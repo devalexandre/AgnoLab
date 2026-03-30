@@ -1,0 +1,31 @@
+[project]
+name = "agnolab-api"
+version = "0.1.0"
+description = "API for the AgnoLab visual builder"
+requires-python = ">=3.11"
+dependencies = [
+  "agno",
+  "aiohttp",
+  "anthropic",
+  "cerebras-cloud-sdk",
+  "cohere",
+  "fastapi>=0.115.0",
+  "azure-ai-inference",
+  "google-genai",
+  "jinja2>=3.1.0",
+  "groq",
+  "ibm-watsonx-ai",
+  "llama-api-client",
+  "litellm",
+  "mistralai",
+  "ollama",
+  "openai",
+  "portkey-ai",
+  "pydantic>=2.8.0",
+  "python-dotenv",
+  "uvicorn>=0.30.0",
+]
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
