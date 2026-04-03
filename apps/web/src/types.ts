@@ -1,4 +1,22 @@
-export type NodeType = "input" | "agent" | "team" | "tool" | "condition" | "output" | "output_api";
+export type NodeType =
+  | "input"
+  | "agent"
+  | "team"
+  | "workflow"
+  | "workflow_step"
+  | "tool"
+  | "skills"
+  | "interface"
+  | "condition"
+  | "output"
+  | "output_api"
+  | "database"
+  | "vector_db"
+  | "knowledge"
+  | "learning_machine"
+  | "memory_manager"
+  | "session_summary_manager"
+  | "compression_manager";
 
 export interface ProjectMeta {
   name: string;
@@ -45,6 +63,31 @@ export interface CanvasGraph {
   edges: GraphEdge[];
 }
 
+export interface CanvasTemplateSummary {
+  id: string;
+  name: string;
+  description: string;
+  category: string;
+  default_flow_name: string;
+}
+
+export interface SkillPathOption {
+  path: string;
+  label: string;
+  source: string;
+  validates: boolean;
+  validation_error?: string | null;
+}
+
+export interface BuiltInToolFunctionOption {
+  name: string;
+  label: string;
+  description?: string | null;
+  signature: string;
+  required_params: string[];
+  optional_params: string[];
+}
+
 export interface RuntimeCredentials {
   openai_api_key?: string | null;
 }
@@ -52,6 +95,7 @@ export interface RuntimeCredentials {
 export interface RunResult {
   success: boolean;
   stdout: string;
+  clean_stdout: string;
   stderr: string;
   exit_code?: number | null;
   code: string;

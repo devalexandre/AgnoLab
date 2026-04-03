@@ -10,10 +10,21 @@ class NodeType(str, Enum):
     INPUT = "input"
     AGENT = "agent"
     TEAM = "team"
+    WORKFLOW = "workflow"
+    WORKFLOW_STEP = "workflow_step"
     TOOL = "tool"
+    SKILLS = "skills"
+    INTERFACE = "interface"
     CONDITION = "condition"
     OUTPUT = "output"
     OUTPUT_API = "output_api"
+    DATABASE = "database"
+    VECTOR_DB = "vector_db"
+    KNOWLEDGE = "knowledge"
+    LEARNING_MACHINE = "learning_machine"
+    MEMORY_MANAGER = "memory_manager"
+    SESSION_SUMMARY_MANAGER = "session_summary_manager"
+    COMPRESSION_MANAGER = "compression_manager"
 
 
 class TargetRuntime(str, Enum):
@@ -66,6 +77,50 @@ class CanvasGraph(BaseModel):
     edges: list[GraphEdge] = Field(default_factory=list)
 
 
+class CanvasTemplateSummary(BaseModel):
+    id: str
+    name: str
+    description: str
+    category: str
+    default_flow_name: str
+
+
+class ListCanvasTemplatesResponse(BaseModel):
+    templates: list[CanvasTemplateSummary] = Field(default_factory=list)
+
+
+class SkillPathOption(BaseModel):
+    path: str
+    label: str
+    source: str
+    validates: bool = True
+    validation_error: str | None = None
+
+
+class ListSkillPathsResponse(BaseModel):
+    paths: list[SkillPathOption] = Field(default_factory=list)
+
+
+class BuiltInToolFunctionOption(BaseModel):
+    name: str
+    label: str
+    description: str | None = None
+    signature: str = "()"
+    required_params: list[str] = Field(default_factory=list)
+    optional_params: list[str] = Field(default_factory=list)
+
+
+class BuiltInToolFunctionsRequest(BaseModel):
+    import_path: str
+    class_name: str
+    config: str | None = None
+
+
+class ListBuiltInToolFunctionsResponse(BaseModel):
+    functions: list[BuiltInToolFunctionOption] = Field(default_factory=list)
+    error: str | None = None
+
+
 class RuntimeCredentials(BaseModel):
     openai_api_key: str | None = None
 
@@ -84,6 +139,27 @@ class SaveFlowResponse(BaseModel):
 class FlowSummary(BaseModel):
     name: str
     updated_at: str
+
+
+class EmailListenerStatus(BaseModel):
+    flow_name: str
+    node_id: str
+    node_name: str
+    protocol: str
+    host: str
+    mailbox: str
+    poll_interval_seconds: int
+    enabled: bool = True
+    status: str = "idle"
+    last_checked_at: str | None = None
+    last_triggered_at: str | None = None
+    last_processed_message_key: str | None = None
+    last_error: str | None = None
+    last_result: str | None = None
+
+
+class ListEmailListenerStatusesResponse(BaseModel):
+    listeners: list[EmailListenerStatus] = Field(default_factory=list)
 
 
 class ListFlowsResponse(BaseModel):
@@ -111,6 +187,7 @@ class RunSavedFlowByNameRequest(RunSavedFlowRequest):
 class CodegenRequest(BaseModel):
     graph: CanvasGraph
     credentials: RuntimeCredentials | None = None
+    response_only: bool = False
 
 
 class CodegenResponse(BaseModel):
@@ -131,6 +208,7 @@ class ExportProjectResponse(BaseModel):
 class RunResult(BaseModel):
     success: bool
     stdout: str = ""
+    clean_stdout: str = ""
     stderr: str = ""
     exit_code: int | None = None
     code: str

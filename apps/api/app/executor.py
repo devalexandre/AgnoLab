@@ -16,12 +16,30 @@ AGNO_PROVIDER_IMPORT_RE = re.compile(
     r"^\s*from\s+(agno\.models\.[\w_.]+)\s+import\s+([A-Za-z_][A-Za-z0-9_]*)(?:\s+as\s+([A-Za-z_][A-Za-z0-9_]*))?",
     re.MULTILINE,
 )
+AGNO_COMPONENT_IMPORT_RE = re.compile(
+    r"^\s*from\s+(agno\.(?:vectordb|db|knowledge|memory|session|compression|learn|skills)[\w_.]*)\s+import\s+([A-Za-z_][A-Za-z0-9_]*)",
+    re.MULTILINE,
+)
 
 
 def format_missing_dependency(stderr: str) -> str | None:
     missing_package_hints = {
         "No module named 'wikipedia'": "WikipediaTools requires the `wikipedia` package. Install it with `pip install wikipedia` in `apps/api/.venv`.",
         "The `wikipedia` package is not installed. Please install it via `pip install wikipedia`.": "WikipediaTools requires the `wikipedia` package. Install it with `pip install wikipedia` in `apps/api/.venv`.",
+        "The `qdrant-client` package is not installed.": "Qdrant requires the `qdrant-client` package. Install it with `pip install qdrant-client` in `apps/api/.venv`.",
+        "The `chromadb` package is not installed.": "Chroma requires the `chromadb` package. Install it with `pip install chromadb` in `apps/api/.venv`.",
+        "Weaviate is not installed.": "Weaviate requires the `weaviate-client` package. Install it with `pip install weaviate-client` in `apps/api/.venv`.",
+        "`lancedb` not installed.": "LanceDB requires the `lancedb` package. Install it with `pip install lancedb` in `apps/api/.venv`.",
+        "`pgvector` not installed.": "PgVector requires the `pgvector` package. Install it with `pip install pgvector` in `apps/api/.venv`.",
+        "`pymongo` not installed.": "MongoDb requires the `pymongo` package. Install it with `pip install pymongo` in `apps/api/.venv`.",
+        "`pypdf` not installed.": "PDF ingestion into Knowledge requires the `pypdf` package. Install it with `pip install pypdf` in `apps/api/.venv`.",
+        "The `python-docx` package is not installed.": "Word ingestion into Knowledge requires the `python-docx` package. Install it with `pip install python-docx` in `apps/api/.venv`.",
+        "The `python-pptx` package is not installed.": "PowerPoint ingestion into Knowledge requires the `python-pptx` package. Install it with `pip install python-pptx` in `apps/api/.venv`.",
+        "`openpyxl` not installed.": "Excel `.xlsx` ingestion into Knowledge requires the `openpyxl` package. Install it with `pip install openpyxl` in `apps/api/.venv`.",
+        "`xlrd` not installed.": "Excel `.xls` ingestion into Knowledge requires the `xlrd` package. Install it with `pip install xlrd` in `apps/api/.venv`.",
+        "Please install it with `pip install aiofiles`": "Field-labeled CSV ingestion into Knowledge requires the `aiofiles` package. Install it with `pip install aiofiles` in `apps/api/.venv`.",
+        "The `bs4` package is not installed.": "Website URL ingestion into Knowledge requires the `beautifulsoup4` package. Install it with `pip install beautifulsoup4` in `apps/api/.venv`.",
+        "No module named 'yaml'": "Agno Skills validation requires the `pyyaml` package. Install it with `pip install pyyaml` in `apps/api/.venv`.",
     }
 
     for marker, message in missing_package_hints.items():
@@ -75,6 +93,28 @@ def preflight_provider_imports(code: str) -> str | None:
     return "Missing dependencies for selected Agno providers:\n" + "\n".join(missing_messages)
 
 
+def preflight_component_imports(code: str) -> str | None:
+    missing_messages: list[str] = []
+    seen_modules: set[tuple[str, str]] = set()
+
+    for module_path, class_name in AGNO_COMPONENT_IMPORT_RE.findall(code):
+        key = (module_path, class_name)
+        if key in seen_modules:
+            continue
+        seen_modules.add(key)
+
+        try:
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                importlib.import_module(module_path)
+        except (ImportError, ModuleNotFoundError) as error:
+            missing_messages.append(f"- {class_name}: {error}")
+
+    if not missing_messages:
+        return None
+
+    return "Missing dependencies for selected Agno components:\n" + "\n".join(missing_messages)
+
+
 def run_generated_code(
     code: str,
     *,
@@ -93,6 +133,10 @@ def run_generated_code(
     missing_tool_dependencies = preflight_tool_imports(code)
     if missing_tool_dependencies:
         return False, "", missing_tool_dependencies, None
+
+    missing_component_dependencies = preflight_component_imports(code)
+    if missing_component_dependencies:
+        return False, "", missing_component_dependencies, None
 
     with tempfile.TemporaryDirectory(prefix="agnolab-run-") as tmp_dir:
         script_path = Path(tmp_dir) / "main.py"

@@ -209,7 +209,7 @@ PROVIDER_DEFINITIONS: list[ProviderDefinition] = [
         id="ollama",
         name="Ollama",
         model="llama3.1",
-        module="agno.models.ollama.chat",
+        module="agno.models.ollama",
         class_name="Ollama",
         aliases=("ollama-chat",),
     ),
@@ -217,7 +217,7 @@ PROVIDER_DEFINITIONS: list[ProviderDefinition] = [
         id="ollama-responses",
         name="Ollama Responses",
         model="llama3.1",
-        module="agno.models.ollama.responses",
+        module="agno.models.ollama",
         class_name="OllamaResponses",
         temperature_supported=False,
         aliases=("ollama-response",),
@@ -814,4 +814,5 @@ def render_provider_model_expression(
     for arg_name, env_name in definition.extra_kwargs_env.items():
         kwargs.append((arg_name, f"os.getenv({python_literal(env_name)})"))
 
-    return f"{definition.class_name}({_render_kwargs(kwargs)})", imports, warnings
+    constructor_ref = class_ref or definition.import_alias or definition.class_name
+    return f"{constructor_ref}({_render_kwargs(kwargs)})", imports, warnings

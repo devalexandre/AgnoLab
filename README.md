@@ -99,8 +99,30 @@ uvicorn app.main:app --reload --port 8000
 ```bash
 cd apps/web
 npm install --no-audit --no-fund
+export VITE_API_URL=http://localhost:8000
 npm run dev
 ```
+
+### Docker
+
+```bash
+export OPENAI_API_KEY="your-key"
+docker compose up --build
+```
+
+The API will be available at `http://localhost:8000` and the web app at `http://localhost:5173`.
+The services stay separated in Docker, but `docker compose` starts both together. The web image receives `VITE_API_URL` at build time, so you can point it to another backend later without changing the source code.
+If you want to connect to a local Ollama instance from inside Docker, use `http://host.docker.internal:11434` as the provider base URL.
+
+### Render
+
+For Render, keep the services separate:
+
+- Publish `apps/api` as a Web Service.
+- Publish `apps/web` as a Static Site.
+- Set `VITE_API_URL` in the web service build environment to the public URL of the API, for example `https://agnolab-api.onrender.com`.
+
+This keeps backend and frontend independent while still letting you deploy both parts of the same repository.
 
 ## Provider Support
 

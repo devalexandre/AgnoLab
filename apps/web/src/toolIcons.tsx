@@ -327,24 +327,24 @@ export function ToolIcon({ toolKey, category }: ToolIconProps) {
 export function toolIconColor(tool: Pick<BuiltInToolDefinition, "category" | "key">): string {
   switch (tool.category) {
     case "Search":
-      return "#6ecbff";
+      return "#ff8d75";
     case "Finance":
-      return "#7ce3a1";
+      return "#ffb19d";
     case "Database":
-      return "#8db4ff";
+      return "#d5cfce";
     case "Web Scraping":
-      return "#ffb86c";
+      return "#ff6a45";
     case "Research":
-      return "#f7d774";
+      return "#ff9d6b";
     case "Productivity":
-      return "#c4a1ff";
+      return "#c98772";
     case "Developer":
-      return "#ff8f8f";
+      return "#ff4017";
     case "AI & Media":
-      return "#81e6d9";
+      return "#ff562f";
     case "Utility":
-      return "#cbd5e1";
+      return "#a6a09f";
     default:
-      return "#f6ad55";
+      return "#ff4017";
   }
 }

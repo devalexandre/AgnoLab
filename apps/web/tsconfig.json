@@ -11,7 +11,7 @@
     "forceConsistentCasingInFileNames": true,
     "types": ["react", "react-dom"],
     "module": "ESNext",
-    "moduleResolution": "Node",
+    "moduleResolution": "bundler",
     "resolveJsonModule": true,
     "isolatedModules": true,
     "noEmit": true,

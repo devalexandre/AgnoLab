@@ -72,3 +72,17 @@ def list_flow_summaries() -> list[FlowSummary]:
     summaries.sort(key=lambda flow: flow.updated_at, reverse=True)
     return summaries
 
+
+def list_flow_records() -> list[FlowRecord]:
+    if not FLOWS_DIR.exists():
+        return []
+
+    records: list[FlowRecord] = []
+    for path in FLOWS_DIR.glob("*.json"):
+        try:
+            records.append(FlowRecord.model_validate_json(path.read_text(encoding="utf-8")))
+        except Exception:
+            continue
+
+    records.sort(key=lambda record: record.updated_at, reverse=True)
+    return records
