@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import asyncio
 import base64
+from datetime import datetime, timezone
 import html
 import json
 import os
 from pathlib import Path
 import re
+import threading
 import time
 from typing import Any
 
@@ -34,7 +37,10 @@ from .models import (
     CodegenRequest,
     CodegenResponse,
     ListEmailListenerStatusesResponse,
+    ListFlowRuntimeStatusesResponse,
+    ListQueueSubscriberStatusesResponse,
     ExportProjectResponse,
+    FlowRuntimeStatus,
     FlowRecord,
     GraphNode,
     ListFlowsResponse,
@@ -43,10 +49,12 @@ from .models import (
     SaveFlowRequest,
     SaveFlowResponse,
     SkillPathOption,
+    QueueSubscriberStatus,
     WhatsappSessionStatus,
     WhatsappWebhookDispatchResponse,
 )
 from .models import NodeType
+from .queue_subscriber import QueueSubscriberManager, extract_queue_subscriber_configs
 from .sample_graph import build_sample_graph, get_canvas_template, list_canvas_templates
 from .whatsapp_gateway import WhatsappGatewayClient, normalize_whatsapp_session_id
 
@@ -60,6 +68,105 @@ RESULT_END_MARKER = "__AGNO_RESULT_END__"
 WHATSAPP_EVENT_DEDUP_TTL_SECONDS = 120.0
 WHATSAPP_IGNORED_EVENT_NAME_PARTS = ("ack", "receipt", "reaction", "presence", "status", "state")
 _recent_whatsapp_events: dict[str, float] = {}
+_flow_runtime_lock = threading.Lock()
+_flow_runtime_stats_by_name: dict[str, dict[str, object]] = {}
+
+QUEUE_INPUT_NODE_TYPES = {
+    NodeType.RABBITMQ_INPUT,
+    NodeType.KAFKA_INPUT,
+    NodeType.REDIS_INPUT,
+    NodeType.NATS_INPUT,
+    NodeType.SQS_INPUT,
+    NodeType.PUBSUB_INPUT,
+}
+
+QUEUE_OUTPUT_NODE_TYPES = {
+    NodeType.RABBITMQ_OUTPUT,
+    NodeType.KAFKA_OUTPUT,
+    NodeType.REDIS_OUTPUT,
+    NodeType.NATS_OUTPUT,
+    NodeType.SQS_OUTPUT,
+    NodeType.PUBSUB_OUTPUT,
+}
+
+
+def _runtime_timestamp_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _ensure_flow_runtime_stats(flow_name: str) -> dict[str, object]:
+    normalized_name = normalize_flow_name(flow_name)
+    stats = _flow_runtime_stats_by_name.get(normalized_name)
+    if stats is None:
+        stats = {
+            "flow_name": flow_name,
+            "active_runs": 0,
+            "total_runs": 0,
+            "success_runs": 0,
+            "failed_runs": 0,
+            "last_source": None,
+            "last_started_at": None,
+            "last_finished_at": None,
+            "last_duration_ms": None,
+            "last_error": None,
+        }
+        _flow_runtime_stats_by_name[normalized_name] = stats
+    else:
+        stats["flow_name"] = flow_name
+    return stats
+
+
+def _record_flow_runtime_start(flow_name: str, *, source: str) -> None:
+    with _flow_runtime_lock:
+        stats = _ensure_flow_runtime_stats(flow_name)
+        stats["active_runs"] = int(stats.get("active_runs") or 0) + 1
+        stats["total_runs"] = int(stats.get("total_runs") or 0) + 1
+        stats["last_source"] = source
+        stats["last_started_at"] = _runtime_timestamp_now()
+
+
+def _record_flow_runtime_finish(flow_name: str, *, source: str, success: bool, duration_ms: int, error: str | None) -> None:
+    with _flow_runtime_lock:
+        stats = _ensure_flow_runtime_stats(flow_name)
+        active_runs = int(stats.get("active_runs") or 0)
+        stats["active_runs"] = max(0, active_runs - 1)
+        if success:
+            stats["success_runs"] = int(stats.get("success_runs") or 0) + 1
+            stats["last_error"] = None
+        else:
+            stats["failed_runs"] = int(stats.get("failed_runs") or 0) + 1
+            stats["last_error"] = (error or "Flow execution failed")[:500]
+        stats["last_source"] = source
+        stats["last_finished_at"] = _runtime_timestamp_now()
+        stats["last_duration_ms"] = max(0, int(duration_ms))
+
+
+def _list_flow_runtime_statuses(flow_name: str | None = None) -> list[FlowRuntimeStatus]:
+    normalized_filter = normalize_flow_name(flow_name) if flow_name else None
+    with _flow_runtime_lock:
+        stats_items = list(_flow_runtime_stats_by_name.items())
+
+    statuses: list[FlowRuntimeStatus] = []
+    for normalized_name, raw_stats in stats_items:
+        if normalized_filter and normalized_name != normalized_filter:
+            continue
+        statuses.append(
+            FlowRuntimeStatus(
+                flow_name=str(raw_stats.get("flow_name") or normalized_name),
+                active_runs=int(raw_stats.get("active_runs") or 0),
+                total_runs=int(raw_stats.get("total_runs") or 0),
+                success_runs=int(raw_stats.get("success_runs") or 0),
+                failed_runs=int(raw_stats.get("failed_runs") or 0),
+                last_source=str(raw_stats.get("last_source") or "") or None,
+                last_started_at=str(raw_stats.get("last_started_at") or "") or None,
+                last_finished_at=str(raw_stats.get("last_finished_at") or "") or None,
+                last_duration_ms=int(raw_stats.get("last_duration_ms") or 0) if raw_stats.get("last_duration_ms") is not None else None,
+                last_error=str(raw_stats.get("last_error") or "") or None,
+            )
+        )
+
+    statuses.sort(key=lambda item: normalize_flow_name(item.flow_name))
+    return statuses
 
 
 def _detect_project_root() -> Path:
@@ -92,6 +199,14 @@ app.add_middleware(
 
 email_listener_manager = EmailListenerManager(
     trigger_flow=lambda flow_name, email_event: run_saved_flow_from_email_event(flow_name, email_event),
+)
+queue_subscriber_manager = QueueSubscriberManager(
+    trigger_flow=lambda flow_name, node_id, payload_text, payload_metadata: run_saved_flow_from_queue_event(
+        flow_name,
+        node_id,
+        payload_text,
+        payload_metadata,
+    ),
 )
 
 
@@ -142,11 +257,13 @@ def discover_skill_paths() -> list[SkillPathOption]:
 @app.on_event("startup")
 def start_email_listener_service() -> None:
     email_listener_manager.start()
+    queue_subscriber_manager.start()
 
 
 @app.on_event("shutdown")
 def stop_email_listener_service() -> None:
     email_listener_manager.stop()
+    queue_subscriber_manager.stop()
 
 
 @app.get("/health")
@@ -318,9 +435,62 @@ def list_flows() -> ListFlowsResponse:
     return ListFlowsResponse(flows=list_flow_summaries())
 
 
+@app.get("/api/flows/runtime/statuses", response_model=ListFlowRuntimeStatusesResponse)
+def list_flow_runtime_statuses(flow_name: str | None = None) -> ListFlowRuntimeStatusesResponse:
+    return ListFlowRuntimeStatusesResponse(statuses=_list_flow_runtime_statuses(flow_name))
+
+
 @app.get("/api/integrations/email/listeners", response_model=ListEmailListenerStatusesResponse)
 def list_email_listener_statuses(flow_name: str | None = None) -> ListEmailListenerStatusesResponse:
     return ListEmailListenerStatusesResponse(listeners=email_listener_manager.list_statuses(flow_name))
+
+
+@app.get("/api/integrations/queues/subscribers", response_model=ListQueueSubscriberStatusesResponse)
+def list_queue_subscriber_statuses(flow_name: str | None = None) -> ListQueueSubscriberStatusesResponse:
+    return ListQueueSubscriberStatusesResponse(subscribers=queue_subscriber_manager.list_statuses(flow_name))
+
+
+@app.get("/api/integrations/queues/{flow_name}/{node_id}/subscriber/status", response_model=QueueSubscriberStatus)
+def get_queue_subscriber_status(flow_name: str, node_id: str) -> QueueSubscriberStatus:
+    record = load_flow_record(flow_name)
+    if record is None:
+        raise HTTPException(status_code=404, detail=f"Flow not found: {flow_name}")
+
+    node = _find_saved_queue_input_node(record, node_id=node_id)
+    config = _resolve_saved_queue_subscriber_config(record, node_id=node_id)
+    status = queue_subscriber_manager.get_status(config.listener_key)
+    return _build_queue_subscriber_status(record, node, status=status)
+
+
+@app.post("/api/integrations/queues/{flow_name}/{node_id}/subscriber/start", response_model=QueueSubscriberStatus)
+def start_queue_subscriber(flow_name: str, node_id: str) -> QueueSubscriberStatus:
+    record = load_flow_record(flow_name)
+    if record is None:
+        raise HTTPException(status_code=404, detail=f"Flow not found: {flow_name}")
+
+    node = _find_saved_queue_input_node(record, node_id=node_id)
+    config = _resolve_saved_queue_subscriber_config(record, node_id=node_id)
+    try:
+        queue_subscriber_manager.start_subscriber(config)
+        status = queue_subscriber_manager.get_status(config.listener_key)
+        return _build_queue_subscriber_status(record, node, status=status)
+    except Exception as error:
+        return _build_queue_subscriber_status(record, node, status=None, last_error=str(error))
+
+
+@app.post("/api/integrations/queues/{flow_name}/{node_id}/subscriber/stop", response_model=QueueSubscriberStatus)
+def stop_queue_subscriber(flow_name: str, node_id: str) -> QueueSubscriberStatus:
+    record = load_flow_record(flow_name)
+    if record is None:
+        raise HTTPException(status_code=404, detail=f"Flow not found: {flow_name}")
+
+    node = _find_saved_queue_input_node(record, node_id=node_id)
+    config = _resolve_saved_queue_subscriber_config(record, node_id=node_id)
+    try:
+        queue_subscriber_manager.stop_subscriber(config.listener_key)
+        return _build_queue_subscriber_status(record, node, status=None)
+    except Exception as error:
+        return _build_queue_subscriber_status(record, node, status=None, last_error=str(error))
 
 
 @app.post("/api/flows/save", response_model=SaveFlowResponse)
@@ -331,6 +501,7 @@ def save_flow(request: SaveFlowRequest) -> SaveFlowResponse:
         raise HTTPException(status_code=400, detail=str(error)) from error
 
     email_listener_manager.sync_saved_flows()
+    queue_subscriber_manager.sync_saved_flows()
 
     return SaveFlowResponse(
         name=record.name,
@@ -810,6 +981,11 @@ def _normalize_input_source(node) -> str:
     return str(extras.get("inputSource") or "manual").strip().lower()
 
 
+def _normalize_queue_provider(node) -> str:
+    extras = node.data.extras if isinstance(node.data.extras, dict) else {}
+    return str(extras.get("queueProvider") or "").strip().lower()
+
+
 def _find_saved_input_node(record: FlowRecord, *, node_id: str, expected_source: str):
     input_node = next((node for node in record.graph.nodes if node.type == NodeType.INPUT and node.id == node_id), None)
     if input_node is None:
@@ -822,6 +998,134 @@ def _find_saved_input_node(record: FlowRecord, *, node_id: str, expected_source:
             detail=f"Input node '{node_id}' is configured as '{input_source}', not '{expected_source}'.",
         )
     return input_node
+
+
+def _find_saved_queue_input_node(record: FlowRecord, *, node_id: str):
+    input_node = next((node for node in record.graph.nodes if node.type in QUEUE_INPUT_NODE_TYPES and node.id == node_id), None)
+    if input_node is None:
+        raise HTTPException(status_code=404, detail=f"Queue input node not found in flow '{record.name}': {node_id}")
+
+    queue_provider = _normalize_queue_provider(input_node)
+    if queue_provider not in {"rabbitmq", "kafka", "redis", "nats", "sqs", "pubsub"}:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Queue node '{node_id}' does not have a valid queue provider configured.",
+        )
+    return input_node
+
+
+def _resolve_saved_queue_subscriber_config(record: FlowRecord, *, node_id: str):
+    _find_saved_queue_input_node(record, node_id=node_id)
+    configs = extract_queue_subscriber_configs(record)
+    config = next((candidate for candidate in configs if candidate.node_id == node_id), None)
+    if config is None:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Queue subscriber config for node '{node_id}' is incomplete.",
+        )
+    return config
+
+
+def _build_queue_subscriber_status(record: FlowRecord, node: GraphNode, *, status: QueueSubscriberStatus | None = None, last_error: str | None = None) -> QueueSubscriberStatus:
+    extras = node.data.extras if isinstance(node.data.extras, dict) else {}
+    poll_interval_seconds = 5
+    try:
+        poll_interval_seconds = max(2, int(str(extras.get("queuePollIntervalSeconds") or "5").strip() or "5"))
+    except (TypeError, ValueError):
+        poll_interval_seconds = 5
+
+    if status is not None:
+        return status
+
+    return QueueSubscriberStatus(
+        flow_name=record.name,
+        node_id=node.id,
+        node_name=node.data.name,
+        provider=_normalize_queue_provider(node),
+        poll_interval_seconds=poll_interval_seconds,
+        enabled=bool(extras.get("queueSubscriberEnabled") or False),
+        connected=False,
+        status="idle",
+        last_error=last_error,
+    )
+
+
+def _collect_reachable_node_ids(graph: CanvasGraph, *, start_node_id: str | None) -> set[str]:
+    all_node_ids = {node.id for node in graph.nodes}
+    if not all_node_ids:
+        return set()
+    if not start_node_id or start_node_id not in all_node_ids:
+        return all_node_ids
+
+    adjacency: dict[str, list[str]] = {}
+    for edge in graph.edges:
+        adjacency.setdefault(edge.source, []).append(edge.target)
+
+    reachable: set[str] = set()
+    queue: list[str] = [start_node_id]
+    while queue:
+        current_id = queue.pop(0)
+        if current_id in reachable:
+            continue
+        reachable.add(current_id)
+        for target_id in adjacency.get(current_id, []):
+            if target_id not in reachable:
+                queue.append(target_id)
+    return reachable
+
+
+def _resolve_queue_output_nodes_for_dispatch(graph: CanvasGraph, *, target_input_node_id: str | None) -> list[GraphNode]:
+    reachable_ids = _collect_reachable_node_ids(graph, start_node_id=target_input_node_id)
+    return [
+        node
+        for node in graph.nodes
+        if node.type in QUEUE_OUTPUT_NODE_TYPES and node.id in reachable_ids
+    ]
+
+
+def _publish_nats_output_payload(*, nats_url: str, nats_subject: str, payload_text: str) -> None:
+    async def _publish() -> None:
+        try:
+            from nats.aio.client import Client as NATS
+        except ModuleNotFoundError as error:
+            raise RuntimeError("NATS output dependency missing. Install 'nats-py' to publish to NATS output nodes.") from error
+
+        client = NATS()
+        await client.connect(servers=[nats_url], connect_timeout=2)
+        await client.publish(nats_subject, payload_text.encode("utf-8"))
+        await client.flush(timeout=2)
+        await client.drain()
+
+    asyncio.run(_publish())
+
+
+def _dispatch_queue_output_payloads(
+    graph: CanvasGraph,
+    *,
+    payload_text: str,
+    target_input_node_id: str | None,
+) -> list[str]:
+    message = payload_text.strip()
+    if not message:
+        return []
+
+    dispatch_errors: list[str] = []
+    output_nodes = _resolve_queue_output_nodes_for_dispatch(graph, target_input_node_id=target_input_node_id)
+    for output_node in output_nodes:
+        extras = output_node.data.extras if isinstance(output_node.data.extras, dict) else {}
+        if output_node.type == NodeType.NATS_OUTPUT:
+            nats_url = str(extras.get("natsUrl") or "nats://localhost:4222").strip()
+            nats_subject = str(extras.get("natsSubject") or "agnolab.output").strip()
+            if not nats_subject:
+                dispatch_errors.append(f"Queue output '{output_node.data.name}' has an empty NATS subject.")
+                continue
+            try:
+                _publish_nats_output_payload(nats_url=nats_url, nats_subject=nats_subject, payload_text=message)
+            except Exception as error:
+                dispatch_errors.append(f"NATS output '{output_node.data.name}' failed: {error}")
+            continue
+
+    return dispatch_errors
 
 
 def _parse_json_text(raw_value: str) -> object | None:
@@ -905,12 +1209,24 @@ def apply_runtime_post_input(
     input_metadata: dict | None,
     input_files: list[dict[str, object]] | None = None,
     merge_metadata: bool = False,
+    target_node_id: str | None = None,
 ):
     if input_text is None and input_metadata is None and not input_files:
         return graph
 
     updated_graph = graph.model_copy(deep=True)
-    input_node = next((node for node in updated_graph.nodes if node.type == NodeType.INPUT), None)
+    candidate_inputs = [
+        node
+        for node in updated_graph.nodes
+        if node.type == NodeType.INPUT or node.type in QUEUE_INPUT_NODE_TYPES
+    ]
+    if target_node_id:
+        input_node = next((node for node in candidate_inputs if node.id == target_node_id), None)
+    else:
+        input_node = next((node for node in candidate_inputs if node.type == NodeType.INPUT), None)
+        if input_node is None:
+            input_node = candidate_inputs[0] if candidate_inputs else None
+
     if input_node is None:
         return updated_graph
 
@@ -1020,43 +1336,68 @@ def run_saved_flow_record(
     input_files: list[dict[str, object]] | None = None,
     debug: bool,
     merge_metadata: bool = False,
+    target_input_node_id: str | None = None,
+    runtime_source: str = "manual",
+    track_runtime_activity: bool = False,
 ) -> RunResult:
-    graph = apply_runtime_post_input(
-        record.graph,
-        input_text=input_text,
-        input_metadata=input_metadata,
-        input_files=input_files,
-        merge_metadata=merge_metadata,
-    )
-    if debug is False:
-        graph = apply_runtime_debug_flag(graph, debug=False)
+    started_at = time.perf_counter()
+    if track_runtime_activity:
+        _record_flow_runtime_start(record.name, source=runtime_source)
 
-    code, warnings = compile_graph(graph)
-    success, stdout, stderr, exit_code = run_generated_code(
-        code,
-        extra_env=get_graph_runtime_env(graph),
-        timeout_seconds=get_graph_execution_timeout_seconds(graph),
-    )
+    run_result: RunResult | None = None
+    try:
+        graph = apply_runtime_post_input(
+            record.graph,
+            input_text=input_text,
+            input_metadata=input_metadata,
+            input_files=input_files,
+            merge_metadata=merge_metadata,
+            target_node_id=target_input_node_id,
+        )
+        if debug is False:
+            graph = apply_runtime_debug_flag(graph, debug=False)
 
-    tagged_clean_stdout, stripped_stdout = extract_tagged_flow_result(stdout)
-    response_stdout = stripped_stdout or stdout
-    clean_stdout = tagged_clean_stdout or extract_agent_response(stdout)
-    response_code = code
-    response_warnings = warnings
-    if debug is False:
-        response_stdout = clean_stdout
-        response_code = ""
-        response_warnings = []
+        code, warnings = compile_graph(graph)
+        success, stdout, stderr, exit_code = run_generated_code(
+            code,
+            extra_env=get_graph_runtime_env(graph),
+            timeout_seconds=get_graph_execution_timeout_seconds(graph),
+        )
 
-    return RunResult(
-        success=success,
-        stdout=response_stdout,
-        clean_stdout=clean_stdout,
-        stderr=stderr,
-        exit_code=exit_code,
-        code=response_code,
-        warnings=response_warnings,
-    )
+        tagged_clean_stdout, stripped_stdout = extract_tagged_flow_result(stdout)
+        response_stdout = stripped_stdout or stdout
+        clean_stdout = tagged_clean_stdout or extract_agent_response(stdout)
+        response_code = code
+        response_warnings = warnings
+        if debug is False:
+            response_stdout = clean_stdout
+            response_code = ""
+            response_warnings = []
+
+        run_result = RunResult(
+            success=success,
+            stdout=response_stdout,
+            clean_stdout=clean_stdout,
+            stderr=stderr,
+            exit_code=exit_code,
+            code=response_code,
+            warnings=response_warnings,
+        )
+        return run_result
+    finally:
+        if track_runtime_activity:
+            duration_ms = int((time.perf_counter() - started_at) * 1000)
+            success_value = bool(run_result.success) if run_result is not None else False
+            error_value: str | None = None
+            if run_result is not None and not run_result.success:
+                error_value = (run_result.stderr or run_result.stdout or "").strip() or None
+            _record_flow_runtime_finish(
+                record.name,
+                source=runtime_source,
+                success=success_value,
+                duration_ms=duration_ms,
+                error=error_value,
+            )
 
 
 def run_saved_flow_from_email_event(flow_name: str, email_event: dict[str, str]) -> tuple[bool, str | None]:
@@ -1074,8 +1415,51 @@ def run_saved_flow_from_email_event(flow_name: str, email_event: dict[str, str])
         input_files=None,
         debug=False,
         merge_metadata=True,
+        runtime_source="email_listener",
+        track_runtime_activity=True,
     )
     summary = run_result.clean_stdout or run_result.stderr or run_result.stdout
+    return run_result.success, summary or None
+
+
+def run_saved_flow_from_queue_event(
+    flow_name: str,
+    node_id: str,
+    payload_text: str,
+    payload_metadata: dict[str, object] | None,
+) -> tuple[bool, str | None]:
+    record = load_flow_record(flow_name)
+    if record is None:
+        return False, f"Flow not found: {flow_name}"
+
+    run_result = run_saved_flow_record(
+        record,
+        input_text=payload_text,
+        input_metadata={
+            "_agnolab_queue_event": {
+                "text": payload_text,
+                "metadata": payload_metadata or {},
+                "node_id": node_id,
+            },
+            "queue_listener_source": "background_subscriber",
+            **(payload_metadata or {}),
+        },
+        input_files=None,
+        debug=False,
+        merge_metadata=True,
+        target_input_node_id=node_id,
+        runtime_source="queue_subscriber",
+        track_runtime_activity=True,
+    )
+    summary = run_result.clean_stdout or run_result.stderr or run_result.stdout
+    if run_result.success and summary:
+        dispatch_errors = _dispatch_queue_output_payloads(
+            record.graph,
+            payload_text=summary,
+            target_input_node_id=node_id,
+        )
+        if dispatch_errors:
+            return False, " | ".join(dispatch_errors)
     return run_result.success, summary or None
 
 
@@ -1126,6 +1510,8 @@ async def run_saved_flow_from_webhook(flow_name: str, node_id: str, request: Req
         input_files=None,
         debug=debug,
         merge_metadata=True,
+        runtime_source="webhook",
+        track_runtime_activity=True,
     )
 
 
@@ -1207,6 +1593,8 @@ async def run_saved_flow_from_form(flow_name: str, node_id: str, request: Reques
         input_files=files,
         debug=debug,
         merge_metadata=True,
+        runtime_source="form",
+        track_runtime_activity=True,
     )
 
 
@@ -1435,6 +1823,9 @@ async def run_saved_flow_from_whatsapp(flow_name: str, node_id: str, request: Re
         input_files=runtime_files or None,
         debug=False,
         merge_metadata=True,
+        target_input_node_id=input_node.id,
+        runtime_source="whatsapp",
+        track_runtime_activity=True,
     )
 
     flow_result_text = (run_result.clean_stdout or run_result.stdout or "").strip()

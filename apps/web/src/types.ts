@@ -1,5 +1,17 @@
 export type NodeType =
   | "input"
+  | "rabbitmq_input"
+  | "rabbitmq_output"
+  | "kafka_input"
+  | "kafka_output"
+  | "redis_input"
+  | "redis_output"
+  | "nats_input"
+  | "nats_output"
+  | "sqs_input"
+  | "sqs_output"
+  | "pubsub_input"
+  | "pubsub_output"
   | "agent"
   | "team"
   | "workflow"
@@ -137,6 +149,37 @@ export interface WhatsappSessionStatus {
   connected: boolean;
   qr_code?: string | null;
   webhook_url?: string | null;
+  last_error?: string | null;
+}
+
+export interface QueueSubscriberStatus {
+  flow_name: string;
+  node_id: string;
+  node_name: string;
+  provider: string;
+  poll_interval_seconds: number;
+  enabled: boolean;
+  connected: boolean;
+  status: string;
+  last_checked_at?: string | null;
+  last_triggered_at?: string | null;
+  last_message_id?: string | null;
+  last_payload_received_at?: string | null;
+  last_payload_preview?: string | null;
+  last_error?: string | null;
+  last_result?: string | null;
+}
+
+export interface FlowRuntimeStatus {
+  flow_name: string;
+  active_runs: number;
+  total_runs: number;
+  success_runs: number;
+  failed_runs: number;
+  last_source?: string | null;
+  last_started_at?: string | null;
+  last_finished_at?: string | null;
+  last_duration_ms?: number | null;
   last_error?: string | null;
 }
 

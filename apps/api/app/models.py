@@ -8,6 +8,18 @@ from pydantic import BaseModel, Field
 
 class NodeType(str, Enum):
     INPUT = "input"
+    RABBITMQ_INPUT = "rabbitmq_input"
+    RABBITMQ_OUTPUT = "rabbitmq_output"
+    KAFKA_INPUT = "kafka_input"
+    KAFKA_OUTPUT = "kafka_output"
+    REDIS_INPUT = "redis_input"
+    REDIS_OUTPUT = "redis_output"
+    NATS_INPUT = "nats_input"
+    NATS_OUTPUT = "nats_output"
+    SQS_INPUT = "sqs_input"
+    SQS_OUTPUT = "sqs_output"
+    PUBSUB_INPUT = "pubsub_input"
+    PUBSUB_OUTPUT = "pubsub_output"
     AGENT = "agent"
     TEAM = "team"
     WORKFLOW = "workflow"
@@ -168,6 +180,45 @@ class EmailListenerStatus(BaseModel):
 
 class ListEmailListenerStatusesResponse(BaseModel):
     listeners: list[EmailListenerStatus] = Field(default_factory=list)
+
+
+class QueueSubscriberStatus(BaseModel):
+    flow_name: str
+    node_id: str
+    node_name: str
+    provider: str
+    poll_interval_seconds: int
+    enabled: bool = False
+    connected: bool = False
+    status: str = "idle"
+    last_checked_at: str | None = None
+    last_triggered_at: str | None = None
+    last_message_id: str | None = None
+    last_payload_received_at: str | None = None
+    last_payload_preview: str | None = None
+    last_error: str | None = None
+    last_result: str | None = None
+
+
+class ListQueueSubscriberStatusesResponse(BaseModel):
+    subscribers: list[QueueSubscriberStatus] = Field(default_factory=list)
+
+
+class FlowRuntimeStatus(BaseModel):
+    flow_name: str
+    active_runs: int = 0
+    total_runs: int = 0
+    success_runs: int = 0
+    failed_runs: int = 0
+    last_source: str | None = None
+    last_started_at: str | None = None
+    last_finished_at: str | None = None
+    last_duration_ms: int | None = None
+    last_error: str | None = None
+
+
+class ListFlowRuntimeStatusesResponse(BaseModel):
+    statuses: list[FlowRuntimeStatus] = Field(default_factory=list)
 
 
 class WhatsappSessionStatus(BaseModel):

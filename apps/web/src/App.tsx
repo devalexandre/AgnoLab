@@ -1,5 +1,5 @@
 import { type ChangeEvent, type MouseEvent as ReactMouseEvent, type WheelEvent as ReactWheelEvent, useEffect, useMemo, useRef, useState } from "react";
-import { API_BASE, fetchCanvasTemplate, fetchDefaultGraph, fetchFlowByName, fetchWhatsappSessionStatus, listBuiltInToolFunctions, listCanvasTemplates, listFlows, listOllamaModels, listSkillPaths, previewCode, runFlowByName, runGraph, saveFlow, startWhatsappSession, stopWhatsappSession } from "./api";
+import { API_BASE, fetchCanvasTemplate, fetchDefaultGraph, fetchFlowByName, fetchQueueSubscriberStatus, fetchWhatsappSessionStatus, listBuiltInToolFunctions, listCanvasTemplates, listFlowRuntimeStatuses, listFlows, listOllamaModels, listSkillPaths, previewCode, runFlowByName, runGraph, saveFlow, startQueueSubscriber, startWhatsappSession, stopQueueSubscriber, stopWhatsappSession } from "./api";
 import { AGENT_FIELDS, AGENT_FIELD_GROUPS, AGNO_MODEL_PROVIDER_OPTIONS, type AgentFieldDefinition } from "./agentConfig";
 import MonacoToolEditor from "./MonacoToolEditor";
 import { NODE_CATALOG, NODE_CATEGORIES, canConnect, listNodeTypes } from "./nodeCatalog";
@@ -8,7 +8,7 @@ import { TEAM_FIELDS, TEAM_FIELD_GROUPS } from "./teamConfig";
 import { STARTER_TOOLS } from "./starterTools";
 import { BUILT_IN_TOOLS, BUILT_IN_TOOL_CATEGORIES, getBuiltInTool, type BuiltInToolDefinition } from "./toolCatalog";
 import { ToolIcon, toolIconColor } from "./toolIcons";
-import { BuiltInToolFunctionOption, CanvasGraph, CanvasTemplateSummary, FlowSummary, GraphEdge, GraphNode, NodeData, NodeType, ProjectRuntimeConfig, ProjectRuntimeEnvVar, RunResult, SaveFlowResponse, SavedUserTool, SkillPathOption, StarterToolTemplate, WhatsappSessionStatus } from "./types";
+import { BuiltInToolFunctionOption, CanvasGraph, CanvasTemplateSummary, FlowRuntimeStatus, FlowSummary, GraphEdge, GraphNode, NodeData, NodeType, ProjectRuntimeConfig, ProjectRuntimeEnvVar, QueueSubscriberStatus, RunResult, SaveFlowResponse, SavedUserTool, SkillPathOption, StarterToolTemplate, WhatsappSessionStatus } from "./types";
 
 const MY_TOOLS_STORAGE_KEY = "agnolab.my_tools";
 const FLOW_DRAFT_STORAGE_KEY_PREFIX = "agnolab.flow_draft.v1:";
@@ -450,6 +450,50 @@ interface WhatsappSessionModalState {
   nodeId: string;
   nodeName: string;
   session?: WhatsappSessionStatus | null;
+}
+
+type QueueNodeType =
+  | "rabbitmq_input"
+  | "rabbitmq_output"
+  | "kafka_input"
+  | "kafka_output"
+  | "redis_input"
+  | "redis_output"
+  | "nats_input"
+  | "nats_output"
+  | "sqs_input"
+  | "sqs_output"
+  | "pubsub_input"
+  | "pubsub_output";
+
+const QUEUE_INPUT_NODE_TYPES = new Set<QueueNodeType>([
+  "rabbitmq_input",
+  "kafka_input",
+  "redis_input",
+  "nats_input",
+  "sqs_input",
+  "pubsub_input",
+]);
+
+function isQueueInputNodeType(type: NodeType): type is QueueNodeType {
+  return QUEUE_INPUT_NODE_TYPES.has(type as QueueNodeType);
+}
+
+function isQueueNodeType(type: NodeType): type is QueueNodeType {
+  return (
+    type === "rabbitmq_input"
+    || type === "rabbitmq_output"
+    || type === "kafka_input"
+    || type === "kafka_output"
+    || type === "redis_input"
+    || type === "redis_output"
+    || type === "nats_input"
+    || type === "nats_output"
+    || type === "sqs_input"
+    || type === "sqs_output"
+    || type === "pubsub_input"
+    || type === "pubsub_output"
+  );
 }
 
 function matchesLibrarySearch(query: string, ...parts: Array<string | undefined | null>): boolean {
@@ -3111,6 +3155,52 @@ function getCanvasNodeLabel(data: NodeData, type: keyof typeof NODE_CATALOG): st
 }
 
 function getCanvasNodeMeta(node: { type: keyof typeof NODE_CATALOG; data: NodeData }): string {
+  if (
+    node.type === "rabbitmq_input"
+    || node.type === "rabbitmq_output"
+    || node.type === "kafka_input"
+    || node.type === "kafka_output"
+    || node.type === "redis_input"
+    || node.type === "redis_output"
+    || node.type === "nats_input"
+    || node.type === "nats_output"
+    || node.type === "sqs_input"
+    || node.type === "sqs_output"
+    || node.type === "pubsub_input"
+    || node.type === "pubsub_output"
+  ) {
+    const provider = fieldValueAsString(node.data.extras?.queueProvider).trim().toLowerCase();
+
+    if (provider === "rabbitmq") {
+      const queue = fieldValueAsString(node.data.extras?.rabbitmqQueue).trim() || "queue not configured";
+      return `RabbitMQ · ${queue}`;
+    }
+    if (provider === "kafka") {
+      const topic = fieldValueAsString(node.data.extras?.kafkaTopic).trim() || "topic not configured";
+      return `Kafka · ${topic}`;
+    }
+    if (provider === "redis") {
+      const channel = fieldValueAsString(node.data.extras?.redisChannel).trim() || "channel not configured";
+      return `Redis · ${channel}`;
+    }
+    if (provider === "nats") {
+      const subject = fieldValueAsString(node.data.extras?.natsSubject).trim() || "subject not configured";
+      return `NATS · ${subject}`;
+    }
+    if (provider === "sqs") {
+      const queueUrl = fieldValueAsString(node.data.extras?.sqsQueueUrl).trim() || "queue URL not configured";
+      return `SQS · ${queueUrl}`;
+    }
+    if (provider === "pubsub") {
+      const name = node.type.endsWith("_input")
+        ? fieldValueAsString(node.data.extras?.pubsubSubscription).trim()
+        : fieldValueAsString(node.data.extras?.pubsubTopic).trim();
+      return `Pub/Sub · ${name || "resource not configured"}`;
+    }
+
+    return "Queue endpoint";
+  }
+
   if (node.type === "database") {
     return fieldValueAsString(node.data.extras?.dbPreset) || "Database backend";
   }
@@ -3318,6 +3408,40 @@ function NodeIcon({ type }: { type: keyof typeof NODE_CATALOG }) {
       <svg viewBox="0 0 24 24" aria-hidden="true">
         <path d="M4 12h10" />
         <path d="M10 6l6 6-6 6" />
+      </svg>
+    );
+  }
+
+  if (
+    type === "rabbitmq_input"
+    || type === "kafka_input"
+    || type === "redis_input"
+    || type === "nats_input"
+    || type === "sqs_input"
+    || type === "pubsub_input"
+  ) {
+    return (
+      <svg viewBox="0 0 24 24" aria-hidden="true">
+        <rect x="4" y="6" width="16" height="12" rx="2" />
+        <path d="M6 12h8" />
+        <path d="M12 9l4 3-4 3" />
+      </svg>
+    );
+  }
+
+  if (
+    type === "rabbitmq_output"
+    || type === "kafka_output"
+    || type === "redis_output"
+    || type === "nats_output"
+    || type === "sqs_output"
+    || type === "pubsub_output"
+  ) {
+    return (
+      <svg viewBox="0 0 24 24" aria-hidden="true">
+        <rect x="4" y="6" width="16" height="12" rx="2" />
+        <path d="M10 9l-4 3 4 3" />
+        <path d="M10 12h8" />
       </svg>
     );
   }
@@ -3539,6 +3663,9 @@ export default function App() {
   const [didCopyWebhookCurl, setDidCopyWebhookCurl] = useState(false);
   const [whatsappSessionModal, setWhatsappSessionModal] = useState<WhatsappSessionModalState | null>(null);
   const [isUpdatingWhatsappSession, setIsUpdatingWhatsappSession] = useState(false);
+  const [queueSubscriberStatusByNodeId, setQueueSubscriberStatusByNodeId] = useState<Record<string, QueueSubscriberStatus>>({});
+  const [flowRuntimeStatusByName, setFlowRuntimeStatusByName] = useState<Record<string, FlowRuntimeStatus>>({});
+  const [isUpdatingQueueSubscriber, setIsUpdatingQueueSubscriber] = useState(false);
   const [isLoadingRouteFlow, setIsLoadingRouteFlow] = useState(false);
   const [homeError, setHomeError] = useState<string | null>(null);
   const [isChatOpen, setIsChatOpen] = useState(false);
@@ -3567,6 +3694,7 @@ export default function App() {
   const [builtInToolFunctionsError, setBuiltInToolFunctionsError] = useState<string | null>(null);
   const [isHitlRunConfirmOpen, setIsHitlRunConfirmOpen] = useState(false);
   const [hitlRunConfirmMessage, setHitlRunConfirmMessage] = useState("");
+  const previousRuntimeActiveRunsRef = useRef(0);
 
   const isHomeRoute = currentPath === "/";
   const routeFlowName = useMemo(() => getFlowNameFromPath(currentPath), [currentPath]);
@@ -3577,6 +3705,8 @@ export default function App() {
   const projectAuthEnabled = projectRuntime.authEnabled;
   const projectAuthToken = fieldValueAsString(projectRuntime.authToken);
   const currentFlowSnapshot = useMemo(() => buildPersistedFlowSnapshot(flowName, graph), [flowName, graph]);
+  const normalizedActiveFlowName = useMemo(() => slugifyFlowName(flowName), [flowName]);
+  const currentFlowRuntimeStatus = normalizedActiveFlowName ? flowRuntimeStatusByName[normalizedActiveFlowName] : undefined;
 
   useEffect(() => {
     listFlows()
@@ -3585,6 +3715,68 @@ export default function App() {
       })
       .catch(console.error);
   }, []);
+
+  useEffect(() => {
+    if (isHomeRoute) {
+      previousRuntimeActiveRunsRef.current = 0;
+      return;
+    }
+
+    const normalizedFlowName = slugifyFlowName(flowName);
+    if (!normalizedFlowName) {
+      return;
+    }
+
+    let cancelled = false;
+    let timeoutId: number | null = null;
+
+    const poll = async () => {
+      try {
+        const statuses = await listFlowRuntimeStatuses(normalizedFlowName);
+        if (cancelled) {
+          return;
+        }
+        const status = statuses[0];
+        if (status) {
+          setFlowRuntimeStatusByName((current) => ({
+            ...current,
+            [normalizedFlowName]: status,
+          }));
+        }
+      } catch (error) {
+        if (!cancelled) {
+          console.error(error);
+        }
+      } finally {
+        if (!cancelled) {
+          timeoutId = window.setTimeout(poll, 2000);
+        }
+      }
+    };
+
+    void poll();
+
+    return () => {
+      cancelled = true;
+      if (timeoutId !== null) {
+        window.clearTimeout(timeoutId);
+      }
+    };
+  }, [flowName, isHomeRoute]);
+
+  useEffect(() => {
+    if (!currentFlowRuntimeStatus) {
+      return;
+    }
+    const previousActiveRuns = previousRuntimeActiveRunsRef.current;
+    const activeRuns = currentFlowRuntimeStatus.active_runs;
+    if (previousActiveRuns === 0 && activeRuns > 0) {
+      setConnectionMessage(`Flow '${flowName}' is processing external requests (${activeRuns} active).`);
+    } else if (previousActiveRuns > 0 && activeRuns === 0) {
+      setConnectionMessage(`Flow '${flowName}' finished processing queued external requests.`);
+    }
+    previousRuntimeActiveRunsRef.current = activeRuns;
+  }, [currentFlowRuntimeStatus?.active_runs, flowName]);
 
   useEffect(() => {
     listCanvasTemplates()
@@ -4102,11 +4294,26 @@ export default function App() {
 
   const selectedNode = graph?.nodes.find((node) => node.id === selectedNodeId) ?? null;
   const selectedEdge = graph?.edges.find((edge) => edge.id === selectedEdgeId) ?? null;
+  const selectedQueueNode = selectedNode && isQueueNodeType(selectedNode.type) ? selectedNode : null;
+  const selectedQueueSubscriberStatus = selectedQueueNode ? queueSubscriberStatusByNodeId[selectedQueueNode.id] : undefined;
   const editingFunctionNode = graph?.nodes.find((node) => node.id === editingFunctionNodeId) ?? null;
   const nodeMap = useMemo(
     () => Object.fromEntries((graph?.nodes ?? []).map((node) => [node.id, node])),
     [graph],
   );
+
+  useEffect(() => {
+    if (!selectedQueueNode || !isQueueInputNodeType(selectedQueueNode.type)) {
+      return;
+    }
+
+    const flowRouteName = slugifyFlowName(flowName);
+    if (!flowRouteName || !savedFlows.some((flow) => flow.name === flowRouteName)) {
+      return;
+    }
+
+    void loadQueueSubscriberStatus(flowRouteName, selectedQueueNode.id);
+  }, [selectedQueueNode?.id, selectedQueueNode?.type, flowName, savedFlows]);
 
   useEffect(() => {
     if (!selectedNode || selectedNode.type !== "tool" || getToolMode(selectedNode.data) !== "builtin") {
@@ -5706,6 +5913,75 @@ export default function App() {
       setConnectionMessage(message);
     } finally {
       setIsUpdatingWhatsappSession(false);
+    }
+  }
+
+  async function loadQueueSubscriberStatus(flowRouteName: string, nodeId: string): Promise<QueueSubscriberStatus | null> {
+    try {
+      const status = await fetchQueueSubscriberStatus(flowRouteName, nodeId);
+      setQueueSubscriberStatusByNodeId((current) => ({
+        ...current,
+        [nodeId]: status,
+      }));
+      return status;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Failed to load queue subscriber status.";
+      setConnectionMessage(message);
+      return null;
+    }
+  }
+
+  async function handleStartQueueSubscriber(node: GraphNode) {
+    const flowRouteName = slugifyFlowName(flowName);
+    if (!flowRouteName) {
+      setConnectionMessage("Save the flow with a valid name before connecting Queue subscriber.");
+      return;
+    }
+    if (!savedFlows.some((flow) => flow.name === flowRouteName)) {
+      setConnectionMessage("Save the flow before connecting Queue subscriber so the backend can target a persisted flow name.");
+      return;
+    }
+
+    setIsUpdatingQueueSubscriber(true);
+    try {
+      const status = await startQueueSubscriber(flowRouteName, node.id);
+      setQueueSubscriberStatusByNodeId((current) => ({
+        ...current,
+        [node.id]: status,
+      }));
+      setConnectionMessage(
+        status.last_error
+          ? status.last_error
+          : `Queue subscriber '${status.node_name}' is now ${status.connected ? "connected" : status.status}.`,
+      );
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Failed to start queue subscriber.";
+      setConnectionMessage(message);
+    } finally {
+      setIsUpdatingQueueSubscriber(false);
+    }
+  }
+
+  async function handleStopQueueSubscriber(node: GraphNode) {
+    const flowRouteName = slugifyFlowName(flowName);
+    if (!flowRouteName) {
+      setConnectionMessage("Save the flow with a valid name before disconnecting Queue subscriber.");
+      return;
+    }
+
+    setIsUpdatingQueueSubscriber(true);
+    try {
+      const status = await stopQueueSubscriber(flowRouteName, node.id);
+      setQueueSubscriberStatusByNodeId((current) => ({
+        ...current,
+        [node.id]: status,
+      }));
+      setConnectionMessage(status.last_error ? status.last_error : `Queue subscriber '${status.node_name}' stopped.`);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Failed to stop queue subscriber.";
+      setConnectionMessage(message);
+    } finally {
+      setIsUpdatingQueueSubscriber(false);
     }
   }
 
@@ -9930,6 +10206,287 @@ export default function App() {
       );
     }
 
+    if (isQueueNodeType(selectedNode.type)) {
+      const currentNode = selectedNode;
+      const currentGraph = graph;
+      if (!currentGraph) {
+        return null;
+      }
+
+      const currentExtras = currentNode.data.extras ?? {};
+      const isInputNode = isQueueInputNodeType(currentNode.type);
+      const queueProvider = fieldValueAsString(currentExtras.queueProvider).trim().toLowerCase();
+      const flowRouteName = slugifyFlowName(flowName) || "save_this_flow_first";
+      const subscriberStatus = selectedQueueSubscriberStatus;
+
+      const updateQueueExtras = (patch: Record<string, unknown>) =>
+        setGraph(
+          updateNodeData(currentGraph, currentNode.id, {
+            extras: {
+              ...currentExtras,
+              ...patch,
+            },
+          }),
+        );
+
+      return (
+        <>
+          <label>
+            {renderInspectorPropertyLabel("Name", "Display name used in the canvas.", true)}
+            <input
+              value={currentNode.data.name}
+              onChange={(event) =>
+                setGraph(updateNodeData(currentGraph, currentNode.id, { name: event.target.value }))
+              }
+            />
+          </label>
+
+          <label>
+            {renderInspectorPropertyLabel("Queue Provider", "Messaging provider configured for this queue node.", true)}
+            <input value={queueProvider || "queue"} readOnly />
+          </label>
+
+          {queueProvider === "rabbitmq" ? (
+            <>
+              <label>
+                {renderInspectorPropertyLabel("RabbitMQ URL", "AMQP endpoint used by this queue node.", true)}
+                <input
+                  value={fieldValueAsString(currentExtras.rabbitmqUrl)}
+                  onChange={(event) => updateQueueExtras({ rabbitmqUrl: event.target.value })}
+                />
+              </label>
+              <label>
+                {renderInspectorPropertyLabel("Queue Name", "Queue used for consume/publish.", true)}
+                <input
+                  value={fieldValueAsString(currentExtras.rabbitmqQueue)}
+                  onChange={(event) => updateQueueExtras({ rabbitmqQueue: event.target.value })}
+                />
+              </label>
+              <label>
+                {renderInspectorPropertyLabel("Exchange", "Optional exchange name for routing.")}
+                <input
+                  value={fieldValueAsString(currentExtras.rabbitmqExchange)}
+                  onChange={(event) => updateQueueExtras({ rabbitmqExchange: event.target.value })}
+                />
+              </label>
+              <label>
+                {renderInspectorPropertyLabel("Routing Key", "Optional routing key.")}
+                <input
+                  value={fieldValueAsString(currentExtras.rabbitmqRoutingKey)}
+                  onChange={(event) => updateQueueExtras({ rabbitmqRoutingKey: event.target.value })}
+                />
+              </label>
+            </>
+          ) : null}
+
+          {queueProvider === "kafka" ? (
+            <>
+              <label>
+                {renderInspectorPropertyLabel("Bootstrap Servers", "Comma-separated Kafka brokers.", true)}
+                <input
+                  value={fieldValueAsString(currentExtras.kafkaBootstrapServers)}
+                  onChange={(event) => updateQueueExtras({ kafkaBootstrapServers: event.target.value })}
+                />
+              </label>
+              <label>
+                {renderInspectorPropertyLabel("Topic", "Topic used for consume/publish.", true)}
+                <input
+                  value={fieldValueAsString(currentExtras.kafkaTopic)}
+                  onChange={(event) => updateQueueExtras({ kafkaTopic: event.target.value })}
+                />
+              </label>
+              {isInputNode ? (
+                <label>
+                  {renderInspectorPropertyLabel("Consumer Group ID", "Consumer group id used by the subscriber.")}
+                  <input
+                    value={fieldValueAsString(currentExtras.kafkaGroupId)}
+                    onChange={(event) => updateQueueExtras({ kafkaGroupId: event.target.value })}
+                  />
+                </label>
+              ) : null}
+            </>
+          ) : null}
+
+          {queueProvider === "redis" ? (
+            <>
+              <label>
+                {renderInspectorPropertyLabel("Redis URL", "Redis connection URL or API endpoint.", true)}
+                <input
+                  value={fieldValueAsString(currentExtras.redisUrl)}
+                  onChange={(event) => updateQueueExtras({ redisUrl: event.target.value })}
+                />
+              </label>
+              <label>
+                {renderInspectorPropertyLabel("Channel/Stream", "Channel (or stream) used for messaging.", true)}
+                <input
+                  value={fieldValueAsString(currentExtras.redisChannel)}
+                  onChange={(event) => updateQueueExtras({ redisChannel: event.target.value })}
+                />
+              </label>
+            </>
+          ) : null}
+
+          {queueProvider === "nats" ? (
+            <>
+              <label>
+                {renderInspectorPropertyLabel("NATS URL", "NATS server URL.", true)}
+                <input
+                  value={fieldValueAsString(currentExtras.natsUrl)}
+                  onChange={(event) => updateQueueExtras({ natsUrl: event.target.value })}
+                />
+              </label>
+              <label>
+                {renderInspectorPropertyLabel("Subject", "NATS subject used for messaging.", true)}
+                <input
+                  value={fieldValueAsString(currentExtras.natsSubject)}
+                  onChange={(event) => updateQueueExtras({ natsSubject: event.target.value })}
+                />
+              </label>
+            </>
+          ) : null}
+
+          {queueProvider === "sqs" ? (
+            <>
+              <label>
+                {renderInspectorPropertyLabel("AWS Region", "AWS region used for SQS client.", true)}
+                <input
+                  value={fieldValueAsString(currentExtras.awsRegion || "us-east-1")}
+                  onChange={(event) => updateQueueExtras({ awsRegion: event.target.value })}
+                />
+              </label>
+              <label>
+                {renderInspectorPropertyLabel("Queue URL", "Full SQS queue URL.", true)}
+                <input
+                  value={fieldValueAsString(currentExtras.sqsQueueUrl)}
+                  onChange={(event) => updateQueueExtras({ sqsQueueUrl: event.target.value })}
+                />
+              </label>
+              <label>
+                {renderInspectorPropertyLabel("Endpoint URL", "Optional endpoint for local emulators (LocalStack).")}
+                <input
+                  value={fieldValueAsString(currentExtras.awsEndpointUrl || "http://localhost:4566")}
+                  onChange={(event) => updateQueueExtras({ awsEndpointUrl: event.target.value })}
+                />
+              </label>
+              <label>
+                {renderInspectorPropertyLabel("Access Key", "Access key for AWS/emulator auth.")}
+                <input
+                  value={fieldValueAsString(currentExtras.awsAccessKeyId || "test")}
+                  onChange={(event) => updateQueueExtras({ awsAccessKeyId: event.target.value })}
+                />
+              </label>
+              <label>
+                {renderInspectorPropertyLabel("Secret Key", "Secret key for AWS/emulator auth.")}
+                <input
+                  type="password"
+                  value={fieldValueAsString(currentExtras.awsSecretAccessKey || "test")}
+                  onChange={(event) => updateQueueExtras({ awsSecretAccessKey: event.target.value })}
+                />
+              </label>
+            </>
+          ) : null}
+
+          {queueProvider === "pubsub" ? (
+            <>
+              <label>
+                {renderInspectorPropertyLabel("Project ID", "Google Cloud project id used by Pub/Sub.", true)}
+                <input
+                  value={fieldValueAsString(currentExtras.pubsubProjectId)}
+                  onChange={(event) => updateQueueExtras({ pubsubProjectId: event.target.value })}
+                />
+              </label>
+              {isInputNode ? (
+                <label>
+                  {renderInspectorPropertyLabel("Subscription", "Subscription name used by subscriber.", true)}
+                  <input
+                    value={fieldValueAsString(currentExtras.pubsubSubscription)}
+                    onChange={(event) => updateQueueExtras({ pubsubSubscription: event.target.value })}
+                  />
+                </label>
+              ) : (
+                <label>
+                  {renderInspectorPropertyLabel("Topic", "Topic name used for publish.", true)}
+                  <input
+                    value={fieldValueAsString(currentExtras.pubsubTopic)}
+                    onChange={(event) => updateQueueExtras({ pubsubTopic: event.target.value })}
+                  />
+                </label>
+              )}
+              <label>
+                {renderInspectorPropertyLabel("Emulator Host", "Pub/Sub emulator host for local tests.")}
+                <input
+                  value={fieldValueAsString(currentExtras.pubsubEmulatorHost)}
+                  onChange={(event) => updateQueueExtras({ pubsubEmulatorHost: event.target.value })}
+                />
+              </label>
+            </>
+          ) : null}
+
+          {isInputNode ? (
+            <>
+              <label className="checkbox-field">
+                <input
+                  type="checkbox"
+                  checked={Boolean(currentExtras.queueSubscriberEnabled ?? false)}
+                  onChange={(event) => updateQueueExtras({ queueSubscriberEnabled: event.target.checked })}
+                />
+                {renderInspectorPropertyLabel("Enable Subscriber", "Marks this queue input as subscriber-driven." )}
+              </label>
+
+              <label>
+                {renderInspectorPropertyLabel("Poll Interval (seconds)", "Interval used by subscriber to poll messages.")}
+                <input
+                  value={fieldValueAsString(currentExtras.queuePollIntervalSeconds || "5")}
+                  onChange={(event) => updateQueueExtras({ queuePollIntervalSeconds: event.target.value })}
+                />
+              </label>
+
+              <div className="button-row">
+                <button
+                  type="button"
+                  className="secondary-button"
+                  onClick={() => handleStartQueueSubscriber(currentNode)}
+                  disabled={isUpdatingQueueSubscriber}
+                >
+                  Connect
+                </button>
+                <button
+                  type="button"
+                  className="secondary-button"
+                  onClick={() => handleStopQueueSubscriber(currentNode)}
+                  disabled={isUpdatingQueueSubscriber}
+                >
+                  Disconnect
+                </button>
+                <button
+                  type="button"
+                  className="secondary-button"
+                  onClick={() => void loadQueueSubscriberStatus(flowRouteName, currentNode.id)}
+                  disabled={isUpdatingQueueSubscriber}
+                >
+                  Refresh
+                </button>
+              </div>
+
+              <div className="info-note">
+                <p>Status: <strong>{subscriberStatus?.status || "idle"}</strong>{subscriberStatus?.connected ? " · connected" : " · disconnected"}</p>
+                {subscriberStatus?.last_message_id ? <p>Last message: <code>{subscriberStatus.last_message_id}</code></p> : null}
+                {subscriberStatus?.last_payload_received_at ? <p>Last received at: <code>{subscriberStatus.last_payload_received_at}</code></p> : null}
+                {subscriberStatus?.last_payload_preview ? <p>Received payload: <code>{subscriberStatus.last_payload_preview}</code></p> : null}
+                {subscriberStatus?.last_result ? <p>Last result: {subscriberStatus.last_result}</p> : null}
+                {subscriberStatus?.last_error ? <p className="status-error">{subscriberStatus.last_error}</p> : null}
+                <p>Flow name: <code>{flowRouteName}</code> · Node: <code>{currentNode.id}</code></p>
+              </div>
+            </>
+          ) : (
+            <div className="info-note">
+              <p>This is a queue output node. Configure publish destination above and connect an executor node as source.</p>
+            </div>
+          )}
+        </>
+      );
+    }
+
     return (
       <>
         <label>
@@ -11185,6 +11742,12 @@ export default function App() {
               ? `Connecting ${pendingSourceNode.data.name}. Click the destination left port to complete.`
               : connectionMessage ?? "To connect components: click the source right port and then the destination left port."}
           </p>
+          {currentFlowRuntimeStatus?.active_runs ? (
+            <p>
+              <strong>Running:</strong> {currentFlowRuntimeStatus.active_runs} active request(s) · total {currentFlowRuntimeStatus.total_runs} ·
+              success {currentFlowRuntimeStatus.success_runs} · failed {currentFlowRuntimeStatus.failed_runs}
+            </p>
+          ) : null}
         </div>
 
         <div

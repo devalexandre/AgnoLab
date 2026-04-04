@@ -1,4 +1,4 @@
-import { BuiltInToolFunctionOption, CanvasGraph, CanvasTemplateSummary, FlowRecord, FlowSummary, RunResult, SaveFlowResponse, SkillPathOption, WhatsappSessionStatus } from "./types";
+import { BuiltInToolFunctionOption, CanvasGraph, CanvasTemplateSummary, FlowRecord, FlowRuntimeStatus, FlowSummary, QueueSubscriberStatus, RunResult, SaveFlowResponse, SkillPathOption, WhatsappSessionStatus } from "./types";
 
 function trimTrailingSlash(value: string): string {
   return value.replace(/\/+$/, "");
@@ -130,6 +130,16 @@ export async function listFlows(): Promise<FlowSummary[]> {
   return payload.flows;
 }
 
+export async function listFlowRuntimeStatuses(flowName?: string): Promise<FlowRuntimeStatus[]> {
+  const query = flowName?.trim() ? `?flow_name=${encodeURIComponent(flowName.trim())}` : "";
+  const response = await fetch(`${API_BASE}/api/flows/runtime/statuses${query}`);
+  if (!response.ok) {
+    throw new Error("Failed to list flow runtime statuses");
+  }
+  const payload = (await response.json()) as { statuses?: FlowRuntimeStatus[] };
+  return Array.isArray(payload.statuses) ? payload.statuses : [];
+}
+
 export async function fetchFlowByName(name: string): Promise<FlowRecord> {
   const response = await fetch(`${API_BASE}/api/flows/${encodeURIComponent(name)}`);
   if (!response.ok) {
@@ -206,6 +216,42 @@ export async function stopWhatsappSession(flowName: string, nodeId: string): Pro
   );
   if (!response.ok) {
     throw new Error("Failed to stop WhatsApp session");
+  }
+  return response.json();
+}
+
+export async function fetchQueueSubscriberStatus(flowName: string, nodeId: string): Promise<QueueSubscriberStatus> {
+  const response = await fetch(
+    `${API_BASE}/api/integrations/queues/${encodeURIComponent(flowName)}/${encodeURIComponent(nodeId)}/subscriber/status`,
+  );
+  if (!response.ok) {
+    throw new Error("Failed to load queue subscriber status");
+  }
+  return response.json();
+}
+
+export async function startQueueSubscriber(flowName: string, nodeId: string): Promise<QueueSubscriberStatus> {
+  const response = await fetch(
+    `${API_BASE}/api/integrations/queues/${encodeURIComponent(flowName)}/${encodeURIComponent(nodeId)}/subscriber/start`,
+    {
+      method: "POST",
+    },
+  );
+  if (!response.ok) {
+    throw new Error("Failed to start queue subscriber");
+  }
+  return response.json();
+}
+
+export async function stopQueueSubscriber(flowName: string, nodeId: string): Promise<QueueSubscriberStatus> {
+  const response = await fetch(
+    `${API_BASE}/api/integrations/queues/${encodeURIComponent(flowName)}/${encodeURIComponent(nodeId)}/subscriber/stop`,
+    {
+      method: "POST",
+    },
+  );
+  if (!response.ok) {
+    throw new Error("Failed to stop queue subscriber");
   }
   return response.json();
 }

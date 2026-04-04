@@ -61,6 +61,24 @@ from agno.team import Team
 RESULT_START_MARKER = "__AGNO_RESULT_START__"
 RESULT_END_MARKER = "__AGNO_RESULT_END__"
 
+QUEUE_INPUT_NODE_TYPES = {
+    NodeType.RABBITMQ_INPUT,
+    NodeType.KAFKA_INPUT,
+    NodeType.REDIS_INPUT,
+    NodeType.NATS_INPUT,
+    NodeType.SQS_INPUT,
+    NodeType.PUBSUB_INPUT,
+}
+
+QUEUE_OUTPUT_NODE_TYPES = {
+    NodeType.RABBITMQ_OUTPUT,
+    NodeType.KAFKA_OUTPUT,
+    NodeType.REDIS_OUTPUT,
+    NodeType.NATS_OUTPUT,
+    NodeType.SQS_OUTPUT,
+    NodeType.PUBSUB_OUTPUT,
+}
+
 
 def _detect_project_root() -> Path:
     current = Path(__file__).resolve()
@@ -3277,9 +3295,9 @@ def compile_graph(graph: CanvasGraph) -> tuple[str, list[str]]:
     import_lines.append("")
     lines.extend(DEBUG_TRACE_HELPERS)
 
-    input_nodes = [node for node in ordered_nodes if node.type == NodeType.INPUT]
+    input_nodes = [node for node in ordered_nodes if node.type in {NodeType.INPUT, *QUEUE_INPUT_NODE_TYPES}]
     terminal_nodes = [
-        node for node in ordered_nodes if node.type in {NodeType.OUTPUT, NodeType.OUTPUT_API}
+        node for node in ordered_nodes if node.type in {NodeType.OUTPUT, NodeType.OUTPUT_API, *QUEUE_OUTPUT_NODE_TYPES}
     ]
 
     if not input_nodes:
@@ -3306,7 +3324,14 @@ def compile_graph(graph: CanvasGraph) -> tuple[str, list[str]]:
             source_id
             for source_id in incoming_ids(graph, output_node.id)
             if node_map.get(source_id)
-            and node_map[source_id].type in {NodeType.INPUT, NodeType.AGENT, NodeType.TEAM, NodeType.WORKFLOW, NodeType.TOOL}
+            and node_map[source_id].type in {
+                NodeType.INPUT,
+                *QUEUE_INPUT_NODE_TYPES,
+                NodeType.AGENT,
+                NodeType.TEAM,
+                NodeType.WORKFLOW,
+                NodeType.TOOL,
+            }
         ]
 
         if len(upstream) > 1:
@@ -3316,6 +3341,12 @@ def compile_graph(graph: CanvasGraph) -> tuple[str, list[str]]:
                 NodeType.WORKFLOW: 2,
                 NodeType.TOOL: 3,
                 NodeType.INPUT: 4,
+                NodeType.RABBITMQ_INPUT: 4,
+                NodeType.KAFKA_INPUT: 4,
+                NodeType.REDIS_INPUT: 4,
+                NodeType.NATS_INPUT: 4,
+                NodeType.SQS_INPUT: 4,
+                NodeType.PUBSUB_INPUT: 4,
             }
             upstream = sorted(
                 upstream,
@@ -3336,7 +3367,7 @@ def compile_graph(graph: CanvasGraph) -> tuple[str, list[str]]:
         elif producer_node and producer_node.type == NodeType.TOOL and producer_symbol:
             lines.append(f"result = {producer_symbol}(flow_input)")
             lines.append("flow_result_text = str(result) if result is not None else ''")
-        elif producer_node and producer_node.type == NodeType.INPUT:
+        elif producer_node and producer_node.type in {NodeType.INPUT, *QUEUE_INPUT_NODE_TYPES}:
             lines.append("flow_result_text = str(flow_input_payload.get('text') or flow_input)")
         else:
             warnings.append("Output node has no valid upstream producer.")
@@ -3350,6 +3381,10 @@ def compile_graph(graph: CanvasGraph) -> tuple[str, list[str]]:
             output_lines, output_warnings = render_output_api_dispatch(output_node, project_name=graph.project.name)
             lines.extend(output_lines)
             warnings.extend(output_warnings)
+        elif output_node.type in QUEUE_OUTPUT_NODE_TYPES:
+            warnings.append(
+                f"Queue output node '{output_node.data.name}' is configured in the canvas, but runtime dispatch is not implemented yet in generated code."
+            )
     else:
         executable_types = {NodeType.AGENT, NodeType.TEAM, NodeType.WORKFLOW, NodeType.TOOL}
         executable_nodes = [node for node in ordered_nodes if node.type in executable_types]

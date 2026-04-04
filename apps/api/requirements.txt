@@ -58,6 +58,10 @@ jira
 atlassian-python-api
 requests
 httpx
+redis
+nats-py
+confluent-kafka
+pika
 cryptography>=41.0
 pyTelegramBotAPI
 slack_sdk>=3.40.0
