@@ -1,5 +1,5 @@
 import { type ChangeEvent, type MouseEvent as ReactMouseEvent, type WheelEvent as ReactWheelEvent, useEffect, useMemo, useRef, useState } from "react";
-import { API_BASE, fetchCanvasTemplate, fetchDefaultGraph, fetchFlowByName, listBuiltInToolFunctions, listCanvasTemplates, listFlows, listOllamaModels, listSkillPaths, previewCode, runFlowByName, runGraph, saveFlow } from "./api";
+import { API_BASE, fetchCanvasTemplate, fetchDefaultGraph, fetchFlowByName, fetchWhatsappSessionStatus, listBuiltInToolFunctions, listCanvasTemplates, listFlows, listOllamaModels, listSkillPaths, previewCode, runFlowByName, runGraph, saveFlow, startWhatsappSession, stopWhatsappSession } from "./api";
 import { AGENT_FIELDS, AGENT_FIELD_GROUPS, AGNO_MODEL_PROVIDER_OPTIONS, type AgentFieldDefinition } from "./agentConfig";
 import MonacoToolEditor from "./MonacoToolEditor";
 import { NODE_CATALOG, NODE_CATEGORIES, canConnect, listNodeTypes } from "./nodeCatalog";
@@ -8,10 +8,11 @@ import { TEAM_FIELDS, TEAM_FIELD_GROUPS } from "./teamConfig";
 import { STARTER_TOOLS } from "./starterTools";
 import { BUILT_IN_TOOLS, BUILT_IN_TOOL_CATEGORIES, getBuiltInTool, type BuiltInToolDefinition } from "./toolCatalog";
 import { ToolIcon, toolIconColor } from "./toolIcons";
-import { BuiltInToolFunctionOption, CanvasGraph, CanvasTemplateSummary, FlowSummary, GraphEdge, GraphNode, NodeData, NodeType, RunResult, RuntimeCredentials, SavedUserTool, SkillPathOption, StarterToolTemplate } from "./types";
+import { BuiltInToolFunctionOption, CanvasGraph, CanvasTemplateSummary, FlowSummary, GraphEdge, GraphNode, NodeData, NodeType, ProjectRuntimeConfig, ProjectRuntimeEnvVar, RunResult, SaveFlowResponse, SavedUserTool, SkillPathOption, StarterToolTemplate, WhatsappSessionStatus } from "./types";
 
-const STORAGE_KEY = "agnolab.runtime_credentials";
 const MY_TOOLS_STORAGE_KEY = "agnolab.my_tools";
+const FLOW_DRAFT_STORAGE_KEY_PREFIX = "agnolab.flow_draft.v1:";
+const FLOW_AUTOSAVE_DELAY_MS = 1200;
 const NODE_WIDTH = 180;
 const NODE_MIN_HEIGHT = 80;
 const CANVAS_WORLD_MIN = -4000;
@@ -113,6 +114,80 @@ interface ChatMessage {
   role: "user" | "assistant";
   text: string;
   attachmentName?: string;
+}
+
+interface FlowDraftStorageRecord {
+  flowName: string;
+  graph: CanvasGraph;
+  updatedAt: string;
+}
+
+function buildFlowDraftRouteKey(routeFlowName: string | null, routeTemplateId: string | null): string | null {
+  if (!routeFlowName) {
+    return null;
+  }
+  if (routeFlowName === "new" && routeTemplateId) {
+    return `new::template:${routeTemplateId}`;
+  }
+  return routeFlowName;
+}
+
+function buildFlowDraftStorageKey(routeKey: string): string {
+  return `${FLOW_DRAFT_STORAGE_KEY_PREFIX}${routeKey}`;
+}
+
+function isCanvasGraph(value: unknown): value is CanvasGraph {
+  if (!value || typeof value !== "object") {
+    return false;
+  }
+  const candidate = value as Partial<CanvasGraph>;
+  return Boolean(candidate.project) && Array.isArray(candidate.nodes) && Array.isArray(candidate.edges);
+}
+
+function loadFlowDraftFromStorage(routeKey: string | null): FlowDraftStorageRecord | null {
+  if (!routeKey) {
+    return null;
+  }
+  try {
+    const rawValue = window.localStorage.getItem(buildFlowDraftStorageKey(routeKey));
+    if (!rawValue) {
+      return null;
+    }
+    const parsed = JSON.parse(rawValue) as Partial<FlowDraftStorageRecord>;
+    if (!parsed || typeof parsed.flowName !== "string" || !isCanvasGraph(parsed.graph)) {
+      return null;
+    }
+    return {
+      flowName: parsed.flowName,
+      graph: parsed.graph,
+      updatedAt: typeof parsed.updatedAt === "string" ? parsed.updatedAt : "",
+    };
+  } catch (error) {
+    console.error(error);
+    return null;
+  }
+}
+
+function saveFlowDraftToStorage(routeKey: string | null, draft: FlowDraftStorageRecord) {
+  if (!routeKey) {
+    return;
+  }
+  try {
+    window.localStorage.setItem(buildFlowDraftStorageKey(routeKey), JSON.stringify(draft));
+  } catch (error) {
+    console.error(error);
+  }
+}
+
+function clearFlowDraftFromStorage(routeKey: string | null) {
+  if (!routeKey) {
+    return;
+  }
+  try {
+    window.localStorage.removeItem(buildFlowDraftStorageKey(routeKey));
+  } catch (error) {
+    console.error(error);
+  }
 }
 
 function escapeHtml(value: string): string {
@@ -359,6 +434,24 @@ interface LibrarySearchResult {
   onSelect: () => void;
 }
 
+interface SavedFlowIntegrationModalState {
+  name: string;
+  authToken?: string | null;
+}
+
+interface WebhookCurlModalState {
+  title: string;
+  endpoint: string;
+  command: string;
+}
+
+interface WhatsappSessionModalState {
+  flowName: string;
+  nodeId: string;
+  nodeName: string;
+  session?: WhatsappSessionStatus | null;
+}
+
 function matchesLibrarySearch(query: string, ...parts: Array<string | undefined | null>): boolean {
   if (!query) {
     return true;
@@ -553,10 +646,18 @@ const INTEGRATION_INPUT_LIBRARY_ITEMS: IntegrationLibraryItem[] = [
   {
     key: "webhook-input",
     label: "Webhook Input",
-    description: "Accept inbound HTTP requests as flow triggers with headers, payload, and signature validation.",
+    description: "Accept inbound HTTP requests as flow triggers with headers, payload parsing, and optional shared-secret validation.",
     helper: "Useful for Stripe, GitHub, WhatsApp, and custom app callbacks.",
-    badge: "Planned",
-    status: "planned",
+    badge: "HTTP",
+    status: "available",
+  },
+  {
+    key: "whatsapp-input",
+    label: "WhatsApp Input",
+    description: "Connect a WhatsApp session with QR scan, listen to incoming messages, and feed each matching message into the flow.",
+    helper: "Uses a WPPConnect gateway session plus webhook callbacks for real-time trigger and auto-reply.",
+    badge: "QR + Listen",
+    status: "available",
   },
   {
     key: "queue-input",
@@ -569,10 +670,10 @@ const INTEGRATION_INPUT_LIBRARY_ITEMS: IntegrationLibraryItem[] = [
   {
     key: "form-input",
     label: "Form Submission Input",
-    description: "Receive structured form fields and uploaded files from an embeddable form endpoint.",
+    description: "Receive structured form fields and uploaded files from a multipart or URL-encoded form endpoint.",
     helper: "Good fit for intake workflows, onboarding, and support requests.",
-    badge: "Planned",
-    status: "planned",
+    badge: "FormData",
+    status: "available",
   },
 ];
 
@@ -589,27 +690,37 @@ const INTEGRATION_OUTPUT_LIBRARY_ITEMS: IntegrationLibraryItem[] = [
     key: "smtp-output",
     label: "Email Send Output",
     description: "Send an email summary, reply, or alert when the flow finishes.",
-    helper: "Would support SMTP, recipients, templates, and attachments.",
-    badge: "Planned",
-    status: "planned",
+    helper: "Supports SMTP, recipients, template placeholders, and optional forwarding of input files as attachments.",
+    badge: "SMTP",
+    status: "available",
   },
   {
     key: "chat-output",
     label: "Chat Message Output",
-    description: "Push a completion message to Slack, Teams, Telegram, or WhatsApp channels.",
+    description: "Push a completion message to Slack, Discord, Telegram, or a generic webhook endpoint.",
     helper: "Useful for approvals, alerts, and operational updates.",
-    badge: "Planned",
-    status: "planned",
+    badge: "Chat",
+    status: "available",
   },
   {
     key: "sheet-output",
     label: "Spreadsheet Output",
-    description: "Append structured rows to Google Sheets, Excel, or Airtable after each run.",
+    description: "Append structured rows to a local CSV spreadsheet file after each run.",
     helper: "Great for ops logs, CRM updates, and lightweight audit trails.",
-    badge: "Planned",
-    status: "planned",
+    badge: "CSV",
+    status: "available",
   },
 ];
+
+const AGNO_OUTPUT_FORMAT_OPTIONS = [
+  { value: "text", label: "Text" },
+  { value: "markdown", label: "Markdown" },
+  { value: "json", label: "JSON" },
+  { value: "yaml", label: "YAML" },
+  { value: "xml", label: "XML" },
+  { value: "csv", label: "CSV" },
+  { value: "html", label: "HTML" },
+] as const;
 
 type VectorDbPresetKey = "pgvector" | "qdrant" | "chroma" | "pinecone" | "lancedb" | "weaviate";
 type DatabasePresetKey = "sqlite-db" | "postgres-db" | "mongo-db" | "async-postgres-db";
@@ -913,6 +1024,18 @@ function sanitizeGeneratedCode(code: string): string {
     .replace(
       /('password'\s*:\s*)'[^']*'/g,
       "$1'<omitted from code preview>'",
+    )
+    .replace(
+      /(_agnolab_[a-z_]*password\s*=\s*)'[^']*'/g,
+      "$1'<omitted from code preview>'",
+    )
+    .replace(
+      /(_agnolab_[a-z_]*secret\s*=\s*)'[^']*'/g,
+      "$1'<omitted from code preview>'",
+    )
+    .replace(
+      /(_agnolab_[a-z_]*token\s*=\s*)'[^']*'/g,
+      "$1'<omitted from code preview>'",
     );
 }
 
@@ -1112,24 +1235,52 @@ function downloadAsFile(content: string, fileName: string, mimeType: string) {
   window.URL.revokeObjectURL(url);
 }
 
-function buildRunFlowCurlCommand(flowName: string): string {
-  return [
+type IntegrationLanguage = "curl" | "go" | "python" | "javascript";
+
+function escapeDoubleQuotedShell(value: string): string {
+  return value.replace(/(["\\$`])/g, "\\$1");
+}
+
+function buildJsonCurlPayload(payload: Record<string, unknown>): string[] {
+  const jsonLines = JSON.stringify(payload, null, 2).split("\n");
+  return jsonLines.map((line, index) => {
+    if (index === 0) {
+      return `  -d '${line}`;
+    }
+    if (index === jsonLines.length - 1) {
+      return `${line}'`;
+    }
+    return line;
+  });
+}
+
+function buildRunFlowCurlCommand(flowName: string, authToken?: string | null): string {
+  const lines = [
     `curl -X POST "${API_BASE}/api/flows/run" \\`,
     "  -H \"Content-Type: application/json\" \\",
-    "  -d '{",
-    `    \"name\": \"${flowName}\",`,
-    "    \"debug\": false,",
-    "    \"input_text\": \"Hello from POST\",",
-    "    \"input_metadata\": {",
-    "      \"tenant\": \"acme\"",
-    "    }",
-    "  }'",
+  ];
+
+  if (authToken?.trim()) {
+    lines.push(`  -H "Authorization: Bearer ${escapeDoubleQuotedShell(authToken.trim())}" \\`);
+  }
+
+  return [
+    ...lines,
+    ...buildJsonCurlPayload({
+      name: flowName,
+      debug: false,
+      input_text: "Hello from POST",
+      input_metadata: {
+        tenant: "acme",
+      },
+    }),
   ].join("\n");
 }
 
-type IntegrationLanguage = "curl" | "go" | "python" | "javascript";
-
-function buildRunFlowGoExample(flowName: string): string {
+function buildRunFlowGoExample(flowName: string, authToken?: string | null): string {
+  const authLine = authToken?.trim()
+    ? `    req.Header.Set("Authorization", "Bearer ${authToken.trim().replace(/"/g, '\\"')}")`
+    : "";
   return [
     "package main",
     "",
@@ -1147,6 +1298,7 @@ function buildRunFlowGoExample(flowName: string): string {
     "        panic(err)",
     "    }",
     '    req.Header.Set("Content-Type", "application/json")',
+    authLine,
     "",
     "    resp, err := http.DefaultClient.Do(req)",
     "    if err != nil {",
@@ -1164,9 +1316,15 @@ function buildRunFlowGoExample(flowName: string): string {
   ].join("\n");
 }
 
-function buildRunFlowPythonExample(flowName: string): string {
+function buildRunFlowPythonExample(flowName: string, authToken?: string | null): string {
+  const headerLines = ['headers = {"Content-Type": "application/json"}'];
+  if (authToken?.trim()) {
+    headerLines.push(`headers["Authorization"] = "Bearer ${authToken.trim().replace(/"/g, '\\"')}"`);
+  }
   return [
     "import requests",
+    "",
+    ...headerLines,
     "",
     `response = requests.post("${API_BASE}/api/flows/run", json={`,
     `    "name": "${flowName}",`,
@@ -1175,19 +1333,23 @@ function buildRunFlowPythonExample(flowName: string): string {
     '    "input_metadata": {',
     '        "tenant": "acme",',
     "    },",
-    "})",
+    "}, headers=headers)",
     "",
     "print(response.status_code)",
     "print(response.text)",
   ].join("\n");
 }
 
-function buildRunFlowJavaScriptExample(flowName: string): string {
+function buildRunFlowJavaScriptExample(flowName: string, authToken?: string | null): string {
+  const authLine = authToken?.trim()
+    ? `    Authorization: "Bearer ${authToken.trim().replace(/"/g, '\\"')}",`
+    : "";
   return [
     `const response = await fetch("${API_BASE}/api/flows/run", {`,
     '  method: "POST",',
     "  headers: {",
     '    "Content-Type": "application/json",',
+    authLine,
     "  },",
     "  body: JSON.stringify({",
     `    name: "${flowName}",`,
@@ -1204,17 +1366,52 @@ function buildRunFlowJavaScriptExample(flowName: string): string {
   ].join("\n");
 }
 
-function buildIntegrationSnippet(flowName: string, language: IntegrationLanguage): string {
+function buildIntegrationSnippet(flowName: string, language: IntegrationLanguage, authToken?: string | null): string {
   if (language === "go") {
-    return buildRunFlowGoExample(flowName);
+    return buildRunFlowGoExample(flowName, authToken);
   }
   if (language === "python") {
-    return buildRunFlowPythonExample(flowName);
+    return buildRunFlowPythonExample(flowName, authToken);
   }
   if (language === "javascript") {
-    return buildRunFlowJavaScriptExample(flowName);
+    return buildRunFlowJavaScriptExample(flowName, authToken);
   }
-  return buildRunFlowCurlCommand(flowName);
+  return buildRunFlowCurlCommand(flowName, authToken);
+}
+
+function buildWebhookCurlCommand(
+  endpoint: string,
+  options: {
+    textField?: unknown;
+    secretHeader?: unknown;
+    secretValue?: unknown;
+    authToken?: unknown;
+  },
+): string {
+  const resolvedTextField = fieldValueAsString(options.textField).trim() || "message";
+  const secretHeader = fieldValueAsString(options.secretHeader).trim() || "X-AgnoLab-Secret";
+  const secretValue = fieldValueAsString(options.secretValue);
+  const authToken = fieldValueAsString(options.authToken).trim();
+  const lines = [
+    `curl -X POST "${endpoint}" \\`,
+    "  -H \"Content-Type: application/json\" \\",
+  ];
+
+  if (authToken) {
+    lines.push(`  -H "Authorization: Bearer ${escapeDoubleQuotedShell(authToken)}" \\`);
+  }
+  if (secretValue.trim()) {
+    lines.push(`  -H "${escapeDoubleQuotedShell(secretHeader)}: ${escapeDoubleQuotedShell(secretValue.trim())}" \\`);
+  }
+
+  return [
+    ...lines,
+    ...buildJsonCurlPayload({
+      [resolvedTextField]: "Hello from webhook",
+      tenant: "acme",
+      source: "curl",
+    }),
+  ].join("\n");
 }
 
 function getIntegrationEditorLanguage(language: IntegrationLanguage): string {
@@ -1244,6 +1441,17 @@ function getFlowNameFromPath(pathname: string): string | null {
 
 function buildFlowPath(flowName: string): string {
   return `/flow/${encodeURIComponent(flowName)}`;
+}
+
+function buildPersistedFlowSnapshot(flowName: string, graph: CanvasGraph | null): string {
+  if (!graph) {
+    return "";
+  }
+  const normalizedName = slugifyFlowName(flowName) || flowName.trim();
+  return JSON.stringify({
+    flowName: normalizedName,
+    graph,
+  });
 }
 
 function clampCanvasZoom(value: number): number {
@@ -1276,6 +1484,11 @@ function buildBlankGraph(): CanvasGraph {
     project: {
       name: "Blank Flow",
       target: "agno-python",
+      runtime: {
+        envVars: [],
+        authEnabled: false,
+        authToken: null,
+      },
     },
     nodes: [],
     edges: [],
@@ -1284,6 +1497,45 @@ function buildBlankGraph(): CanvasGraph {
 
 function isObjectRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function createDefaultProjectRuntime(): ProjectRuntimeConfig {
+  return {
+    envVars: [],
+    authEnabled: false,
+    authToken: null,
+  };
+}
+
+function normalizeProjectRuntime(value: unknown): ProjectRuntimeConfig {
+  const runtime = isObjectRecord(value) ? value : {};
+  const rawEnvVars = Array.isArray(runtime.envVars) ? runtime.envVars : [];
+
+  return {
+    envVars: rawEnvVars.map((item) => ({
+      key: isObjectRecord(item) ? fieldValueAsString(item.key) : "",
+      value: isObjectRecord(item) ? fieldValueAsString(item.value) : "",
+    })),
+    authEnabled: Boolean(runtime.authEnabled),
+    authToken: runtime.authToken == null ? null : fieldValueAsString(runtime.authToken),
+  };
+}
+
+function getGraphProjectRuntime(graph: CanvasGraph | null): ProjectRuntimeConfig {
+  return normalizeProjectRuntime(graph?.project?.runtime);
+}
+
+function getGraphAuthToken(graph: CanvasGraph | null): string {
+  const runtime = getGraphProjectRuntime(graph);
+  return runtime.authEnabled ? fieldValueAsString(runtime.authToken).trim() : "";
+}
+
+function createClientSecret(prefix: string): string {
+  const rawToken =
+    typeof crypto !== "undefined" && typeof crypto.randomUUID === "function"
+      ? crypto.randomUUID().replace(/-/g, "")
+      : `${Date.now()}${Math.random().toString(16).slice(2)}`;
+  return `${prefix}_${rawToken.slice(0, 24)}`;
 }
 
 function normalizeImportedNodeData(value: unknown, fallbackName: string): NodeData {
@@ -1380,6 +1632,7 @@ function normalizeImportedFlowPayload(rawValue: unknown): { graph: CanvasGraph; 
     project: {
       name: projectName,
       target: targetValue === "agnogo" ? "agnogo" : "agno-python",
+      runtime: normalizeProjectRuntime(rawProject.runtime),
     },
     nodes,
     edges,
@@ -2561,6 +2814,121 @@ function createEmailInputNodeData(index: number): NodeData {
   };
 }
 
+function createWebhookInputNodeData(index: number): NodeData {
+  return {
+    name: `Webhook Input ${index}`,
+    description: "Accepts inbound HTTP requests and maps the payload into the flow runtime.",
+    prompt: "Webhook event received.",
+    extras: {
+      inputSource: "webhook",
+      inputMode: "text",
+      inputText: "Webhook event received.",
+      attachedFileName: "",
+      attachedFileAlias: "",
+      attachedFileMimeType: "",
+      attachedFileEncoding: "base64",
+      attachedFileBase64: "",
+      attachedFileContent: "",
+      payloadJson: '{\n  "source": "webhook"\n}',
+      hitlAutoApprove: "",
+      hitlUserInputJson: "",
+      webhookSecret: "",
+      webhookSecretHeader: "X-AgnoLab-Secret",
+      webhookTextField: "message",
+    },
+  };
+}
+
+function createWhatsappInputNodeData(index: number): NodeData {
+  return {
+    name: `WhatsApp Input ${index}`,
+    description: "Receives WhatsApp messages from a connected session and can auto-reply with the flow result.",
+    prompt: "WhatsApp message received.",
+    extras: {
+      inputSource: "whatsapp",
+      inputMode: "text",
+      inputText: "WhatsApp message received.",
+      attachedFileName: "",
+      attachedFileAlias: "",
+      attachedFileMimeType: "",
+      attachedFileEncoding: "base64",
+      attachedFileBase64: "",
+      attachedFileContent: "",
+      payloadJson: '{\n  "source": "whatsapp"\n}',
+      hitlAutoApprove: "",
+      hitlUserInputJson: "",
+      whatsappSessionId: `agnolab_whatsapp_${index}`,
+      whatsappWebhookSecret: createClientSecret("wa"),
+      whatsappIgnoreGroups: true,
+      whatsappSenderFilter: "",
+      whatsappBodyKeywords: "",
+      whatsappReplyEnabled: true,
+      whatsappReplyTemplate: "$result_text",
+    },
+  };
+}
+
+function createFormInputNodeData(index: number): NodeData {
+  return {
+    name: `Form Input ${index}`,
+    description: "Receives form submissions with fields and uploaded files, then runs the flow automatically.",
+    prompt: "New form submission received.",
+    extras: {
+      inputSource: "form",
+      inputMode: "mixed",
+      inputText: "New form submission received.",
+      attachedFileName: "",
+      attachedFileAlias: "",
+      attachedFileMimeType: "",
+      attachedFileEncoding: "base64",
+      attachedFileBase64: "",
+      attachedFileContent: "",
+      payloadJson: '{\n  "source": "form_submission"\n}',
+      hitlAutoApprove: "",
+      hitlUserInputJson: "",
+      formSecret: "",
+      formSecretHeader: "X-AgnoLab-Secret",
+      formSecretField: "_secret",
+      formTextField: "message",
+      formMetadataField: "metadata_json",
+      formPrimaryFileField: "",
+    },
+  };
+}
+
+function createEmailOutputNodeData(index: number): NodeData {
+  return {
+    name: `Email Send Output ${index}`,
+    output_format: "text",
+    extras: {
+      ...NODE_CATALOG.output_api.createData(index).extras,
+      outputMode: "email",
+    },
+  };
+}
+
+function createChatOutputNodeData(index: number): NodeData {
+  return {
+    name: `Chat Message Output ${index}`,
+    output_format: "json",
+    extras: {
+      ...NODE_CATALOG.output_api.createData(index).extras,
+      outputMode: "chat",
+    },
+  };
+}
+
+function createSpreadsheetOutputNodeData(index: number): NodeData {
+  return {
+    name: `Spreadsheet Output ${index}`,
+    output_format: "json",
+    extras: {
+      ...NODE_CATALOG.output_api.createData(index).extras,
+      outputMode: "spreadsheet",
+    },
+  };
+}
+
 function createManagerNodeData(type: "memory_manager" | "session_summary_manager" | "compression_manager"): NodeData {
   const label = NODE_CATALOG[type].label;
   const extras: Record<string, unknown> = {};
@@ -2595,12 +2963,20 @@ function getToolMode(data: NodeData): "builtin" | "function" {
   return (data.extras?.toolMode as "builtin" | "function" | undefined) ?? "builtin";
 }
 
-function getInputSource(data: NodeData): "manual" | "email" {
-  return (data.extras?.inputSource as "manual" | "email" | undefined) ?? "manual";
+function getInputSource(data: NodeData): "manual" | "email" | "webhook" | "whatsapp" | "form" {
+  return (data.extras?.inputSource as "manual" | "email" | "webhook" | "whatsapp" | "form" | undefined) ?? "manual";
 }
 
 function getInputMode(data: NodeData): "text" | "file" | "mixed" {
   return (data.extras?.inputMode as "text" | "file" | "mixed" | undefined) ?? "text";
+}
+
+function getOutputMode(data: NodeData): "api" | "email" | "chat" | "spreadsheet" {
+  return (data.extras?.outputMode as "api" | "email" | "chat" | "spreadsheet" | undefined) ?? "api";
+}
+
+function getChatProvider(data: NodeData): "slack" | "discord" | "telegram" | "generic" | "whatsapp" {
+  return (data.extras?.chatProvider as "slack" | "discord" | "telegram" | "generic" | "whatsapp" | undefined) ?? "slack";
 }
 
 function getEmailProtocol(data: NodeData): "imap" | "pop" {
@@ -2818,6 +3194,23 @@ function getCanvasNodeMeta(node: { type: keyof typeof NODE_CATALOG; data: NodeDa
       return `${protocol} inbox`;
     }
 
+    if (inputSource === "webhook") {
+      const textField = fieldValueAsString(node.data.extras?.webhookTextField).trim() || "message";
+      return `Webhook · ${textField}`;
+    }
+
+    if (inputSource === "whatsapp") {
+      const sessionId = fieldValueAsString(node.data.extras?.whatsappSessionId).trim() || "session not configured";
+      const senderFilter = fieldValueAsString(node.data.extras?.whatsappSenderFilter).trim();
+      return senderFilter ? `WhatsApp · ${sessionId} · ${senderFilter}` : `WhatsApp · ${sessionId}`;
+    }
+
+    if (inputSource === "form") {
+      const textField = fieldValueAsString(node.data.extras?.formTextField).trim() || "message";
+      const fileField = fieldValueAsString(node.data.extras?.formPrimaryFileField).trim();
+      return fileField ? `Form · ${textField} · ${fileField}` : `Form · ${textField}`;
+    }
+
     const inputMode = getInputMode(node.data);
     const inputText = getInputText(node.data);
     const attachedFileName = getAttachedFileName(node.data);
@@ -2834,7 +3227,36 @@ function getCanvasNodeMeta(node: { type: keyof typeof NODE_CATALOG; data: NodeDa
   }
 
   if (node.type === "output_api") {
-    const apiUrl = fieldValueAsString(node.data.extras?.apiUrl);
+    const outputMode = getOutputMode(node.data);
+    if (outputMode === "email") {
+      const recipients = fieldValueAsString(node.data.extras?.emailTo).trim();
+      return recipients || "SMTP recipients not configured";
+    }
+    if (outputMode === "chat") {
+      const provider = getChatProvider(node.data);
+      if (provider === "telegram") {
+        const channel = fieldValueAsString(node.data.extras?.chatChannelId).trim();
+        return channel ? `Telegram · ${channel}` : "Telegram target not configured";
+      }
+      if (provider === "whatsapp") {
+        const sessionId = fieldValueAsString(node.data.extras?.chatWhatsappSessionId).trim();
+        const target = fieldValueAsString(node.data.extras?.chatChannelId).trim();
+        if (sessionId && target) {
+          return `WhatsApp · ${sessionId} · ${target}`;
+        }
+        if (sessionId) {
+          return `WhatsApp · ${sessionId}`;
+        }
+        return "WhatsApp target not configured";
+      }
+      const webhookUrl = fieldValueAsString(node.data.extras?.chatWebhookUrl).trim();
+      return webhookUrl || `${provider} webhook not configured`;
+    }
+    if (outputMode === "spreadsheet") {
+      const sheetFilePath = fieldValueAsString(node.data.extras?.sheetFilePath).trim();
+      return sheetFilePath || "CSV path not configured";
+    }
+    const apiUrl = fieldValueAsString(node.data.extras?.apiUrl).trim();
     return apiUrl || "POST URL not configured";
   }
 
@@ -3077,6 +3499,8 @@ export default function App() {
   const pendingImportedGraphRef = useRef<CanvasGraph | null>(null);
   const pendingImportedFlowNameRef = useRef("imported_flow");
   const hitlRunConfirmResolverRef = useRef<((approved: boolean) => void) | null>(null);
+  const lastPersistedFlowSnapshotRef = useRef("");
+  const autosaveTimeoutRef = useRef<number | null>(null);
   const [currentPath, setCurrentPath] = useState<string>(() => window.location.pathname);
   const [currentSearch, setCurrentSearch] = useState<string>(() => window.location.search);
   const [graph, setGraph] = useState<CanvasGraph | null>(null);
@@ -3084,7 +3508,6 @@ export default function App() {
   const [selectedEdgeId, setSelectedEdgeId] = useState<string | null>(null);
   const [code, setCode] = useState("");
   const [warnings, setWarnings] = useState<string[]>([]);
-  const [credentials, setCredentials] = useState<RuntimeCredentials>({});
   const [runResult, setRunResult] = useState<RunResult | null>(null);
   const [runError, setRunError] = useState<string | null>(null);
   const [isRunning, setIsRunning] = useState(false);
@@ -3106,10 +3529,16 @@ export default function App() {
   const [runByNameInputText, setRunByNameInputText] = useState("");
   const [runByNameMetadata, setRunByNameMetadata] = useState("{}\n");
   const [isSavingFlow, setIsSavingFlow] = useState(false);
+  const [autosaveState, setAutosaveState] = useState<"idle" | "pending" | "saving" | "saved" | "error">("idle");
+  const [autosaveError, setAutosaveError] = useState<string | null>(null);
   const [isRunningSavedFlow, setIsRunningSavedFlow] = useState(false);
-  const [savedFlowIntegrationModal, setSavedFlowIntegrationModal] = useState<{ name: string } | null>(null);
+  const [savedFlowIntegrationModal, setSavedFlowIntegrationModal] = useState<SavedFlowIntegrationModalState | null>(null);
   const [activeIntegrationLanguage, setActiveIntegrationLanguage] = useState<IntegrationLanguage>("curl");
   const [didCopyIntegration, setDidCopyIntegration] = useState(false);
+  const [webhookCurlModal, setWebhookCurlModal] = useState<WebhookCurlModalState | null>(null);
+  const [didCopyWebhookCurl, setDidCopyWebhookCurl] = useState(false);
+  const [whatsappSessionModal, setWhatsappSessionModal] = useState<WhatsappSessionModalState | null>(null);
+  const [isUpdatingWhatsappSession, setIsUpdatingWhatsappSession] = useState(false);
   const [isLoadingRouteFlow, setIsLoadingRouteFlow] = useState(false);
   const [homeError, setHomeError] = useState<string | null>(null);
   const [isChatOpen, setIsChatOpen] = useState(false);
@@ -3142,6 +3571,12 @@ export default function App() {
   const isHomeRoute = currentPath === "/";
   const routeFlowName = useMemo(() => getFlowNameFromPath(currentPath), [currentPath]);
   const routeTemplateId = useMemo(() => getTemplateIdFromSearch(currentSearch), [currentSearch]);
+  const flowDraftRouteKey = useMemo(() => buildFlowDraftRouteKey(routeFlowName, routeTemplateId), [routeFlowName, routeTemplateId]);
+  const projectRuntime = getGraphProjectRuntime(graph);
+  const projectRuntimeEnvVars = projectRuntime.envVars;
+  const projectAuthEnabled = projectRuntime.authEnabled;
+  const projectAuthToken = fieldValueAsString(projectRuntime.authToken);
+  const currentFlowSnapshot = useMemo(() => buildPersistedFlowSnapshot(flowName, graph), [flowName, graph]);
 
   useEffect(() => {
     listFlows()
@@ -3262,6 +3697,7 @@ export default function App() {
     }
 
     const targetFlowName = routeFlowName ?? "";
+    const targetDraftRouteKey = buildFlowDraftRouteKey(routeFlowName, routeTemplateId);
     if (!targetFlowName) {
       window.history.replaceState({}, "", "/");
       setCurrentPath("/");
@@ -3287,10 +3723,33 @@ export default function App() {
             setCanvasOffset({ x: 0, y: 0 });
             setCanvasZoom(1);
             ignoreCanvasClickRef.current = false;
+            lastPersistedFlowSnapshotRef.current = buildPersistedFlowSnapshot(importedFlowName || slugifyFlowName(importedGraph.project.name) || "imported_flow", importedGraph);
             setGraph(importedGraph);
             setFlowName(importedFlowName || slugifyFlowName(importedGraph.project.name) || "imported_flow");
+            setAutosaveState("idle");
+            setAutosaveError(null);
             setHomeError(null);
             setConnectionMessage(`Flow '${importedFlowName || importedGraph.project.name}' imported. Save to persist it.`);
+            return;
+          }
+
+          const localDraft = loadFlowDraftFromStorage(targetDraftRouteKey);
+          if (localDraft) {
+            if (cancelled) {
+              return;
+            }
+            hasAutoCenteredRef.current = false;
+            setCanvasPanState(null);
+            setCanvasOffset({ x: 0, y: 0 });
+            setCanvasZoom(1);
+            ignoreCanvasClickRef.current = false;
+            lastPersistedFlowSnapshotRef.current = buildPersistedFlowSnapshot(localDraft.flowName || "new_flow", localDraft.graph);
+            setGraph(localDraft.graph);
+            setFlowName(localDraft.flowName || "new_flow");
+            setAutosaveState("idle");
+            setAutosaveError(null);
+            setHomeError(null);
+            setConnectionMessage("Local draft restored after reload.");
             return;
           }
 
@@ -3303,13 +3762,35 @@ export default function App() {
           setCanvasOffset({ x: 0, y: 0 });
           setCanvasZoom(1);
           ignoreCanvasClickRef.current = false;
+          lastPersistedFlowSnapshotRef.current = buildPersistedFlowSnapshot(slugifyFlowName(defaultGraph.project.name) || "new_flow", defaultGraph);
           setGraph(defaultGraph);
           setFlowName(slugifyFlowName(defaultGraph.project.name) || "new_flow");
+          setAutosaveState("idle");
+          setAutosaveError(null);
           setHomeError(null);
           return;
         }
 
         if (targetFlowName === "blank") {
+          const localDraft = loadFlowDraftFromStorage(targetDraftRouteKey);
+          if (localDraft) {
+            if (cancelled) {
+              return;
+            }
+            hasAutoCenteredRef.current = false;
+            setCanvasPanState(null);
+            setCanvasOffset({ x: 0, y: 0 });
+            setCanvasZoom(1);
+            ignoreCanvasClickRef.current = false;
+            lastPersistedFlowSnapshotRef.current = buildPersistedFlowSnapshot(localDraft.flowName || "blank_flow", localDraft.graph);
+            setGraph(localDraft.graph);
+            setFlowName(localDraft.flowName || "blank_flow");
+            setAutosaveState("idle");
+            setAutosaveError(null);
+            setHomeError(null);
+            setConnectionMessage("Local draft restored after reload.");
+            return;
+          }
           if (cancelled) {
             return;
           }
@@ -3318,8 +3799,12 @@ export default function App() {
           setCanvasOffset({ x: 0, y: 0 });
           setCanvasZoom(1);
           ignoreCanvasClickRef.current = false;
-          setGraph(buildBlankGraph());
+          const blankGraph = buildBlankGraph();
+          lastPersistedFlowSnapshotRef.current = buildPersistedFlowSnapshot("blank_flow", blankGraph);
+          setGraph(blankGraph);
           setFlowName("blank_flow");
+          setAutosaveState("idle");
+          setAutosaveError(null);
           setHomeError(null);
           return;
         }
@@ -3328,14 +3813,23 @@ export default function App() {
         if (cancelled) {
           return;
         }
+        const localDraft = loadFlowDraftFromStorage(targetDraftRouteKey);
+        const nextGraph = localDraft?.graph ?? record.graph;
+        const nextFlowName = localDraft?.flowName || slugifyFlowName(record.name) || record.name;
         hasAutoCenteredRef.current = false;
         setCanvasPanState(null);
         setCanvasOffset({ x: 0, y: 0 });
         setCanvasZoom(1);
         ignoreCanvasClickRef.current = false;
-        setGraph(record.graph);
-        setFlowName(slugifyFlowName(record.name) || record.name);
+        lastPersistedFlowSnapshotRef.current = buildPersistedFlowSnapshot(slugifyFlowName(record.name) || record.name, record.graph);
+        setGraph(nextGraph);
+        setFlowName(nextFlowName);
+        setAutosaveState("idle");
+        setAutosaveError(null);
         setHomeError(null);
+        if (localDraft) {
+          setConnectionMessage("Local draft restored after reload.");
+        }
       } catch (error) {
         if (cancelled) {
           return;
@@ -3356,18 +3850,6 @@ export default function App() {
   }, [isHomeRoute, routeFlowName, routeTemplateId]);
 
   useEffect(() => {
-    const saved = window.localStorage.getItem(STORAGE_KEY);
-    if (!saved) {
-      return;
-    }
-    try {
-      setCredentials(JSON.parse(saved));
-    } catch (error) {
-      console.error(error);
-    }
-  }, []);
-
-  useEffect(() => {
     const savedTools = window.localStorage.getItem(MY_TOOLS_STORAGE_KEY);
     if (!savedTools) {
       return;
@@ -3380,12 +3862,98 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    window.localStorage.setItem(STORAGE_KEY, JSON.stringify(credentials));
-  }, [credentials]);
-
-  useEffect(() => {
     window.localStorage.setItem(MY_TOOLS_STORAGE_KEY, JSON.stringify(myTools));
   }, [myTools]);
+
+  useEffect(() => {
+    if (isHomeRoute || !graph || !flowDraftRouteKey) {
+      return;
+    }
+    saveFlowDraftToStorage(flowDraftRouteKey, {
+      flowName,
+      graph,
+      updatedAt: new Date().toISOString(),
+    });
+  }, [flowDraftRouteKey, flowName, graph, isHomeRoute]);
+
+  useEffect(() => {
+    if (autosaveTimeoutRef.current !== null) {
+      window.clearTimeout(autosaveTimeoutRef.current);
+      autosaveTimeoutRef.current = null;
+    }
+
+    if (isHomeRoute || !graph || isLoadingRouteFlow) {
+      return;
+    }
+
+    const normalizedName = slugifyFlowName(flowName);
+    if (!normalizedName) {
+      setAutosaveState("idle");
+      return;
+    }
+
+    if (currentFlowSnapshot === lastPersistedFlowSnapshotRef.current) {
+      if (autosaveState !== "error") {
+        setAutosaveState("saved");
+      }
+      return;
+    }
+
+    if (isSavingFlow) {
+      return;
+    }
+
+    setAutosaveState("pending");
+    autosaveTimeoutRef.current = window.setTimeout(() => {
+      saveCurrentFlow({
+        openIntegrationModal: false,
+        suppressSuccessMessage: true,
+        source: "autosave",
+      }).catch(console.error);
+    }, FLOW_AUTOSAVE_DELAY_MS);
+
+    return () => {
+      if (autosaveTimeoutRef.current !== null) {
+        window.clearTimeout(autosaveTimeoutRef.current);
+        autosaveTimeoutRef.current = null;
+      }
+    };
+  }, [autosaveState, currentFlowSnapshot, flowName, graph, isHomeRoute, isLoadingRouteFlow, isSavingFlow]);
+
+  useEffect(() => {
+    if (!whatsappSessionModal) {
+      return;
+    }
+
+    let cancelled = false;
+    let timeoutId: number | null = null;
+
+    const poll = async () => {
+      const session = await loadWhatsappSessionState(whatsappSessionModal.flowName, whatsappSessionModal.nodeId);
+      if (!cancelled && session) {
+        setWhatsappSessionModal((current) =>
+          current && current.flowName === whatsappSessionModal.flowName && current.nodeId === whatsappSessionModal.nodeId
+            ? {
+                ...current,
+                session,
+              }
+            : current,
+        );
+      }
+      if (!cancelled) {
+        timeoutId = window.setTimeout(poll, 3000);
+      }
+    };
+
+    timeoutId = window.setTimeout(poll, 3000);
+
+    return () => {
+      cancelled = true;
+      if (timeoutId !== null) {
+        window.clearTimeout(timeoutId);
+      }
+    };
+  }, [whatsappSessionModal?.flowName, whatsappSessionModal?.nodeId]);
 
   useEffect(() => {
     if (!graph) {
@@ -3695,7 +4263,7 @@ export default function App() {
   const inputNode = useMemo(() => getPrimaryInputNode(graph), [graph]);
   const inputSource = useMemo(() => (inputNode ? getInputSource(inputNode.data) : "manual"), [inputNode]);
   const inputMode = useMemo(() => (inputNode ? getInputMode(inputNode.data) : "text"), [inputNode]);
-  const chatSupportsFileUpload = inputSource === "manual" && (inputMode === "mixed" || inputMode === "file");
+  const chatSupportsFileUpload = inputSource !== "email" && (inputMode === "mixed" || inputMode === "file");
   const selectedAgentProvider = useMemo(() => {
     if (!selectedNode || selectedNode.type !== "agent") {
       return "";
@@ -3914,6 +4482,100 @@ export default function App() {
 
   function addEmailInputNode() {
     addConfiguredInputNode(createEmailInputNodeData, "Email Inbox Input added to canvas.");
+  }
+
+  function addWebhookInputNode() {
+    addConfiguredInputNode(createWebhookInputNodeData, "Webhook Input added to canvas.");
+  }
+
+  function addWhatsappInputNode() {
+    addConfiguredInputNode(createWhatsappInputNodeData, "WhatsApp Input added to canvas.");
+  }
+
+  function addFormInputNode() {
+    addConfiguredInputNode(createFormInputNodeData, "Form Submission Input added to canvas.");
+  }
+
+  function addConfiguredOutputNode(createData: (index: number) => NodeData, message: string) {
+    if (!graph) {
+      return;
+    }
+
+    const nodeId = createNodeId(graph, "output_api");
+    setGraph((currentGraph) => {
+      if (!currentGraph) {
+        return currentGraph;
+      }
+
+      const safeNodeId = createNodeId(currentGraph, "output_api");
+      const nextIndex = currentGraph.nodes.filter((node) => node.type === "output_api").length + 1;
+
+      return {
+        ...currentGraph,
+        nodes: [
+          ...currentGraph.nodes,
+          {
+            id: safeNodeId,
+            type: "output_api",
+            position: createNodePosition(currentGraph),
+            data: createData(nextIndex),
+          },
+        ],
+      };
+    });
+    setSelectedNodeId(nodeId);
+    setSelectedEdgeId(null);
+    setConnectionMessage(message);
+    setActiveRightTab("properties");
+  }
+
+  function addEmailOutputNode() {
+    addConfiguredOutputNode(createEmailOutputNodeData, "Email Send Output added to canvas.");
+  }
+
+  function addChatOutputNode() {
+    addConfiguredOutputNode(createChatOutputNodeData, "Chat Message Output added to canvas.");
+  }
+
+  function addSpreadsheetOutputNode() {
+    addConfiguredOutputNode(createSpreadsheetOutputNodeData, "Spreadsheet Output added to canvas.");
+  }
+
+  function handleIntegrationInputLibrarySelect(itemKey: string) {
+    if (itemKey === "email-inbox") {
+      addEmailInputNode();
+      return;
+    }
+    if (itemKey === "webhook-input") {
+      addWebhookInputNode();
+      return;
+    }
+    if (itemKey === "whatsapp-input") {
+      addWhatsappInputNode();
+      return;
+    }
+    if (itemKey === "form-input") {
+      addFormInputNode();
+      return;
+    }
+  }
+
+  function handleIntegrationOutputLibrarySelect(itemKey: string) {
+    if (itemKey === "api-output") {
+      addNode("output_api");
+      return;
+    }
+    if (itemKey === "smtp-output") {
+      addEmailOutputNode();
+      return;
+    }
+    if (itemKey === "chat-output") {
+      addChatOutputNode();
+      return;
+    }
+    if (itemKey === "sheet-output") {
+      addSpreadsheetOutputNode();
+    }
   }
 
   function addBuiltInToolNode(tool: BuiltInToolDefinition) {
@@ -4362,7 +5024,7 @@ export default function App() {
     setOutputResponseOnly(false);
 
     try {
-      let result = await runGraph(runtimeGraph, credentials);
+      let result = await runGraph(runtimeGraph);
       if (!hitlAutoApprovedForRun && shouldPromptHitlConfirmationFromRunResult(runtimeGraph, result)) {
         const approved = await requestHitlRunConfirmation(
           "This flow paused on a confirmation gate. Confirm to rerun this preview with hitl_auto_approve=true.",
@@ -4376,7 +5038,7 @@ export default function App() {
         setGraph(runtimeGraph);
         hitlAutoApprovedForRun = true;
         setConnectionMessage("HITL confirmation approved after pause. Re-running with hitl_auto_approve=true.");
-        result = await runGraph(runtimeGraph, credentials);
+        result = await runGraph(runtimeGraph);
       }
       setRunResult(result);
     } catch (error) {
@@ -4431,7 +5093,7 @@ export default function App() {
       return;
     }
 
-    if (inputSource === "manual" && inputMode !== "text" && !chatDraft.fileName) {
+    if (inputSource !== "email" && inputMode !== "text" && !chatDraft.fileName) {
       setConnectionMessage("Current Input mode requires a file in chat upload.");
       return;
     }
@@ -4445,6 +5107,12 @@ export default function App() {
     const userText =
       inputSource === "email"
         ? "Check the configured inbox and run the flow with the newest matching email."
+        : inputSource === "webhook"
+        ? normalizedUserText || "Preview webhook payload"
+        : inputSource === "whatsapp"
+        ? normalizedUserText || "Preview WhatsApp message"
+        : inputSource === "form"
+        ? normalizedUserText || (chatDraft.fileAlias || chatDraft.fileName || "Preview form submission")
         : inputMode === "file"
         ? normalizedUserText || (chatDraft.fileAlias || chatDraft.fileName || "Uploaded file")
         : normalizedUserText || "(empty message)";
@@ -4480,7 +5148,7 @@ export default function App() {
     setRunResult(null);
 
     try {
-      let result = await runGraph(runtimeGraph, credentials);
+      let result = await runGraph(runtimeGraph);
       if (!hitlAutoApprovedForChatRun && shouldPromptHitlConfirmationFromRunResult(runtimeGraph, result)) {
         const approved = await requestHitlRunConfirmation(
           "This flow paused on a confirmation gate. Confirm to rerun this chat execution with hitl_auto_approve=true.",
@@ -4501,7 +5169,7 @@ export default function App() {
         setGraph(runtimeGraph);
         hitlAutoApprovedForChatRun = true;
         setConnectionMessage("HITL confirmation approved after pause for chat execution.");
-        result = await runGraph(runtimeGraph, credentials);
+        result = await runGraph(runtimeGraph);
       }
       setRunResult(result);
       const assistantText = result.clean_stdout || extractAgentResponse(result.stdout) || result.stdout || (result.success ? "No clean assistant reply was produced." : result.stderr);
@@ -4575,7 +5243,23 @@ export default function App() {
     navigateToRoute("/");
   }
 
-  async function handleSaveFlow() {
+  function upsertSavedFlowSummary(payload: Pick<SaveFlowResponse, "name" | "updated_at">) {
+    setSavedFlows((current) => {
+      const next = [
+        { name: payload.name, updated_at: payload.updated_at },
+        ...current.filter((item) => item.name !== payload.name),
+      ];
+      next.sort((left, right) => right.updated_at.localeCompare(left.updated_at));
+      return next;
+    });
+  }
+
+  async function saveCurrentFlow(options?: {
+    openIntegrationModal?: boolean;
+    successMessage?: string;
+    suppressSuccessMessage?: boolean;
+    source?: "manual" | "runtime" | "autosave";
+  }) {
     if (!graph) {
       return;
     }
@@ -4587,6 +5271,10 @@ export default function App() {
     }
 
     setIsSavingFlow(true);
+    if (options?.source === "autosave") {
+      setAutosaveState("saving");
+      setAutosaveError(null);
+    }
     try {
       const hasEmailListenerInput = graph.nodes.some(
         (node) =>
@@ -4594,27 +5282,63 @@ export default function App() {
           getInputSource(node.data) === "email" &&
           node.data.extras?.emailListenerEnabled !== false,
       );
-      await saveFlow(normalizedName, graph);
+      const response = await saveFlow(normalizedName, graph);
+      lastPersistedFlowSnapshotRef.current = buildPersistedFlowSnapshot(normalizedName, graph);
+      const nextDraftRouteKey = buildFlowDraftRouteKey(normalizedName, null);
+      if (flowDraftRouteKey && flowDraftRouteKey !== nextDraftRouteKey) {
+        clearFlowDraftFromStorage(flowDraftRouteKey);
+      }
+      saveFlowDraftToStorage(nextDraftRouteKey, {
+        flowName: normalizedName,
+        graph,
+        updatedAt: new Date().toISOString(),
+      });
       setFlowName(normalizedName);
       window.history.replaceState({}, "", buildFlowPath(normalizedName));
       setCurrentPath(buildFlowPath(normalizedName));
       setCurrentSearch("");
-      await refreshSavedFlows();
-      setConnectionMessage(
-        hasEmailListenerInput
-          ? `Flow '${normalizedName}' saved successfully. Email listener synced in the backend.`
-          : `Flow '${normalizedName}' saved successfully.`,
-      );
-      setSavedFlowIntegrationModal({
-        name: normalizedName,
-      });
-      setActiveIntegrationLanguage("curl");
-      setDidCopyIntegration(false);
+      upsertSavedFlowSummary(response);
+      const defaultMessage = hasEmailListenerInput
+        ? `Flow '${normalizedName}' saved successfully. Email listener synced in the backend.`
+        : `Flow '${normalizedName}' saved successfully.`;
+      if (!options?.suppressSuccessMessage) {
+        setConnectionMessage(options?.successMessage || defaultMessage);
+      }
+      if (options?.source === "autosave") {
+        setAutosaveState("saved");
+        setAutosaveError(null);
+      }
+      if (options?.openIntegrationModal === true) {
+        setSavedFlowIntegrationModal({
+          name: normalizedName,
+          authToken: getGraphAuthToken(graph),
+        });
+        setActiveIntegrationLanguage("curl");
+        setDidCopyIntegration(false);
+      }
     } catch (error) {
-      setConnectionMessage(error instanceof Error ? error.message : "Failed to save flow.");
+      const message = error instanceof Error ? error.message : "Failed to save flow.";
+      if (options?.source === "autosave") {
+        setAutosaveState("error");
+        setAutosaveError(message);
+      }
+      setConnectionMessage(message);
     } finally {
       setIsSavingFlow(false);
     }
+  }
+
+  async function handleSaveFlow() {
+    await saveCurrentFlow({
+      openIntegrationModal: false,
+    });
+  }
+
+  async function handleSaveRuntimeData() {
+    await saveCurrentFlow({
+      openIntegrationModal: false,
+      successMessage: `Runtime settings for '${slugifyFlowName(flowName) || flowName}' saved successfully.`,
+    });
   }
 
   async function handleCopyIntegrationSnippet() {
@@ -4624,7 +5348,7 @@ export default function App() {
 
     try {
       await window.navigator.clipboard.writeText(
-        buildIntegrationSnippet(savedFlowIntegrationModal.name, activeIntegrationLanguage),
+        buildIntegrationSnippet(savedFlowIntegrationModal.name, activeIntegrationLanguage, savedFlowIntegrationModal.authToken),
       );
       setDidCopyIntegration(true);
     } catch (error) {
@@ -4680,7 +5404,8 @@ export default function App() {
     setRunResult(null);
     setOutputResponseOnly(false);
     try {
-      let result = await runFlowByName(normalizedName, runByNameInputText, metadataPayload, credentials);
+      const savedFlowAuthToken = getGraphAuthToken(savedGraphForRun);
+      let result = await runFlowByName(normalizedName, runByNameInputText, metadataPayload, savedFlowAuthToken);
       if (
         savedGraphForRun &&
         !hitlAutoApprovedForSavedRun &&
@@ -4701,7 +5426,7 @@ export default function App() {
         hitlAutoApprovedForSavedRun = true;
         setRunByNameMetadata(stringifyJsonObject(metadataPayload));
         setConnectionMessage("HITL confirmation approved after pause. Re-running saved flow with hitl_auto_approve=true.");
-        result = await runFlowByName(normalizedName, runByNameInputText, metadataPayload, credentials);
+        result = await runFlowByName(normalizedName, runByNameInputText, metadataPayload, savedFlowAuthToken);
       }
       setRunResult(result);
       setConnectionMessage(`Saved flow '${normalizedName}' executed.`);
@@ -4788,18 +5513,200 @@ export default function App() {
     }
   }
 
-  function handleOpenIntegrationModal(targetFlowName?: string) {
+  function updateProjectRuntime(patch: Partial<ProjectRuntimeConfig>) {
+    setGraph((currentGraph) => {
+      if (!currentGraph) {
+        return currentGraph;
+      }
+
+      return {
+        ...currentGraph,
+        project: {
+          ...currentGraph.project,
+          runtime: {
+            ...createDefaultProjectRuntime(),
+            ...getGraphProjectRuntime(currentGraph),
+            ...patch,
+          },
+        },
+      };
+    });
+  }
+
+  function addProjectRuntimeEnvVar() {
+    updateProjectRuntime({
+      envVars: [...projectRuntimeEnvVars, { key: "", value: "" }],
+    });
+  }
+
+  function updateProjectRuntimeEnvVar(index: number, patch: Partial<ProjectRuntimeEnvVar>) {
+    updateProjectRuntime({
+      envVars: projectRuntimeEnvVars.map((item, itemIndex) =>
+        itemIndex === index
+          ? {
+              ...item,
+              ...patch,
+            }
+          : item,
+      ),
+    });
+  }
+
+  function removeProjectRuntimeEnvVar(index: number) {
+    updateProjectRuntime({
+      envVars: projectRuntimeEnvVars.filter((_, itemIndex) => itemIndex !== index),
+    });
+  }
+
+  async function handleOpenIntegrationModal(targetFlowName?: string) {
     const normalizedName = slugifyFlowName(targetFlowName ?? flowName);
     if (!normalizedName) {
       setConnectionMessage("Provide a valid flow name to generate an integration snippet.");
       return;
     }
 
+    let authToken = targetFlowName ? "" : getGraphAuthToken(graph);
+    if (targetFlowName) {
+      try {
+        const record = await fetchFlowByName(normalizedName);
+        authToken = getGraphAuthToken(record.graph);
+      } catch (error) {
+        console.error(error);
+      }
+    }
+
     setSavedFlowIntegrationModal({
       name: normalizedName,
+      authToken,
     });
     setActiveIntegrationLanguage("curl");
     setDidCopyIntegration(false);
+  }
+
+  async function handleCopyWebhookCurlCommand() {
+    if (!webhookCurlModal) {
+      return;
+    }
+
+    try {
+      await window.navigator.clipboard.writeText(webhookCurlModal.command);
+      setDidCopyWebhookCurl(true);
+    } catch (error) {
+      console.error(error);
+      setConnectionMessage("Failed to copy webhook cURL example.");
+    }
+  }
+
+  function handleOpenWebhookCurlModal(node: GraphNode, endpoint: string) {
+    const extras = node.data.extras ?? {};
+    setWebhookCurlModal({
+      title: node.data.name,
+      endpoint,
+      command: buildWebhookCurlCommand(endpoint, {
+        textField: extras.webhookTextField,
+        secretHeader: extras.webhookSecretHeader,
+        secretValue: extras.webhookSecret,
+        authToken: getGraphAuthToken(graph),
+      }),
+    });
+    setDidCopyWebhookCurl(false);
+  }
+
+  async function loadWhatsappSessionState(flowRouteName: string, nodeId: string): Promise<WhatsappSessionStatus | null> {
+    try {
+      return await fetchWhatsappSessionStatus(flowRouteName, nodeId);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Failed to load WhatsApp session status.";
+      setConnectionMessage(message);
+      return null;
+    }
+  }
+
+  async function handleOpenWhatsappSessionModal(node: GraphNode) {
+    const flowRouteName = slugifyFlowName(flowName);
+    if (!flowRouteName) {
+      setConnectionMessage("Save the flow with a valid name before connecting WhatsApp.");
+      return;
+    }
+    if (!savedFlows.some((flow) => flow.name === flowRouteName)) {
+      setConnectionMessage("Save the flow before connecting WhatsApp so the gateway can target a persisted flow name.");
+      return;
+    }
+
+    const nextModal: WhatsappSessionModalState = {
+      flowName: flowRouteName,
+      nodeId: node.id,
+      nodeName: node.data.name,
+      session: null,
+    };
+    setWhatsappSessionModal(nextModal);
+
+    const session = await loadWhatsappSessionState(flowRouteName, node.id);
+    setWhatsappSessionModal((current) =>
+      current && current.flowName === flowRouteName && current.nodeId === node.id
+        ? {
+            ...current,
+            session,
+          }
+        : current,
+    );
+  }
+
+  async function handleStartWhatsappSession() {
+    if (!whatsappSessionModal) {
+      return;
+    }
+
+    setIsUpdatingWhatsappSession(true);
+    try {
+      const session = await startWhatsappSession(whatsappSessionModal.flowName, whatsappSessionModal.nodeId);
+      setWhatsappSessionModal((current) => (current ? { ...current, session } : current));
+      setConnectionMessage(
+        session.last_error
+          ? session.last_error
+          : `WhatsApp session '${session.session_id}' started. Scan the QR code to connect.`,
+      );
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Failed to start WhatsApp session.";
+      setConnectionMessage(message);
+    } finally {
+      setIsUpdatingWhatsappSession(false);
+    }
+  }
+
+  async function handleRefreshWhatsappSession() {
+    if (!whatsappSessionModal) {
+      return;
+    }
+
+    setIsUpdatingWhatsappSession(true);
+    try {
+      const session = await fetchWhatsappSessionStatus(whatsappSessionModal.flowName, whatsappSessionModal.nodeId);
+      setWhatsappSessionModal((current) => (current ? { ...current, session } : current));
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Failed to refresh WhatsApp session.";
+      setConnectionMessage(message);
+    } finally {
+      setIsUpdatingWhatsappSession(false);
+    }
+  }
+
+  async function handleStopWhatsappSession() {
+    if (!whatsappSessionModal) {
+      return;
+    }
+
+    setIsUpdatingWhatsappSession(true);
+    try {
+      const session = await stopWhatsappSession(whatsappSessionModal.flowName, whatsappSessionModal.nodeId);
+      setWhatsappSessionModal((current) => (current ? { ...current, session } : current));
+      setConnectionMessage(session.last_error ? session.last_error : `WhatsApp session '${session.session_id}' stopped.`);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Failed to stop WhatsApp session.";
+      setConnectionMessage(message);
+    } finally {
+      setIsUpdatingWhatsappSession(false);
+    }
   }
 
   function getCanvasLocalPoint(clientX: number, clientY: number): PointerPosition | null {
@@ -7337,6 +8244,10 @@ export default function App() {
       const attachedFileMimeType = fieldValueAsString(currentNode.data.extras?.attachedFileMimeType);
       const emailUnreadOnly = Boolean(currentExtras.emailUnreadOnly ?? true);
       const emailListenerEnabled = Boolean(currentExtras.emailListenerEnabled ?? true);
+      const currentFlowRouteName = slugifyFlowName(flowName) || "save_this_flow_first";
+      const webhookEndpoint = `${API_BASE}/api/integrations/webhook/${encodeURIComponent(currentFlowRouteName)}/${encodeURIComponent(currentNode.id)}`;
+      const whatsappEventsEndpoint = `${API_BASE}/api/integrations/whatsapp/${encodeURIComponent(currentFlowRouteName)}/${encodeURIComponent(currentNode.id)}/events`;
+      const formEndpoint = `${API_BASE}/api/integrations/form/${encodeURIComponent(currentFlowRouteName)}/${encodeURIComponent(currentNode.id)}`;
       const updateInputExtras = (patch: Record<string, unknown>) =>
         setGraph(
           updateNodeData(currentGraph, currentNode.id, {
@@ -7405,32 +8316,86 @@ export default function App() {
           </label>
 
           <label>
-            {renderInspectorPropertyLabel("Input Source", "Choose whether this flow starts from manual payloads or from a mailbox poll.", true)}
+            {renderInspectorPropertyLabel("Input Source", "Choose whether this flow starts from manual payloads, email inbox polling, webhooks, WhatsApp messages, or form submissions.", true)}
             <select
               value={currentInputSource}
               onChange={(event) => {
-                const nextSource = event.target.value as "manual" | "email";
-                updateInputExtras(
-                  nextSource === "email"
-                    ? {
-                        inputSource: "email",
-                        inputMode: "text",
-                        attachedFileName: "",
-                        attachedFileAlias: "",
-                        attachedFileMimeType: "",
-                        attachedFileEncoding: "base64",
-                        attachedFileBase64: "",
-                        attachedFileContent: "",
-                        emailPort: fieldValueAsString(currentExtras.emailPort).trim() || getDefaultEmailPort(emailProtocol, emailSecurity),
-                      }
-                    : {
-                        inputSource: "manual",
-                      },
-                );
+                const nextSource = event.target.value as "manual" | "email" | "webhook" | "whatsapp" | "form";
+                if (nextSource === "email") {
+                  updateInputExtras({
+                    inputSource: "email",
+                    inputMode: "text",
+                    attachedFileName: "",
+                    attachedFileAlias: "",
+                    attachedFileMimeType: "",
+                    attachedFileEncoding: "base64",
+                    attachedFileBase64: "",
+                    attachedFileContent: "",
+                    emailPort: fieldValueAsString(currentExtras.emailPort).trim() || getDefaultEmailPort(emailProtocol, emailSecurity),
+                  });
+                  return;
+                }
+
+                if (nextSource === "webhook") {
+                  updateInputExtras({
+                    inputSource: "webhook",
+                    inputMode: "text",
+                    attachedFileName: "",
+                    attachedFileAlias: "",
+                    attachedFileMimeType: "",
+                    attachedFileEncoding: "base64",
+                    attachedFileBase64: "",
+                    attachedFileContent: "",
+                    inputText: getInputText(currentNode.data) || "Webhook event received.",
+                    webhookSecretHeader: fieldValueAsString(currentExtras.webhookSecretHeader) || "X-AgnoLab-Secret",
+                    webhookTextField: fieldValueAsString(currentExtras.webhookTextField) || "message",
+                  });
+                  return;
+                }
+
+                if (nextSource === "whatsapp") {
+                  updateInputExtras({
+                    inputSource: "whatsapp",
+                    inputMode: "text",
+                    attachedFileName: "",
+                    attachedFileAlias: "",
+                    attachedFileMimeType: "",
+                    attachedFileEncoding: "base64",
+                    attachedFileBase64: "",
+                    attachedFileContent: "",
+                    inputText: getInputText(currentNode.data) || "WhatsApp message received.",
+                    whatsappSessionId: fieldValueAsString(currentExtras.whatsappSessionId) || `agnolab_whatsapp_${currentNode.id}`,
+                    whatsappWebhookSecret: fieldValueAsString(currentExtras.whatsappWebhookSecret) || createClientSecret("wa"),
+                    whatsappIgnoreGroups: currentExtras.whatsappIgnoreGroups ?? true,
+                    whatsappReplyEnabled: currentExtras.whatsappReplyEnabled ?? true,
+                    whatsappReplyTemplate: fieldValueAsString(currentExtras.whatsappReplyTemplate) || "$result_text",
+                  });
+                  return;
+                }
+
+                if (nextSource === "form") {
+                  updateInputExtras({
+                    inputSource: "form",
+                    inputMode: inputMode === "file" ? "file" : "mixed",
+                    inputText: getInputText(currentNode.data) || "New form submission received.",
+                    formSecretHeader: fieldValueAsString(currentExtras.formSecretHeader) || "X-AgnoLab-Secret",
+                    formSecretField: fieldValueAsString(currentExtras.formSecretField) || "_secret",
+                    formTextField: fieldValueAsString(currentExtras.formTextField) || "message",
+                    formMetadataField: fieldValueAsString(currentExtras.formMetadataField) || "metadata_json",
+                  });
+                  return;
+                }
+
+                updateInputExtras({
+                  inputSource: "manual",
+                });
               }}
             >
               <option value="manual">Manual payload</option>
               <option value="email">Email inbox</option>
+              <option value="webhook">Webhook</option>
+              <option value="whatsapp">WhatsApp</option>
+              <option value="form">Form submission</option>
             </select>
           </label>
 
@@ -7529,7 +8494,7 @@ export default function App() {
                 </>
               ) : null}
             </>
-          ) : (
+          ) : currentInputSource === "email" ? (
             <>
               <label>
                 {renderInspectorPropertyLabel("Protocol", "Select whether this mailbox should be read with IMAP or POP3.", true)}
@@ -7692,7 +8657,312 @@ export default function App() {
                 <p>After you save the flow, the backend listener can monitor this inbox automatically. Manual run still works and uses the newest matching email as `flow_input_payload.text`.</p>
               </div>
             </>
-          )}
+          ) : currentInputSource === "webhook" ? (
+            <>
+              <label>
+                {renderInspectorPropertyLabel("Webhook Endpoint", "Save the flow, then send HTTP POST requests to this endpoint to trigger it.")}
+                <input value={webhookEndpoint} readOnly />
+              </label>
+
+              <div className="button-row">
+                <button
+                  type="button"
+                  className="secondary-button"
+                  onClick={() => handleOpenWebhookCurlModal(currentNode, webhookEndpoint)}
+                >
+                  Show cURL Example
+                </button>
+              </div>
+
+              <label>
+                {renderInspectorPropertyLabel("Shared Secret", "Optional secret compared against the configured header before the flow is allowed to run.")}
+                <input
+                  type="password"
+                  value={fieldValueAsString(currentExtras.webhookSecret)}
+                  onChange={(event) => updateInputExtras({ webhookSecret: event.target.value })}
+                />
+              </label>
+
+              <label>
+                {renderInspectorPropertyLabel("Secret Header", "Header name used to carry the shared secret from the caller, for example X-AgnoLab-Secret.")}
+                <input
+                  value={fieldValueAsString(currentExtras.webhookSecretHeader)}
+                  onChange={(event) => updateInputExtras({ webhookSecretHeader: event.target.value })}
+                />
+              </label>
+
+              <label>
+                {renderInspectorPropertyLabel("Text Field", "JSON field preferred as the main flow text when the webhook body is an object.")}
+                <input
+                  value={fieldValueAsString(currentExtras.webhookTextField)}
+                  onChange={(event) => updateInputExtras({ webhookTextField: event.target.value })}
+                />
+              </label>
+
+              <label>
+                {renderInspectorPropertyLabel("Fallback Text", "Preview text used for manual runs or when the webhook body does not expose the configured field.")}
+                <textarea
+                  value={getInputText(selectedNode.data)}
+                  onChange={(event) =>
+                    setGraph(
+                      updateNodeData(currentGraph, currentNode.id, {
+                        prompt: event.target.value,
+                        extras: {
+                          ...(currentNode.data.extras ?? {}),
+                          inputText: event.target.value,
+                        },
+                      }),
+                    )
+                  }
+                />
+              </label>
+
+              <div className="info-note">
+                <p>External callers can send JSON or plain text. The backend forwards headers, query params, parsed JSON, and body metadata into the flow.</p>
+                {projectAuthEnabled ? <p>This flow also requires `Authorization: Bearer ...` on webhook requests.</p> : null}
+              </div>
+            </>
+          ) : currentInputSource === "whatsapp" ? (
+            <>
+              <label>
+                {renderInspectorPropertyLabel("WhatsApp Session ID", "Stable session name used inside the WhatsApp gateway. Reuse the same id to preserve the linked device login.", true)}
+                <input
+                  value={fieldValueAsString(currentExtras.whatsappSessionId)}
+                  onChange={(event) => updateInputExtras({ whatsappSessionId: event.target.value })}
+                />
+              </label>
+
+              <label>
+                {renderInspectorPropertyLabel("Events Endpoint", "Internal callback used by the WhatsApp gateway to trigger this flow when a new message arrives.")}
+                <input value={whatsappEventsEndpoint} readOnly />
+              </label>
+
+              <div className="button-row">
+                <button
+                  type="button"
+                  className="secondary-button"
+                  onClick={() => handleOpenWhatsappSessionModal(currentNode)}
+                >
+                  Connect / Scan QR
+                </button>
+              </div>
+
+              <label className="checkbox-field">
+                <input
+                  type="checkbox"
+                  checked={Boolean(currentExtras.whatsappIgnoreGroups ?? true)}
+                  onChange={(event) => updateInputExtras({ whatsappIgnoreGroups: event.target.checked })}
+                />
+                {renderInspectorPropertyLabel("Ignore Group Messages", "When enabled, only direct 1:1 WhatsApp conversations trigger the flow.")}
+              </label>
+
+              <label>
+                {renderInspectorPropertyLabel("Sender Filter", "Optional case-insensitive substring filter applied to the sender id or push name.")}
+                <input
+                  value={fieldValueAsString(currentExtras.whatsappSenderFilter)}
+                  onChange={(event) => updateInputExtras({ whatsappSenderFilter: event.target.value })}
+                />
+              </label>
+
+              <label>
+                {renderInspectorPropertyLabel("Body Keywords", "Optional comma or line-break separated keywords. All keywords must appear in the incoming WhatsApp message.")}
+                <textarea
+                  value={fieldValueAsString(currentExtras.whatsappBodyKeywords)}
+                  onChange={(event) => updateInputExtras({ whatsappBodyKeywords: event.target.value })}
+                />
+              </label>
+
+              <label className="checkbox-field">
+                <input
+                  type="checkbox"
+                  checked={Boolean(currentExtras.whatsappReplyEnabled ?? true)}
+                  onChange={(event) => updateInputExtras({ whatsappReplyEnabled: event.target.checked })}
+                />
+                {renderInspectorPropertyLabel("Auto Reply With Flow Result", "Sends the final clean flow result back to the same WhatsApp chat using the connected gateway session.")}
+              </label>
+
+              <label>
+                {renderInspectorPropertyLabel("Reply Template", "Template for the outgoing WhatsApp reply. Use `$result_text`, `$input_text`, `$whatsapp_from`, `$whatsapp_sender_name`, and metadata keys.")}
+                <textarea
+                  value={fieldValueAsString(currentExtras.whatsappReplyTemplate)}
+                  onChange={(event) => updateInputExtras({ whatsappReplyTemplate: event.target.value })}
+                />
+              </label>
+
+              <label>
+                {renderInspectorPropertyLabel("Fallback Text", "Preview text used when you manually run this flow without a live WhatsApp event.")}
+                <textarea
+                  value={getInputText(selectedNode.data)}
+                  onChange={(event) =>
+                    setGraph(
+                      updateNodeData(currentGraph, currentNode.id, {
+                        prompt: event.target.value,
+                        extras: {
+                          ...(currentNode.data.extras ?? {}),
+                          inputText: event.target.value,
+                        },
+                      }),
+                    )
+                  }
+                />
+              </label>
+
+              <div className="info-note">
+                <p>Save the flow, open Connect / Scan QR, and pair the device. After that, each matching WhatsApp message runs the flow and can reply automatically with the final result.</p>
+                <p>The WhatsApp listener always executes the saved flow version on the backend. If you changed agent wiring, instructions, or Runtime Variables, save the flow before testing a new message.</p>
+                <p>The QR/session modal uses `WHATSAPP_GATEWAY_BASE_URL`, `WHATSAPP_GATEWAY_SECRET_KEY`, and `WHATSAPP_WEBHOOK_BASE_URL` from the saved flow Runtime Variables. Save the flow again after editing them.</p>
+              </div>
+            </>
+          ) : currentInputSource === "form" ? (
+            <>
+              <label>
+                {renderInspectorPropertyLabel("Form Endpoint", "Save the flow, then submit multipart or URL-encoded forms to this endpoint.")}
+                <input value={formEndpoint} readOnly />
+              </label>
+
+              <label>
+                {renderInspectorPropertyLabel("Payload Mode", "Controls the preview payload used when you test this input manually from chat or run preview.", true)}
+                <select
+                  value={inputMode}
+                  onChange={(event) =>
+                    updateInputExtras({
+                      inputMode: event.target.value,
+                    })
+                  }
+                >
+                  <option value="text">Text only</option>
+                  <option value="file">File only</option>
+                  <option value="mixed">Text + file</option>
+                </select>
+              </label>
+
+              {inputMode !== "file" ? (
+                <label>
+                  {renderInspectorPropertyLabel("Preview Text", "Preview text used for manual runs or when the form text field is empty.")}
+                  <textarea
+                    value={getInputText(selectedNode.data)}
+                    onChange={(event) =>
+                      setGraph(
+                        updateNodeData(currentGraph, currentNode.id, {
+                          prompt: event.target.value,
+                          extras: {
+                            ...(currentNode.data.extras ?? {}),
+                            inputText: event.target.value,
+                          },
+                        }),
+                      )
+                    }
+                  />
+                </label>
+              ) : null}
+
+              {inputMode !== "text" ? (
+                <>
+                  <label>
+                    {renderInspectorPropertyLabel("Upload File", "Preview attachment used when testing form submissions manually.")}
+                    <input type="file" accept={FLOW_INPUT_FILE_ACCEPT} onChange={handleInputFileChange} />
+                  </label>
+                  <p className="muted">{FLOW_INPUT_FILE_SUPPORT_NOTE}</p>
+
+                  <label>
+                    {renderInspectorPropertyLabel("File Alias", "Optional display name exposed alongside the uploaded file path.")}
+                    <input
+                      value={fieldValueAsString(currentExtras.attachedFileAlias)}
+                      onChange={(event) =>
+                        updateInputExtras({
+                          attachedFileAlias: event.target.value,
+                        })
+                      }
+                    />
+                  </label>
+
+                  {attachedFileName ? (
+                    <div className="info-note">
+                      <p>
+                        <strong>{attachedFileName}</strong>
+                      </p>
+                      <p>{attachedFileMimeType || "text/plain"}</p>
+                      <div className="button-row">
+                        <button
+                          type="button"
+                          className="secondary-button"
+                          onClick={() =>
+                            updateInputExtras({
+                              attachedFileName: "",
+                              attachedFileAlias: "",
+                              attachedFileMimeType: "",
+                              attachedFileEncoding: "base64",
+                              attachedFileBase64: "",
+                              attachedFileContent: "",
+                            })
+                          }
+                        >
+                          Clear File
+                        </button>
+                      </div>
+                    </div>
+                  ) : (
+                    <div className="info-note">
+                      <p>Use upload to preview a file-backed form submission.</p>
+                    </div>
+                  )}
+                </>
+              ) : null}
+
+              <label>
+                {renderInspectorPropertyLabel("Shared Secret", "Optional secret accepted either from the configured header or from the configured hidden form field.")}
+                <input
+                  type="password"
+                  value={fieldValueAsString(currentExtras.formSecret)}
+                  onChange={(event) => updateInputExtras({ formSecret: event.target.value })}
+                />
+              </label>
+
+              <label>
+                {renderInspectorPropertyLabel("Secret Header", "Optional header name that can carry the secret for form submissions.")}
+                <input
+                  value={fieldValueAsString(currentExtras.formSecretHeader)}
+                  onChange={(event) => updateInputExtras({ formSecretHeader: event.target.value })}
+                />
+              </label>
+
+              <label>
+                {renderInspectorPropertyLabel("Secret Form Field", "Hidden form field name that can also carry the secret.")}
+                <input
+                  value={fieldValueAsString(currentExtras.formSecretField)}
+                  onChange={(event) => updateInputExtras({ formSecretField: event.target.value })}
+                />
+              </label>
+
+              <label>
+                {renderInspectorPropertyLabel("Text Field", "Field name preferred as the main flow text when the form is submitted.")}
+                <input
+                  value={fieldValueAsString(currentExtras.formTextField)}
+                  onChange={(event) => updateInputExtras({ formTextField: event.target.value })}
+                />
+              </label>
+
+              <label>
+                {renderInspectorPropertyLabel("Metadata JSON Field", "Optional form field whose content is parsed as JSON and merged into flow_input_metadata.")}
+                <input
+                  value={fieldValueAsString(currentExtras.formMetadataField)}
+                  onChange={(event) => updateInputExtras({ formMetadataField: event.target.value })}
+                />
+              </label>
+
+              <label>
+                {renderInspectorPropertyLabel("Primary File Field", "Optional field name used to prioritize one uploaded file when a form sends many files.")}
+                <input
+                  value={fieldValueAsString(currentExtras.formPrimaryFileField)}
+                  onChange={(event) => updateInputExtras({ formPrimaryFileField: event.target.value })}
+                />
+              </label>
+
+              <div className="info-note">
+                <p>The backend accepts multipart form-data and x-www-form-urlencoded payloads. All fields and files are exposed to the flow runtime metadata.</p>
+              </div>
+            </>
+          ) : null}
 
           <label>
             {renderInspectorPropertyLabel("Payload Metadata JSON", "Static metadata merged into `flow_input_metadata` on every run.")}
@@ -8290,6 +9560,19 @@ export default function App() {
 
     if (selectedNode.type === "output_api") {
       const currentNode = selectedNode;
+      const currentExtras = currentNode.data.extras ?? {};
+      const outputMode = getOutputMode(currentNode.data);
+      const chatProvider = getChatProvider(currentNode.data);
+      const updateOutputExtras = (patch: Record<string, unknown>) =>
+        setGraph(
+          updateNodeData(graph, currentNode.id, {
+            extras: {
+              ...currentExtras,
+              ...patch,
+            },
+          }),
+        );
+
       return (
         <>
           <label>
@@ -8304,111 +9587,345 @@ export default function App() {
           </label>
 
           <label>
-            API URL
-            <span className="required-mark">*</span>
-            <input
-              placeholder="https://api.example.com/webhooks/flow-result"
-              value={fieldValueAsString(currentNode.data.extras?.apiUrl)}
-              onChange={(event) =>
-                setGraph(
-                  updateNodeData(graph, currentNode.id, {
-                    extras: {
-                      ...(currentNode.data.extras ?? {}),
-                      apiUrl: event.target.value,
-                    },
-                  }),
-                )
-              }
-            />
+            {renderInspectorPropertyLabel("Output Mode", "Choose where this integration output should deliver the final flow result.", true)}
+            <select
+              value={outputMode}
+              onChange={(event) => updateOutputExtras({ outputMode: event.target.value })}
+            >
+              <option value="api">API POST</option>
+              <option value="email">Email send</option>
+              <option value="chat">Chat message</option>
+              <option value="spreadsheet">Spreadsheet append</option>
+            </select>
           </label>
 
-          <label>
-            Bearer Token
-            <input
-              placeholder="token without 'Bearer' prefix"
-              value={fieldValueAsString(currentNode.data.extras?.apiBearerToken)}
-              onChange={(event) =>
-                setGraph(
-                  updateNodeData(graph, currentNode.id, {
-                    extras: {
-                      ...(currentNode.data.extras ?? {}),
-                      apiBearerToken: event.target.value,
-                    },
-                  }),
-                )
-              }
-            />
-          </label>
+          {outputMode === "api" ? (
+            <>
+              <label>
+                API URL
+                <span className="required-mark">*</span>
+                <input
+                  placeholder="https://api.example.com/webhooks/flow-result"
+                  value={fieldValueAsString(currentExtras.apiUrl)}
+                  onChange={(event) => updateOutputExtras({ apiUrl: event.target.value })}
+                />
+              </label>
 
-          <label>
-            Timeout (seconds)
-            <input
-              type="number"
-              min={1}
-              step={1}
-              value={fieldValueAsString(currentNode.data.extras?.apiTimeoutSeconds || 15)}
-              onChange={(event) => {
-                const rawValue = Number(event.target.value);
-                const nextValue = Number.isFinite(rawValue) && rawValue > 0 ? rawValue : 15;
-                setGraph(
-                  updateNodeData(graph, currentNode.id, {
-                    extras: {
-                      ...(currentNode.data.extras ?? {}),
-                      apiTimeoutSeconds: nextValue,
-                    },
-                  }),
-                );
-              }}
-            />
-          </label>
+              <label>
+                Bearer Token
+                <input
+                  placeholder="token without 'Bearer' prefix"
+                  value={fieldValueAsString(currentExtras.apiBearerToken)}
+                  onChange={(event) => updateOutputExtras({ apiBearerToken: event.target.value })}
+                />
+              </label>
 
-          <label>
-            Additional Headers JSON
-            <textarea
-              className="code-input"
-              value={fieldValueAsString(currentNode.data.extras?.apiHeadersJson)}
-              onChange={(event) =>
-                setGraph(
-                  updateNodeData(graph, currentNode.id, {
-                    extras: {
-                      ...(currentNode.data.extras ?? {}),
-                      apiHeadersJson: event.target.value,
-                    },
-                  }),
-                )
-              }
-            />
-          </label>
+              <label>
+                Timeout (seconds)
+                <input
+                  type="number"
+                  min={1}
+                  step={1}
+                  value={fieldValueAsString(currentExtras.apiTimeoutSeconds || 15)}
+                  onChange={(event) => {
+                    const rawValue = Number(event.target.value);
+                    const nextValue = Number.isFinite(rawValue) && rawValue > 0 ? rawValue : 15;
+                    updateOutputExtras({ apiTimeoutSeconds: nextValue });
+                  }}
+                />
+              </label>
 
-          <label>
-            Additional Payload JSON
-            <textarea
-              className="code-input"
-              value={fieldValueAsString(currentNode.data.extras?.apiPayloadJson)}
-              onChange={(event) =>
-                setGraph(
-                  updateNodeData(graph, currentNode.id, {
-                    extras: {
-                      ...(currentNode.data.extras ?? {}),
-                      apiPayloadJson: event.target.value,
-                    },
-                  }),
-                )
-              }
-            />
-          </label>
+              <label>
+                Additional Headers JSON
+                <textarea
+                  className="code-input"
+                  value={fieldValueAsString(currentExtras.apiHeadersJson)}
+                  onChange={(event) => updateOutputExtras({ apiHeadersJson: event.target.value })}
+                />
+              </label>
 
-          <div className="info-note">
-            <p>
-              This node sends a POST request with a standard JSON envelope containing <code>flow</code>, <code>timestamp</code>, <code>input</code>, and <code>result</code>.
-            </p>
-            <p>
-              In <code>Additional Payload JSON</code>, you can reference input metadata keys with placeholders like <code>$tenant</code> or <code>$user_token</code>.
-            </p>
-            <p>
-              Example: <code>{'{"tenant": $tenant, "user_token": $user_token}'}</code>
-            </p>
-          </div>
+              <label>
+                Additional Payload JSON
+                <textarea
+                  className="code-input"
+                  value={fieldValueAsString(currentExtras.apiPayloadJson)}
+                  onChange={(event) => updateOutputExtras({ apiPayloadJson: event.target.value })}
+                />
+              </label>
+
+              <div className="info-note">
+                <p>This node sends a POST request with a standard JSON envelope containing <code>flow</code>, <code>timestamp</code>, <code>input</code>, and <code>result</code>.</p>
+                <p>Template placeholders work in the additional payload JSON. Use metadata keys like <code>$tenant</code> and system values like <code>$result_text</code>, <code>$input_text</code>, <code>$timestamp</code>, and <code>$flow_name</code>.</p>
+                <p>Example: <code>{'{"tenant": $tenant, "summary": "$result_text"}'}</code></p>
+              </div>
+            </>
+          ) : outputMode === "email" ? (
+            <>
+              <label>
+                SMTP Host
+                <span className="required-mark">*</span>
+                <input
+                  placeholder="smtp.example.com"
+                  value={fieldValueAsString(currentExtras.emailHost)}
+                  onChange={(event) => updateOutputExtras({ emailHost: event.target.value })}
+                />
+              </label>
+
+              <label>
+                Security
+                <select
+                  value={fieldValueAsString(currentExtras.emailSecurity || "starttls")}
+                  onChange={(event) => updateOutputExtras({ emailSecurity: event.target.value })}
+                >
+                  <option value="ssl">SSL/TLS</option>
+                  <option value="starttls">STARTTLS</option>
+                  <option value="none">None</option>
+                </select>
+              </label>
+
+              <label>
+                SMTP Port
+                <input
+                  type="number"
+                  min={1}
+                  step={1}
+                  value={fieldValueAsString(currentExtras.emailPort || 587)}
+                  onChange={(event) => updateOutputExtras({ emailPort: event.target.value })}
+                />
+              </label>
+
+              <label>
+                Username
+                <input
+                  value={fieldValueAsString(currentExtras.emailUsername)}
+                  onChange={(event) => updateOutputExtras({ emailUsername: event.target.value })}
+                />
+              </label>
+
+              <label>
+                Password
+                <input
+                  type="password"
+                  value={fieldValueAsString(currentExtras.emailPassword)}
+                  onChange={(event) => updateOutputExtras({ emailPassword: event.target.value })}
+                />
+              </label>
+
+              <label>
+                From
+                <span className="required-mark">*</span>
+                <input
+                  placeholder="robot@example.com"
+                  value={fieldValueAsString(currentExtras.emailFrom)}
+                  onChange={(event) => updateOutputExtras({ emailFrom: event.target.value })}
+                />
+              </label>
+
+              <label>
+                To
+                <span className="required-mark">*</span>
+                <input
+                  placeholder="ops@example.com, support@example.com"
+                  value={fieldValueAsString(currentExtras.emailTo)}
+                  onChange={(event) => updateOutputExtras({ emailTo: event.target.value })}
+                />
+              </label>
+
+              <label>
+                Cc
+                <input
+                  value={fieldValueAsString(currentExtras.emailCc)}
+                  onChange={(event) => updateOutputExtras({ emailCc: event.target.value })}
+                />
+              </label>
+
+              <label>
+                Bcc
+                <input
+                  value={fieldValueAsString(currentExtras.emailBcc)}
+                  onChange={(event) => updateOutputExtras({ emailBcc: event.target.value })}
+                />
+              </label>
+
+              <label>
+                Subject Template
+                <textarea
+                  value={fieldValueAsString(currentExtras.emailSubject)}
+                  onChange={(event) => updateOutputExtras({ emailSubject: event.target.value })}
+                />
+              </label>
+
+              <label>
+                Body Template
+                <textarea
+                  value={fieldValueAsString(currentExtras.emailBodyTemplate)}
+                  onChange={(event) => updateOutputExtras({ emailBodyTemplate: event.target.value })}
+                />
+              </label>
+
+              <label>
+                Timeout (seconds)
+                <input
+                  type="number"
+                  min={1}
+                  step={1}
+                  value={fieldValueAsString(currentExtras.emailTimeoutSeconds || 15)}
+                  onChange={(event) => updateOutputExtras({ emailTimeoutSeconds: event.target.value })}
+                />
+              </label>
+
+              <label className="checkbox-field">
+                <input
+                  type="checkbox"
+                  checked={Boolean(currentExtras.emailAttachInputFiles)}
+                  onChange={(event) => updateOutputExtras({ emailAttachInputFiles: event.target.checked })}
+                />
+                {renderInspectorPropertyLabel("Attach Input Files", "Forwards any incoming flow_input_files as email attachments when present.")}
+              </label>
+
+              <div className="info-note">
+                <p>Subject and body support placeholders like <code>$tenant</code>, <code>$result_text</code>, <code>$input_text</code>, <code>$timestamp</code>, and <code>$flow_name</code>.</p>
+              </div>
+            </>
+          ) : outputMode === "chat" ? (
+            <>
+              <label>
+                Chat Provider
+                <select
+                  value={chatProvider}
+                  onChange={(event) => updateOutputExtras({ chatProvider: event.target.value })}
+                >
+                  <option value="slack">Slack webhook</option>
+                  <option value="discord">Discord webhook</option>
+                  <option value="telegram">Telegram bot</option>
+                  <option value="whatsapp">WhatsApp gateway</option>
+                  <option value="generic">Generic webhook</option>
+                </select>
+              </label>
+
+              {chatProvider === "telegram" ? (
+                <>
+                  <label>
+                    Bot Token
+                    <span className="required-mark">*</span>
+                    <input
+                      type="password"
+                      value={fieldValueAsString(currentExtras.chatBotToken)}
+                      onChange={(event) => updateOutputExtras({ chatBotToken: event.target.value })}
+                    />
+                  </label>
+
+                  <label>
+                    Chat ID
+                    <span className="required-mark">*</span>
+                    <input
+                      value={fieldValueAsString(currentExtras.chatChannelId)}
+                      onChange={(event) => updateOutputExtras({ chatChannelId: event.target.value })}
+                    />
+                  </label>
+                </>
+              ) : chatProvider === "whatsapp" ? (
+                <>
+                  <label>
+                    WhatsApp Session ID
+                    <span className="required-mark">*</span>
+                    <input
+                      value={fieldValueAsString(currentExtras.chatWhatsappSessionId)}
+                      onChange={(event) => updateOutputExtras({ chatWhatsappSessionId: event.target.value })}
+                    />
+                  </label>
+
+                  <label>
+                    Target Phone / Chat
+                    <span className="required-mark">*</span>
+                    <input
+                      placeholder="$whatsapp_from or 5511999999999"
+                      value={fieldValueAsString(currentExtras.chatChannelId)}
+                      onChange={(event) => updateOutputExtras({ chatChannelId: event.target.value })}
+                    />
+                  </label>
+                </>
+              ) : (
+                <>
+                  <label>
+                    Webhook URL
+                    <span className="required-mark">*</span>
+                    <input
+                      placeholder="https://hooks.slack.com/..."
+                      value={fieldValueAsString(currentExtras.chatWebhookUrl)}
+                      onChange={(event) => updateOutputExtras({ chatWebhookUrl: event.target.value })}
+                    />
+                  </label>
+
+                  <label>
+                    Additional Headers JSON
+                    <textarea
+                      className="code-input"
+                      value={fieldValueAsString(currentExtras.chatHeadersJson)}
+                      onChange={(event) => updateOutputExtras({ chatHeadersJson: event.target.value })}
+                    />
+                  </label>
+                </>
+              )}
+
+              <label>
+                Message Template
+                <textarea
+                  value={fieldValueAsString(currentExtras.chatMessageTemplate)}
+                  onChange={(event) => updateOutputExtras({ chatMessageTemplate: event.target.value })}
+                />
+              </label>
+
+              <label>
+                Timeout (seconds)
+                <input
+                  type="number"
+                  min={1}
+                  step={1}
+                  value={fieldValueAsString(currentExtras.chatTimeoutSeconds || 15)}
+                  onChange={(event) => updateOutputExtras({ chatTimeoutSeconds: event.target.value })}
+                />
+              </label>
+
+              <div className="info-note">
+                <p>Use this mode for Slack, Discord, Telegram, WhatsApp, or any webhook that accepts a short JSON message. Placeholders like <code>$tenant</code>, <code>$result_text</code>, and <code>$whatsapp_from</code> are supported.</p>
+              </div>
+            </>
+          ) : (
+            <>
+              <label>
+                CSV File Path
+                <span className="required-mark">*</span>
+                <input
+                  placeholder="tmp/flow_results.csv"
+                  value={fieldValueAsString(currentExtras.sheetFilePath)}
+                  onChange={(event) => updateOutputExtras({ sheetFilePath: event.target.value })}
+                />
+              </label>
+
+              <label className="checkbox-field">
+                <input
+                  type="checkbox"
+                  checked={Boolean(currentExtras.sheetIncludeHeader ?? true)}
+                  onChange={(event) => updateOutputExtras({ sheetIncludeHeader: event.target.checked })}
+                />
+                {renderInspectorPropertyLabel("Write Header Row", "Adds a CSV header when the file is created or empty.")}
+              </label>
+
+              <label>
+                Row JSON
+                <textarea
+                  className="code-input"
+                  value={fieldValueAsString(currentExtras.sheetRowJson)}
+                  onChange={(event) => updateOutputExtras({ sheetRowJson: event.target.value })}
+                />
+              </label>
+
+              <div className="info-note">
+                <p>Append a structured row to a local CSV file after every run. JSON values are serialized automatically, and placeholders like <code>$tenant</code>, <code>$result_text</code>, and <code>$timestamp</code> are supported.</p>
+              </div>
+            </>
+          )}
         </>
       );
     }
@@ -8466,15 +9983,23 @@ export default function App() {
           />
         </label>
 
-        <label>
-          Output Format
-          <input
-            value={selectedNode.data.output_format ?? ""}
-            onChange={(event) =>
-              setGraph(updateNodeData(graph, selectedNode.id, { output_format: event.target.value }))
-            }
-          />
-        </label>
+        {selectedNode.type === "output" ? (
+          <label>
+            {renderInspectorPropertyLabel("Output Format", "Choose a response format commonly used with Agno-generated flows.")}
+            <select
+              value={selectedNode.data.output_format ?? "text"}
+              onChange={(event) =>
+                setGraph(updateNodeData(graph, selectedNode.id, { output_format: event.target.value }))
+              }
+            >
+              {AGNO_OUTPUT_FORMAT_OPTIONS.map((option) => (
+                <option key={option.value} value={option.value}>
+                  {option.label}
+                </option>
+              ))}
+            </select>
+          </label>
+        ) : null}
       </>
     );
   }
@@ -8640,9 +10165,12 @@ export default function App() {
                   </button>
                 ))}
               </div>
-              <p className="muted">Use this snippet to execute the saved flow by name via POST.</p>
+              <p className="muted">
+                Use this snippet to execute the saved flow by name via POST.
+                {savedFlowIntegrationModal.authToken ? " The Authorization header is already included because this flow requires bearer auth." : ""}
+              </p>
               <MonacoToolEditor
-                value={buildIntegrationSnippet(savedFlowIntegrationModal.name, activeIntegrationLanguage)}
+                value={buildIntegrationSnippet(savedFlowIntegrationModal.name, activeIntegrationLanguage, savedFlowIntegrationModal.authToken)}
                 readOnly
                 language={getIntegrationEditorLanguage(activeIntegrationLanguage)}
                 height="38vh"
@@ -8713,7 +10241,7 @@ export default function App() {
         badge: item.badge,
         color: NODE_CATALOG.input.color,
         icon: <NodeIcon type="input" />,
-        onSelect: () => addEmailInputNode(),
+        onSelect: () => handleIntegrationInputLibrarySelect(item.key),
       });
     });
 
@@ -8729,7 +10257,7 @@ export default function App() {
         badge: item.badge,
         color: NODE_CATALOG.output_api.color,
         icon: <NodeIcon type="output_api" />,
-        onSelect: () => addNode("output_api"),
+        onSelect: () => handleIntegrationOutputLibrarySelect(item.key),
       });
     });
 
@@ -9028,7 +10556,7 @@ export default function App() {
                     key={item.key}
                     type="button"
                     className={`library-item ${item.status === "planned" ? "library-item-disabled" : ""}`}
-                    onClick={item.status === "available" ? () => addEmailInputNode() : undefined}
+                    onClick={item.status === "available" ? () => handleIntegrationInputLibrarySelect(item.key) : undefined}
                     disabled={item.status === "planned"}
                     title={`${item.description}${item.helper ? `\n\n${item.helper}` : ""}`}
                   >
@@ -9064,7 +10592,7 @@ export default function App() {
                     key={item.key}
                     type="button"
                     className={`library-item ${item.status === "planned" ? "library-item-disabled" : ""}`}
-                    onClick={item.status === "available" ? () => addNode("output_api") : undefined}
+                    onClick={item.status === "available" ? () => handleIntegrationOutputLibrarySelect(item.key) : undefined}
                     disabled={item.status === "planned"}
                     title={`${item.description}${item.helper ? `\n\n${item.helper}` : ""}`}
                   >
@@ -9615,6 +11143,15 @@ export default function App() {
           <button type="button" className="secondary-button" onClick={() => handleOpenIntegrationModal()}>
             Integration
           </button>
+          <span className="muted small-note">
+            {autosaveState === "saving"
+              ? "Autosaving..."
+              : autosaveState === "pending"
+                ? "Autosave pending..."
+                : autosaveState === "error"
+                  ? autosaveError || "Autosave failed."
+                  : "Autosave on"}
+          </span>
           <datalist id="saved-flow-names">
             {savedFlows.map((flow) => (
               <option key={flow.name} value={flow.name} />
@@ -10000,22 +11537,82 @@ export default function App() {
           ) : (
             <div className="tab-content">
               <section className="subpanel">
-                <h2>Runtime credentials</h2>
-                <p className="muted">Used only for runtime requests. Not injected into generated code.</p>
-                <label>
-                  OpenAI API Key
+                <h2>Variables</h2>
+                <p className="muted">Configure model keys, provider URLs, and any custom runtime env here. Non-empty values override the same system env during runtime. If a key is absent or blank here, the flow falls back to the host environment.</p>
+
+                <div className="button-row">
+                  <button type="button" className="secondary-button save-button" onClick={handleSaveRuntimeData} disabled={isSavingFlow}>
+                    {isSavingFlow ? "Saving..." : "Save Runtime Data"}
+                  </button>
+                </div>
+
+                {projectRuntimeEnvVars.length ? (
+                  <div className="runtime-env-list">
+                    {projectRuntimeEnvVars.map((item, index) => (
+                      <div key={`runtime-env-${index}`} className="runtime-env-row">
+                        <input
+                          placeholder="ENV_NAME"
+                          value={item.key}
+                          onChange={(event) => updateProjectRuntimeEnvVar(index, { key: event.target.value })}
+                        />
+                        <input
+                          placeholder="value"
+                          value={item.value}
+                          onChange={(event) => updateProjectRuntimeEnvVar(index, { value: event.target.value })}
+                        />
+                        <button
+                          type="button"
+                          className="secondary-button"
+                          onClick={() => removeProjectRuntimeEnvVar(index)}
+                        >
+                          Remove
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                ) : (
+                  <p className="muted runtime-env-empty">No runtime variables configured for this flow yet.</p>
+                )}
+
+                <div className="button-row">
+                  <button type="button" className="secondary-button" onClick={addProjectRuntimeEnvVar}>
+                    Add Variable
+                  </button>
+                </div>
+              </section>
+
+              <section className="subpanel">
+                <h2>Flow Authentication</h2>
+                <label className="checkbox-field">
                   <input
-                    type="password"
-                    placeholder="sk-..."
-                    value={credentials.openai_api_key ?? ""}
+                    type="checkbox"
+                    checked={projectAuthEnabled}
                     onChange={(event) =>
-                      setCredentials({
-                        ...credentials,
-                        openai_api_key: event.target.value,
+                      updateProjectRuntime({
+                        authEnabled: event.target.checked,
                       })
                     }
                   />
+                  {renderInspectorPropertyLabel("Require Bearer Token", "Applies to external HTTP entrypoints such as `/api/flows/run`, Webhook Input, and Form Submission Input.")}
                 </label>
+
+                {projectAuthEnabled ? (
+                  <label>
+                    {renderInspectorPropertyLabel("Bearer Token", "Callers must send this exact token in `Authorization: Bearer <token>`.")}
+                    <input
+                      type="password"
+                      placeholder="flow-secret-token"
+                      value={projectAuthToken}
+                      onChange={(event) =>
+                        updateProjectRuntime({
+                          authToken: event.target.value,
+                        })
+                      }
+                    />
+                  </label>
+                ) : null}
+
+                <p className="muted small-note">Canvas preview via `Run` keeps funcionando sem bearer; a exigência vale para entradas HTTP externas do flow.</p>
               </section>
             </div>
           )}
@@ -10076,13 +11673,94 @@ export default function App() {
                 </button>
               ))}
             </div>
-            <p className="muted">Use this snippet to execute the saved flow by name via POST.</p>
+            <p className="muted">
+              Use this snippet to execute the saved flow by name via POST.
+              {savedFlowIntegrationModal.authToken ? " The Authorization header is already included because this flow requires bearer auth." : ""}
+            </p>
             <MonacoToolEditor
-              value={buildIntegrationSnippet(savedFlowIntegrationModal.name, activeIntegrationLanguage)}
+              value={buildIntegrationSnippet(savedFlowIntegrationModal.name, activeIntegrationLanguage, savedFlowIntegrationModal.authToken)}
               readOnly
               language={getIntegrationEditorLanguage(activeIntegrationLanguage)}
               height="38vh"
             />
+          </div>
+        </div>
+      ) : null}
+
+      {webhookCurlModal ? (
+        <div className="modal-backdrop" onClick={() => setWebhookCurlModal(null)}>
+          <div className="code-modal curl-modal" onClick={(event) => event.stopPropagation()}>
+            <div className="code-modal-header">
+              <div>
+                <p className="eyebrow">Webhook Input</p>
+                <h2>{webhookCurlModal.title}</h2>
+              </div>
+              <div className="button-row">
+                <button type="button" className="secondary-button save-button" onClick={handleCopyWebhookCurlCommand}>
+                  {didCopyWebhookCurl ? "Copied" : "Copy cURL"}
+                </button>
+                <button type="button" className="secondary-button" onClick={() => setWebhookCurlModal(null)}>
+                  Close
+                </button>
+              </div>
+            </div>
+            <p className="muted">Endpoint: {webhookCurlModal.endpoint}</p>
+            <MonacoToolEditor
+              value={webhookCurlModal.command}
+              readOnly
+              language="shell"
+              height="32vh"
+            />
+          </div>
+        </div>
+      ) : null}
+
+      {whatsappSessionModal ? (
+        <div className="modal-backdrop" onClick={() => setWhatsappSessionModal(null)}>
+          <div className="code-modal curl-modal" onClick={(event) => event.stopPropagation()}>
+            <div className="code-modal-header">
+              <div>
+                <p className="eyebrow">WhatsApp Input</p>
+                <h2>{whatsappSessionModal.nodeName}</h2>
+              </div>
+              <div className="button-row">
+                <button type="button" className="secondary-button" onClick={handleRefreshWhatsappSession} disabled={isUpdatingWhatsappSession}>
+                  Refresh
+                </button>
+                <button type="button" className="secondary-button save-button" onClick={handleStartWhatsappSession} disabled={isUpdatingWhatsappSession}>
+                  {isUpdatingWhatsappSession ? "Updating..." : "Start / Show QR"}
+                </button>
+                <button type="button" className="secondary-button" onClick={handleStopWhatsappSession} disabled={isUpdatingWhatsappSession}>
+                  Disconnect
+                </button>
+                <button type="button" className="secondary-button" onClick={() => setWhatsappSessionModal(null)}>
+                  Close
+                </button>
+              </div>
+            </div>
+
+            <p className="muted">
+              Session ID: <code>{whatsappSessionModal.session?.session_id || "pending"}</code>
+            </p>
+            <p className="muted">
+              Status: <strong>{whatsappSessionModal.session?.status || "unknown"}</strong>
+              {whatsappSessionModal.session?.connected ? " · connected" : " · waiting for QR or reconnect"}
+            </p>
+            {whatsappSessionModal.session?.last_error ? <p className="status-error">{whatsappSessionModal.session.last_error}</p> : null}
+
+            {whatsappSessionModal.session?.qr_code ? (
+              <div className="whatsapp-qr-panel">
+                <img src={whatsappSessionModal.session.qr_code} alt="WhatsApp QR code" className="whatsapp-qr-image" />
+              </div>
+            ) : (
+              <div className="info-note">
+                <p>
+                  {whatsappSessionModal.session?.connected
+                    ? "The WhatsApp session is already connected and listening for new messages."
+                    : "Start the session to fetch the latest QR code. Keep this modal open while pairing the device."}
+                </p>
+              </div>
+            )}
           </div>
         </div>
       ) : null}
@@ -10194,6 +11872,12 @@ export default function App() {
                     <span className="chat-mode-chip">
                       {inputSource === "email"
                         ? "Email inbox"
+                        : inputSource === "webhook"
+                          ? "Webhook preview"
+                          : inputSource === "whatsapp"
+                            ? "WhatsApp preview"
+                          : inputSource === "form"
+                            ? "Form preview"
                         : inputMode === "text"
                           ? "Text only"
                           : inputMode === "file"
@@ -10211,7 +11895,7 @@ export default function App() {
                     ) : null}
                   </div>
 
-                  {inputSource === "manual" && chatDraft.fileName ? (
+                  {inputSource !== "email" && chatDraft.fileName ? (
                     <div className="chat-upload-row">
                       <span className="chat-attachment-chip">📎 {chatDraft.fileAlias || chatDraft.fileName}</span>
                       <button type="button" className="secondary-button" onClick={clearChatFile}>
@@ -10231,11 +11915,37 @@ export default function App() {
                     </div>
                   ) : null}
 
-                  <div className={`chat-prompt-shell ${inputSource === "manual" && inputMode === "file" ? "file-only" : ""}`}>
+                  <div className={`chat-prompt-shell ${inputSource !== "email" && inputMode === "file" ? "file-only" : ""}`}>
                     {inputSource === "email" ? (
                       <p className="muted chat-file-mode-copy">
                         Email inbox input active. Running from chat will poll the configured mailbox once and use the newest message that matches the filters.
                       </p>
+                    ) : inputSource === "webhook" ? (
+                      <textarea
+                        className="chat-input"
+                        value={chatDraft.text}
+                        onChange={(event) => setChatDraft((current) => ({ ...current, text: event.target.value }))}
+                        onKeyDown={(event) => {
+                          if (event.key === "Enter" && !event.shiftKey) {
+                            event.preventDefault();
+                            handleRunFromChat().catch(console.error);
+                          }
+                        }}
+                        placeholder="Simulate the webhook body text or message field"
+                      />
+                    ) : inputSource === "whatsapp" ? (
+                      <textarea
+                        className="chat-input"
+                        value={chatDraft.text}
+                        onChange={(event) => setChatDraft((current) => ({ ...current, text: event.target.value }))}
+                        onKeyDown={(event) => {
+                          if (event.key === "Enter" && !event.shiftKey) {
+                            event.preventDefault();
+                            handleRunFromChat().catch(console.error);
+                          }
+                        }}
+                        placeholder="Simulate the incoming WhatsApp message text"
+                      />
                     ) : inputMode !== "file" ? (
                       <textarea
                         className="chat-input"
@@ -10259,7 +11969,7 @@ export default function App() {
                       onClick={handleRunFromChat}
                       disabled={isRunning || isRunningSavedFlow || !canSendChatMessage}
                     >
-                      {isRunning ? "..." : inputSource === "email" ? "Check Inbox" : "Send"}
+                      {isRunning ? "..." : inputSource === "email" ? "Check Inbox" : inputSource === "webhook" ? "Send Webhook" : inputSource === "whatsapp" ? "Send WhatsApp Preview" : inputSource === "form" ? "Submit Form" : "Send"}
                     </button>
                   </div>
 
@@ -10267,6 +11977,12 @@ export default function App() {
                     <span className="muted small-note">
                       {inputSource === "email"
                         ? "This run will poll the configured mailbox once. Metadata JSON still goes to the flow input."
+                        : inputSource === "webhook"
+                          ? "This preview simulates a webhook execution. Use the generated endpoint to trigger the saved flow from external systems."
+                          : inputSource === "whatsapp"
+                            ? "This preview simulates an incoming WhatsApp message. The live integration runs automatically after the session is connected in the QR modal."
+                          : inputSource === "form"
+                            ? "This preview simulates a form submission. Uploaded files and metadata are sent into the flow runtime."
                         : chatSupportsFileUpload
                           ? "You can send text, files, and metadata from this chat."
                           : "This chat currently accepts text and metadata."}

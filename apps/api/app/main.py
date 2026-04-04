@@ -1,23 +1,29 @@
 from __future__ import annotations
 
+import base64
 import html
 import json
+import os
 from pathlib import Path
 import re
+import time
+from typing import Any
 
 from fastapi import FastAPI
 from fastapi import HTTPException
+from fastapi import Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 from dotenv import load_dotenv
 import requests
+from starlette.datastructures import UploadFile as StarletteUploadFile
 
 from .builtin_tools import inspect_builtin_tool_functions
 from .compiler import compile_graph
 from .email_listener import EmailListenerManager
 from .executor import run_generated_code
 from .exporter import export_project
-from .flow_store import list_flow_summaries, load_flow_record, save_flow_record
+from .flow_store import list_flow_summaries, load_flow_record, normalize_flow_name, save_flow_record
 from .models import (
     CanvasGraph,
     BuiltInToolFunctionOption,
@@ -30,15 +36,19 @@ from .models import (
     ListEmailListenerStatusesResponse,
     ExportProjectResponse,
     FlowRecord,
+    GraphNode,
     ListFlowsResponse,
     RunResult,
     RunSavedFlowByNameRequest,
     SaveFlowRequest,
     SaveFlowResponse,
     SkillPathOption,
+    WhatsappSessionStatus,
+    WhatsappWebhookDispatchResponse,
 )
 from .models import NodeType
 from .sample_graph import build_sample_graph, get_canvas_template, list_canvas_templates
+from .whatsapp_gateway import WhatsappGatewayClient, normalize_whatsapp_session_id
 
 load_dotenv()
 
@@ -47,7 +57,26 @@ app = FastAPI(title="AgnoLab API", version="0.1.0")
 DEFAULT_GENERATED_CODE_TIMEOUT_SECONDS = 20.0
 RESULT_START_MARKER = "__AGNO_RESULT_START__"
 RESULT_END_MARKER = "__AGNO_RESULT_END__"
-PROJECT_ROOT = Path(__file__).resolve().parents[3]
+WHATSAPP_EVENT_DEDUP_TTL_SECONDS = 120.0
+WHATSAPP_IGNORED_EVENT_NAME_PARTS = ("ack", "receipt", "reaction", "presence", "status", "state")
+_recent_whatsapp_events: dict[str, float] = {}
+
+
+def _detect_project_root() -> Path:
+    current = Path(__file__).resolve()
+    markers = ("docker-compose.dev.yml", "docker-compose.yml", "README.md")
+
+    for parent in current.parents:
+        if any((parent / marker).exists() for marker in markers) or (parent / "apps").is_dir():
+            return parent
+
+    if current.parent.name == "app":
+        return current.parent.parent
+
+    return current.parent
+
+
+PROJECT_ROOT = _detect_project_root()
 SKILL_DISCOVERY_ROOTS = [
     ("repo", PROJECT_ROOT / "examples/skills"),
     ("user", Path.home() / ".agents/skills"),
@@ -267,7 +296,7 @@ def run_code(request: CodegenRequest) -> RunResult:
     code, warnings = compile_graph(graph)
     success, stdout, stderr, exit_code = run_generated_code(
         code,
-        openai_api_key=request.credentials.openai_api_key if request.credentials else None,
+        extra_env=get_graph_runtime_env(graph),
         timeout_seconds=get_graph_execution_timeout_seconds(graph),
     )
     tagged_clean_stdout, stripped_stdout = extract_tagged_flow_result(stdout)
@@ -363,6 +392,386 @@ def get_graph_execution_timeout_seconds(graph: CanvasGraph) -> float:
     return timeout_seconds
 
 
+def get_graph_runtime_env(graph: CanvasGraph) -> dict[str, str]:
+    runtime = getattr(graph.project, "runtime", None)
+    env_items = getattr(runtime, "envVars", []) if runtime is not None else []
+    resolved_env: dict[str, str] = {}
+
+    for item in env_items:
+        key = str(getattr(item, "key", "") or "").strip()
+        value = str(getattr(item, "value", "") or "")
+        if not key or value == "":
+            continue
+        resolved_env[key] = value
+
+    return resolved_env
+
+
+def is_graph_bearer_auth_enabled(graph: CanvasGraph) -> bool:
+    runtime = getattr(graph.project, "runtime", None)
+    return bool(getattr(runtime, "authEnabled", False))
+
+
+def get_graph_bearer_auth_token(graph: CanvasGraph) -> str:
+    runtime = getattr(graph.project, "runtime", None)
+    return str(getattr(runtime, "authToken", "") or "").strip()
+
+
+def extract_bearer_token(request: Request) -> str:
+    authorization = request.headers.get("authorization", "").strip()
+    if not authorization:
+        return ""
+
+    scheme, _, token = authorization.partition(" ")
+    if scheme.lower() != "bearer":
+        return ""
+    return token.strip()
+
+
+def require_flow_bearer_auth(record: FlowRecord, request: Request) -> None:
+    if not is_graph_bearer_auth_enabled(record.graph):
+        return
+
+    expected_token = get_graph_bearer_auth_token(record.graph)
+    if not expected_token:
+        raise HTTPException(status_code=400, detail="Flow bearer authentication is enabled but no token is configured.")
+
+    provided_token = extract_bearer_token(request)
+    if provided_token != expected_token:
+        raise HTTPException(status_code=401, detail="Missing or invalid bearer token for this flow.")
+
+
+def _normalize_bool(value: object, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    normalized = str(value or "").strip().lower()
+    if normalized in {"true", "1", "yes", "on"}:
+        return True
+    if normalized in {"false", "0", "no", "off"}:
+        return False
+    return default
+
+
+def _split_filter_values(raw_value: object) -> list[str]:
+    return [item.strip().lower() for item in re.split(r"[\n,]+", str(raw_value or "")) if item.strip()]
+
+
+def _field_matches(value: object, raw_filter: object) -> bool:
+    filter_values = _split_filter_values(raw_filter)
+    if not filter_values:
+        return True
+    haystack = str(value or "").lower()
+    return any(filter_value in haystack for filter_value in filter_values)
+
+
+def _keywords_match(value: object, raw_keywords: object) -> bool:
+    keywords = _split_filter_values(raw_keywords)
+    if not keywords:
+        return True
+    haystack = str(value or "").lower()
+    return all(keyword in haystack for keyword in keywords)
+
+
+def _recursive_find_first_string(payload: Any, keys: tuple[str, ...]) -> str:
+    if isinstance(payload, dict):
+        for key in keys:
+            value = payload.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        for value in payload.values():
+            found = _recursive_find_first_string(value, keys)
+            if found:
+                return found
+    elif isinstance(payload, list):
+        for item in payload:
+            found = _recursive_find_first_string(item, keys)
+            if found:
+                return found
+    return ""
+
+
+def _looks_like_base64_text(value: str) -> bool:
+    compact = "".join(str(value or "").split())
+    if len(compact) < 32:
+        return False
+    return bool(re.fullmatch(r"[A-Za-z0-9+/=_-]+", compact))
+
+
+def _guess_extension_from_mime(mime_type: str) -> str:
+    normalized = str(mime_type or "").split(";", 1)[0].strip().lower()
+    if normalized in {"audio/ogg", "audio/opus"}:
+        return "ogg"
+    if normalized == "audio/mpeg":
+        return "mp3"
+    if normalized in {"audio/mp4", "audio/x-m4a"}:
+        return "m4a"
+    if normalized == "audio/wav":
+        return "wav"
+    if normalized.startswith("audio/"):
+        return normalized.split("/", 1)[1] or "bin"
+    return "bin"
+
+
+def _extract_whatsapp_runtime_files(message_event: dict[str, Any]) -> list[dict[str, object]]:
+    raw_payload = message_event.get("raw")
+    if not isinstance(raw_payload, dict):
+        return []
+
+    mime_type = _recursive_find_first_string(raw_payload, ("mimetype", "mimeType", "mediaType"))
+    media_type = str(raw_payload.get("type") or raw_payload.get("messageType") or "").strip().lower()
+    body_value = _recursive_find_first_string(raw_payload, ("base64", "fileData", "data", "body", "content"))
+    compact_base64 = "".join(str(body_value or "").split())
+
+    is_audio_like = str(mime_type).lower().startswith("audio/") or media_type in {"audio", "ptt", "voice", "voice_note"}
+    if not is_audio_like:
+        return []
+
+    if not _looks_like_base64_text(compact_base64):
+        return []
+
+    normalized_mime = str(mime_type or "").split(";", 1)[0].strip().lower() or "audio/ogg"
+    file_name = _recursive_find_first_string(raw_payload, ("filename", "fileName", "name"))
+    if not file_name:
+        extension = _guess_extension_from_mime(normalized_mime)
+        file_name = f"whatsapp_audio.{extension}"
+
+    return [
+        {
+            "name": file_name,
+            "alias": "WhatsApp Audio",
+            "mime_type": normalized_mime,
+            "encoding": "base64",
+            "base64": compact_base64,
+        }
+    ]
+
+
+def _transcribe_whatsapp_audio_with_openai(runtime_files: list[dict[str, object]]) -> str:
+    api_key = str(os.getenv("OPENAI_API_KEY") or "").strip()
+    if not api_key:
+        return ""
+
+    base_url = str(os.getenv("OPENAI_BASE_URL") or "https://api.openai.com/v1").strip().rstrip("/")
+    endpoint = f"{base_url}/audio/transcriptions"
+
+    for file_item in runtime_files:
+        mime_type = str(file_item.get("mime_type") or "").strip().lower()
+        if not mime_type.startswith("audio/"):
+            continue
+
+        encoded = str(file_item.get("base64") or "").strip()
+        if not encoded:
+            continue
+
+        try:
+            audio_bytes = base64.b64decode(encoded, validate=False)
+        except Exception:
+            continue
+
+        if not audio_bytes:
+            continue
+
+        file_name = str(file_item.get("name") or "whatsapp_audio.ogg")
+        try:
+            response = requests.post(
+                endpoint,
+                headers={"Authorization": f"Bearer {api_key}"},
+                data={"model": "gpt-4o-mini-transcribe"},
+                files={"file": (file_name, audio_bytes, mime_type or "application/octet-stream")},
+                timeout=45,
+            )
+            if not response.ok:
+                continue
+            payload = response.json()
+            transcript = str(payload.get("text") or "").strip() if isinstance(payload, dict) else ""
+            if transcript:
+                return transcript
+        except Exception:
+            continue
+
+    return ""
+
+
+def _extract_whatsapp_message_text(payload: dict[str, Any]) -> str:
+    message_type = str(payload.get("type") or payload.get("messageType") or "").strip().lower()
+    mime_hint = str(payload.get("mimetype") or payload.get("mimeType") or "").strip().lower()
+    is_audio_message = message_type in {"audio", "ptt", "voice", "voice_note"} or mime_hint.startswith("audio/")
+    for key in ("body", "content", "caption", "text"):
+        value = payload.get(key)
+        if isinstance(value, str) and value.strip():
+            candidate = value.strip()
+            if key == "body" and is_audio_message:
+                continue
+            return candidate
+        if isinstance(value, dict):
+            nested_value = value.get("body")
+            if isinstance(nested_value, str) and nested_value.strip():
+                return nested_value.strip()
+    return ""
+
+
+def _extract_whatsapp_message_id(payload: dict[str, Any]) -> str:
+    raw_id = payload.get("id")
+    if isinstance(raw_id, str) and raw_id.strip():
+        return raw_id.strip()
+    if isinstance(raw_id, dict):
+        for key in ("_serialized", "id", "remote"):
+            value = raw_id.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    return ""
+
+
+def _extract_whatsapp_sender_name(payload: dict[str, Any]) -> str:
+    sender = payload.get("sender")
+    if isinstance(sender, dict):
+        for key in ("pushname", "name", "shortName", "formattedName"):
+            value = sender.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    for key in ("notifyName", "senderName", "chatName"):
+        value = payload.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+def _extract_whatsapp_message_candidate(payload: Any) -> dict[str, Any] | None:
+    if isinstance(payload, list):
+        for item in payload:
+            candidate = _extract_whatsapp_message_candidate(item)
+            if candidate is not None:
+                return candidate
+        return None
+
+    if not isinstance(payload, dict):
+        return None
+
+    direct_from = str(payload.get("from") or payload.get("chatId") or payload.get("author") or "").strip()
+    direct_text = _extract_whatsapp_message_text(payload)
+    if direct_from or direct_text:
+        return payload
+
+    for key in ("message", "messages", "data", "response", "payload", "eventData"):
+        nested = payload.get(key)
+        candidate = _extract_whatsapp_message_candidate(nested)
+        if candidate is not None:
+            return candidate
+    return None
+
+
+def _extract_whatsapp_message_event(payload: Any) -> dict[str, Any] | None:
+    candidate = _extract_whatsapp_message_candidate(payload)
+    if candidate is None:
+        return None
+
+    from_value = str(candidate.get("from") or candidate.get("chatId") or candidate.get("author") or "").strip()
+    text_value = _extract_whatsapp_message_text(candidate)
+    is_group = _normalize_bool(candidate.get("isGroupMsg"), False) or _normalize_bool(candidate.get("isGroup"), False) or from_value.endswith("@g.us")
+    from_me = _normalize_bool(candidate.get("fromMe"), False) or _normalize_bool(candidate.get("isSentByMe"), False)
+    message_id = _extract_whatsapp_message_id(candidate)
+    sender_name = _extract_whatsapp_sender_name(candidate)
+
+    return {
+        "text": text_value,
+        "from": from_value,
+        "sender_name": sender_name,
+        "message_id": message_id,
+        "is_group": is_group,
+        "from_me": from_me,
+        "timestamp": str(candidate.get("t") or candidate.get("timestamp") or "").strip(),
+        "raw": candidate,
+    }
+
+
+def _normalize_whatsapp_reply_target(sender: str, *, is_group: bool) -> str:
+    raw_sender = str(sender or "").strip()
+    if not raw_sender:
+        return ""
+    if is_group:
+        return raw_sender
+    return raw_sender.split("@", 1)[0]
+
+
+def _replace_template_tokens(template: str, context: dict[str, object]) -> str:
+    def replace(match: re.Match[str]) -> str:
+        key = match.group(1)
+        value = context.get(key)
+        if value is None:
+            return ""
+        if isinstance(value, (dict, list)):
+            return json.dumps(value, ensure_ascii=False)
+        return str(value)
+
+    return re.sub(r"\$([A-Za-z_][A-Za-z0-9_]*)", replace, template)
+
+
+def _should_ignore_whatsapp_event(event_name: str) -> bool:
+    normalized = str(event_name or "").strip().lower()
+    if not normalized:
+        return False
+    return any(part in normalized for part in WHATSAPP_IGNORED_EVENT_NAME_PARTS)
+
+
+def _remember_recent_whatsapp_event(flow_name: str, session_id: str, message_id: str) -> bool:
+    normalized_message_id = str(message_id or "").strip()
+    if not normalized_message_id:
+        return False
+
+    now = time.monotonic()
+    expired_keys = [key for key, expires_at in _recent_whatsapp_events.items() if expires_at <= now]
+    for key in expired_keys:
+        _recent_whatsapp_events.pop(key, None)
+
+    event_key = f"{flow_name}:{session_id}:{normalized_message_id}"
+    if event_key in _recent_whatsapp_events:
+        return True
+
+    _recent_whatsapp_events[event_key] = now + WHATSAPP_EVENT_DEDUP_TTL_SECONDS
+    return False
+
+
+def _build_whatsapp_status_response(record: FlowRecord, input_node: GraphNode, *, status_payload: dict[str, Any], webhook_url: str, last_error: str | None = None) -> WhatsappSessionStatus:
+    extras = input_node.data.extras if isinstance(input_node.data.extras, dict) else {}
+    fallback_session_id = normalize_whatsapp_session_id(
+        extras.get("whatsappSessionId"),
+        fallback=f"{normalize_flow_name(record.name)}_{input_node.id}",
+    )
+    return WhatsappSessionStatus(
+        flow_name=record.name,
+        node_id=input_node.id,
+        node_name=input_node.data.name,
+        session_id=str(status_payload.get("session_id") or fallback_session_id),
+        status=str(status_payload.get("status") or "unknown"),
+        connected=bool(status_payload.get("connected")),
+        qr_code=status_payload.get("qr_code"),
+        webhook_url=webhook_url.split("?", 1)[0],
+        last_error=last_error,
+    )
+
+
+def _build_whatsapp_gateway_for_graph(graph: CanvasGraph) -> WhatsappGatewayClient:
+    runtime_env = get_graph_runtime_env(graph)
+    return WhatsappGatewayClient(
+        base_url=runtime_env.get("WHATSAPP_GATEWAY_BASE_URL"),
+        secret_key=runtime_env.get("WHATSAPP_GATEWAY_SECRET_KEY"),
+        webhook_base_url=runtime_env.get("WHATSAPP_WEBHOOK_BASE_URL"),
+    )
+
+
+def _get_saved_whatsapp_input(record: FlowRecord, *, node_id: str) -> tuple[GraphNode, dict[str, Any], str, str, str, WhatsappGatewayClient]:
+    input_node = _find_saved_input_node(record, node_id=node_id, expected_source="whatsapp")
+    extras = input_node.data.extras if isinstance(input_node.data.extras, dict) else {}
+    session_id = normalize_whatsapp_session_id(
+        extras.get("whatsappSessionId"),
+        fallback=f"{normalize_flow_name(record.name)}_{input_node.id}",
+    )
+    webhook_secret = str(extras.get("whatsappWebhookSecret") or "").strip() or input_node.id
+    gateway = _build_whatsapp_gateway_for_graph(record.graph)
+    webhook_url = gateway.build_flow_webhook_url(record.name, input_node.id, webhook_secret)
+    return input_node, extras, session_id, webhook_secret, webhook_url, gateway
+
+
 @app.get("/api/providers/ollama/models")
 def list_ollama_models(base_url: str | None = None) -> dict[str, list[str]]:
     endpoint_base = normalize_ollama_base_url(base_url)
@@ -396,14 +805,108 @@ def list_ollama_models(base_url: str | None = None) -> dict[str, list[str]]:
     return {"models": names}
 
 
+def _normalize_input_source(node) -> str:
+    extras = node.data.extras if isinstance(node.data.extras, dict) else {}
+    return str(extras.get("inputSource") or "manual").strip().lower()
+
+
+def _find_saved_input_node(record: FlowRecord, *, node_id: str, expected_source: str):
+    input_node = next((node for node in record.graph.nodes if node.type == NodeType.INPUT and node.id == node_id), None)
+    if input_node is None:
+        raise HTTPException(status_code=404, detail=f"Input node not found in flow '{record.name}': {node_id}")
+
+    input_source = _normalize_input_source(input_node)
+    if input_source != expected_source:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Input node '{node_id}' is configured as '{input_source}', not '{expected_source}'.",
+        )
+    return input_node
+
+
+def _parse_json_text(raw_value: str) -> object | None:
+    text = raw_value.strip()
+    if not text:
+        return None
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        return None
+
+
+def _coerce_text_value(value: object) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, (int, float, bool)):
+        return str(value)
+    if isinstance(value, (dict, list)):
+        return json.dumps(value, ensure_ascii=False)
+    return str(value)
+
+
+def _pick_mapping_value(payload: object, preferred_key: str, fallback_keys: list[str]) -> str:
+    if not isinstance(payload, dict):
+        return ""
+
+    candidate_keys: list[str] = []
+    normalized_preferred_key = preferred_key.strip()
+    if normalized_preferred_key:
+        candidate_keys.append(normalized_preferred_key)
+    for fallback_key in fallback_keys:
+        if fallback_key not in candidate_keys:
+            candidate_keys.append(fallback_key)
+
+    for key in candidate_keys:
+        if key not in payload:
+            continue
+        value = payload.get(key)
+        text_value = _coerce_text_value(value).strip()
+        if text_value:
+            return text_value
+
+    return ""
+
+
+def _sanitize_headers(request: Request, *, extra_hidden_names: set[str] | None = None) -> dict[str, str]:
+    hidden_names = {"authorization", "cookie", "set-cookie"}
+    if extra_hidden_names:
+        hidden_names.update(name.lower() for name in extra_hidden_names if name)
+    sanitized: dict[str, str] = {}
+    for key, value in request.headers.items():
+        if key.lower() in hidden_names:
+            continue
+        sanitized[key] = value
+    return sanitized
+
+
+def _set_multi_value(container: dict[str, object], key: str, value: object) -> None:
+    if key not in container:
+        container[key] = value
+        return
+    current_value = container[key]
+    if isinstance(current_value, list):
+        current_value.append(value)
+        return
+    container[key] = [current_value, value]
+
+
+def _extract_secret_value(value: object) -> str:
+    if isinstance(value, list):
+        return _extract_secret_value(value[0] if value else "")
+    return str(value or "")
+
+
 def apply_runtime_post_input(
     graph,
     *,
     input_text: str | None,
     input_metadata: dict | None,
+    input_files: list[dict[str, object]] | None = None,
     merge_metadata: bool = False,
 ):
-    if input_text is None and input_metadata is None:
+    if input_text is None and input_metadata is None and not input_files:
         return graph
 
     updated_graph = graph.model_copy(deep=True)
@@ -417,8 +920,8 @@ def apply_runtime_post_input(
         if str(extras.get("inputMode") or "text") != "file":
             input_node.data.prompt = input_text
 
-    if input_metadata is not None:
-        next_metadata = dict(input_metadata)
+    if input_metadata is not None or input_files:
+        next_metadata = dict(input_metadata or {})
         if merge_metadata:
             existing_metadata = {}
             payload_json_raw = str(extras.get("payloadJson") or "").strip()
@@ -433,6 +936,9 @@ def apply_runtime_post_input(
                 **existing_metadata,
                 **next_metadata,
             }
+
+        if input_files:
+            next_metadata["_agnolab_runtime_files"] = input_files
 
         extras["payloadJson"] = json.dumps(next_metadata, ensure_ascii=False)
         if "hitl_auto_approve" in next_metadata:
@@ -511,14 +1017,15 @@ def run_saved_flow_record(
     *,
     input_text: str | None,
     input_metadata: dict | None,
+    input_files: list[dict[str, object]] | None = None,
     debug: bool,
     merge_metadata: bool = False,
-    openai_api_key: str | None = None,
 ) -> RunResult:
     graph = apply_runtime_post_input(
         record.graph,
         input_text=input_text,
         input_metadata=input_metadata,
+        input_files=input_files,
         merge_metadata=merge_metadata,
     )
     if debug is False:
@@ -527,7 +1034,7 @@ def run_saved_flow_record(
     code, warnings = compile_graph(graph)
     success, stdout, stderr, exit_code = run_generated_code(
         code,
-        openai_api_key=openai_api_key,
+        extra_env=get_graph_runtime_env(graph),
         timeout_seconds=get_graph_execution_timeout_seconds(graph),
     )
 
@@ -564,6 +1071,7 @@ def run_saved_flow_from_email_event(flow_name: str, email_event: dict[str, str])
             "_agnolab_email_listener_event": email_event,
             "email_listener_source": "background_listener",
         },
+        input_files=None,
         debug=False,
         merge_metadata=True,
     )
@@ -571,17 +1079,420 @@ def run_saved_flow_from_email_event(flow_name: str, email_event: dict[str, str])
     return run_result.success, summary or None
 
 
+@app.api_route("/api/integrations/webhook/{flow_name}/{node_id}", methods=["POST", "PUT", "PATCH"], response_model=RunResult)
+async def run_saved_flow_from_webhook(flow_name: str, node_id: str, request: Request, debug: bool = False) -> RunResult:
+    record = load_flow_record(flow_name)
+    if record is None:
+        raise HTTPException(status_code=404, detail=f"Flow not found: {flow_name}")
+    require_flow_bearer_auth(record, request)
+
+    input_node = _find_saved_input_node(record, node_id=node_id, expected_source="webhook")
+    extras = input_node.data.extras if isinstance(input_node.data.extras, dict) else {}
+
+    shared_secret = str(extras.get("webhookSecret") or "")
+    secret_header = str(extras.get("webhookSecretHeader") or "X-AgnoLab-Secret").strip() or "X-AgnoLab-Secret"
+    if shared_secret and request.headers.get(secret_header) != shared_secret:
+        raise HTTPException(status_code=401, detail=f"Invalid webhook secret in header '{secret_header}'.")
+
+    body_bytes = await request.body()
+    raw_text = body_bytes.decode("utf-8", errors="replace")
+    parsed_json = _parse_json_text(raw_text)
+    preferred_text_field = str(extras.get("webhookTextField") or "message")
+    resolved_text = _pick_mapping_value(parsed_json, preferred_text_field, ["message", "text", "prompt", "body", "input"])
+    if not resolved_text:
+        resolved_text = raw_text.strip()
+
+    metadata_payload: dict[str, object] = {
+        "integration_source": "webhook",
+        "webhook_method": request.method,
+        "webhook_path": request.url.path,
+        "webhook_query": dict(request.query_params),
+        "webhook_headers": _sanitize_headers(request, extra_hidden_names={secret_header}),
+        "webhook_content_type": request.headers.get("content-type", ""),
+    }
+    if parsed_json is not None:
+        metadata_payload["webhook_json"] = parsed_json
+    elif raw_text.strip():
+        metadata_payload["webhook_body"] = raw_text
+
+    metadata_payload["_agnolab_webhook_event"] = {
+        "text": resolved_text,
+    }
+
+    return run_saved_flow_record(
+        record,
+        input_text=resolved_text or None,
+        input_metadata=metadata_payload,
+        input_files=None,
+        debug=debug,
+        merge_metadata=True,
+    )
+
+
+@app.post("/api/integrations/form/{flow_name}/{node_id}", response_model=RunResult)
+async def run_saved_flow_from_form(flow_name: str, node_id: str, request: Request, debug: bool = False) -> RunResult:
+    record = load_flow_record(flow_name)
+    if record is None:
+        raise HTTPException(status_code=404, detail=f"Flow not found: {flow_name}")
+    require_flow_bearer_auth(record, request)
+
+    input_node = _find_saved_input_node(record, node_id=node_id, expected_source="form")
+    extras = input_node.data.extras if isinstance(input_node.data.extras, dict) else {}
+    form_payload = await request.form()
+
+    fields: dict[str, object] = {}
+    files: list[dict[str, object]] = []
+    for key, value in form_payload.multi_items():
+        if isinstance(value, StarletteUploadFile):
+            file_bytes = await value.read()
+            files.append(
+                {
+                    "name": value.filename or key or "upload.bin",
+                    "alias": value.filename or key or "upload.bin",
+                    "mime_type": value.content_type or "application/octet-stream",
+                    "encoding": "base64",
+                    "base64": base64.b64encode(file_bytes).decode("ascii"),
+                    "field_name": key,
+                }
+            )
+        else:
+            _set_multi_value(fields, key, str(value))
+
+    form_secret = str(extras.get("formSecret") or "")
+    form_secret_header = str(extras.get("formSecretHeader") or "X-AgnoLab-Secret").strip() or "X-AgnoLab-Secret"
+    form_secret_field = str(extras.get("formSecretField") or "_secret").strip() or "_secret"
+    provided_secret = request.headers.get(form_secret_header) or _extract_secret_value(fields.get(form_secret_field))
+    if form_secret and provided_secret != form_secret:
+        raise HTTPException(
+            status_code=401,
+            detail=f"Invalid form secret. Expected header '{form_secret_header}' or field '{form_secret_field}'.",
+        )
+
+    if form_secret_field in fields:
+        fields.pop(form_secret_field, None)
+
+    metadata_payload: dict[str, object] = {
+        "integration_source": "form",
+        "form_path": request.url.path,
+        "form_content_type": request.headers.get("content-type", ""),
+        "form_headers": _sanitize_headers(request, extra_hidden_names={form_secret_header}),
+        "form_fields": fields,
+        "form_file_count": len(files),
+        "form_file_names": [str(item.get("name") or "") for item in files],
+    }
+
+    form_metadata_field = str(extras.get("formMetadataField") or "metadata_json").strip()
+    if form_metadata_field and form_metadata_field in fields:
+        parsed_metadata = _parse_json_text(_extract_secret_value(fields.pop(form_metadata_field)))
+        if isinstance(parsed_metadata, dict):
+            metadata_payload.update(parsed_metadata)
+        elif parsed_metadata is not None:
+            metadata_payload["form_metadata_value"] = parsed_metadata
+
+    preferred_text_field = str(extras.get("formTextField") or "message")
+    resolved_text = _pick_mapping_value(fields, preferred_text_field, ["message", "text", "description", "prompt"])
+
+    primary_file_field = str(extras.get("formPrimaryFileField") or "").strip()
+    if primary_file_field:
+        files.sort(key=lambda item: 0 if str(item.get("field_name") or "") == primary_file_field else 1)
+
+    metadata_payload["_agnolab_form_event"] = {
+        "text": resolved_text,
+    }
+
+    return run_saved_flow_record(
+        record,
+        input_text=resolved_text or None,
+        input_metadata=metadata_payload,
+        input_files=files,
+        debug=debug,
+        merge_metadata=True,
+    )
+
+
+@app.get("/api/integrations/whatsapp/{flow_name}/{node_id}/session/status", response_model=WhatsappSessionStatus)
+def get_saved_flow_whatsapp_session_status(flow_name: str, node_id: str) -> WhatsappSessionStatus:
+    record = load_flow_record(flow_name)
+    if record is None:
+        raise HTTPException(status_code=404, detail=f"Flow not found: {flow_name}")
+
+    input_node, _extras, session_id, _webhook_secret, webhook_url, gateway = _get_saved_whatsapp_input(record, node_id=node_id)
+    try:
+        status_payload = gateway.get_session_status(session_id)
+        return _build_whatsapp_status_response(record, input_node, status_payload=status_payload, webhook_url=webhook_url)
+    except Exception as error:
+        return _build_whatsapp_status_response(
+            record,
+            input_node,
+            status_payload={"session_id": session_id, "status": "error", "connected": False, "qr_code": None},
+            webhook_url=webhook_url,
+            last_error=str(error),
+        )
+
+
+@app.post("/api/integrations/whatsapp/{flow_name}/{node_id}/session/start", response_model=WhatsappSessionStatus)
+def start_saved_flow_whatsapp_session(flow_name: str, node_id: str) -> WhatsappSessionStatus:
+    record = load_flow_record(flow_name)
+    if record is None:
+        raise HTTPException(status_code=404, detail=f"Flow not found: {flow_name}")
+
+    input_node, _extras, session_id, _webhook_secret, webhook_url, gateway = _get_saved_whatsapp_input(record, node_id=node_id)
+    try:
+        status_payload = gateway.start_session(session_id, webhook_url=webhook_url)
+        return _build_whatsapp_status_response(record, input_node, status_payload=status_payload, webhook_url=webhook_url)
+    except Exception as error:
+        return _build_whatsapp_status_response(
+            record,
+            input_node,
+            status_payload={"session_id": session_id, "status": "error", "connected": False, "qr_code": None},
+            webhook_url=webhook_url,
+            last_error=str(error),
+        )
+
+
+@app.post("/api/integrations/whatsapp/{flow_name}/{node_id}/session/stop", response_model=WhatsappSessionStatus)
+def stop_saved_flow_whatsapp_session(flow_name: str, node_id: str) -> WhatsappSessionStatus:
+    record = load_flow_record(flow_name)
+    if record is None:
+        raise HTTPException(status_code=404, detail=f"Flow not found: {flow_name}")
+
+    input_node, _extras, session_id, _webhook_secret, webhook_url, gateway = _get_saved_whatsapp_input(record, node_id=node_id)
+    try:
+        gateway.close_session(session_id)
+        status_payload = {"session_id": session_id, "status": "closed", "connected": False, "qr_code": None}
+        return _build_whatsapp_status_response(record, input_node, status_payload=status_payload, webhook_url=webhook_url)
+    except Exception as error:
+        return _build_whatsapp_status_response(
+            record,
+            input_node,
+            status_payload={"session_id": session_id, "status": "error", "connected": False, "qr_code": None},
+            webhook_url=webhook_url,
+            last_error=str(error),
+        )
+
+
+@app.post("/api/integrations/whatsapp/{flow_name}/{node_id}/events", response_model=WhatsappWebhookDispatchResponse)
+async def run_saved_flow_from_whatsapp(flow_name: str, node_id: str, request: Request) -> WhatsappWebhookDispatchResponse:
+    record = load_flow_record(flow_name)
+    if record is None:
+        raise HTTPException(status_code=404, detail=f"Flow not found: {flow_name}")
+
+    input_node, extras, session_id, webhook_secret, _webhook_url, gateway = _get_saved_whatsapp_input(record, node_id=node_id)
+    provided_secret = str(request.query_params.get("secret") or "").strip()
+    if webhook_secret and provided_secret != webhook_secret:
+        raise HTTPException(status_code=401, detail="Invalid WhatsApp webhook secret.")
+
+    raw_body = await request.body()
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = _parse_json_text(raw_body.decode("utf-8", errors="replace")) or {}
+
+    event_name = "message"
+    if isinstance(payload, dict):
+        event_name = str(payload.get("event") or payload.get("eventName") or payload.get("type") or "message").strip() or "message"
+
+    def _respond(response: WhatsappWebhookDispatchResponse) -> WhatsappWebhookDispatchResponse:
+        print(
+            "[whatsapp-dispatch] "
+            f"flow={flow_name} node={node_id} session={session_id} "
+            f"event={response.event or event_name} accepted={response.accepted} replied={response.replied} "
+            f"sender={response.sender or ''} reason={response.reason or ''} delivery_error={response.delivery_error or ''}",
+            flush=True,
+        )
+        return response
+
+    if _should_ignore_whatsapp_event(event_name):
+        return _respond(WhatsappWebhookDispatchResponse(
+            accepted=False,
+            connected=True,
+            replied=False,
+            session_id=session_id,
+            event=event_name,
+            reason=f"Ignored WhatsApp event '{event_name}' because it is not an inbound message event.",
+        ))
+
+    message_event = _extract_whatsapp_message_event(payload)
+    if message_event is None:
+        return _respond(WhatsappWebhookDispatchResponse(
+            accepted=False,
+            connected=None,
+            replied=False,
+            session_id=session_id,
+            event=event_name,
+            reason="Webhook payload does not contain a supported WhatsApp message event.",
+        ))
+
+    if message_event["from_me"]:
+        return _respond(WhatsappWebhookDispatchResponse(
+            accepted=False,
+            connected=True,
+            replied=False,
+            session_id=session_id,
+            event=event_name,
+            sender=str(message_event["from"] or ""),
+            reason="Outgoing messages from this same WhatsApp session are ignored.",
+        ))
+
+    if _normalize_bool(extras.get("whatsappIgnoreGroups"), True) and bool(message_event["is_group"]):
+        return _respond(WhatsappWebhookDispatchResponse(
+            accepted=False,
+            connected=True,
+            replied=False,
+            session_id=session_id,
+            event=event_name,
+            sender=str(message_event["from"] or ""),
+            reason="Group messages are ignored by this flow configuration.",
+        ))
+
+    sender_value = str(message_event["from"] or "")
+    sender_name = str(message_event["sender_name"] or "")
+    text_value = str(message_event["text"] or "").strip()
+    runtime_files = _extract_whatsapp_runtime_files(message_event)
+
+    transcription_text = ""
+    if not text_value and runtime_files:
+        transcription_text = _transcribe_whatsapp_audio_with_openai(runtime_files)
+        if transcription_text:
+            text_value = transcription_text
+
+    if not text_value and not runtime_files:
+        return _respond(WhatsappWebhookDispatchResponse(
+            accepted=False,
+            connected=True,
+            replied=False,
+            session_id=session_id,
+            event=event_name,
+            sender=sender_value,
+            reason="Message has no text body to pass into the flow.",
+        ))
+
+    if not _field_matches(sender_value, extras.get("whatsappSenderFilter")) and not _field_matches(sender_name, extras.get("whatsappSenderFilter")):
+        return _respond(WhatsappWebhookDispatchResponse(
+            accepted=False,
+            connected=True,
+            replied=False,
+            session_id=session_id,
+            event=event_name,
+            sender=sender_value,
+            reason="Message sender does not match the configured WhatsApp filter.",
+        ))
+
+    if not _keywords_match(text_value, extras.get("whatsappBodyKeywords")):
+        return _respond(WhatsappWebhookDispatchResponse(
+            accepted=False,
+            connected=True,
+            replied=False,
+            session_id=session_id,
+            event=event_name,
+            sender=sender_value,
+            reason="Message text does not match the configured WhatsApp keyword filter.",
+        ))
+
+    message_id_value = str(message_event["message_id"] or "")
+    if _remember_recent_whatsapp_event(record.name, session_id, message_id_value):
+        return _respond(WhatsappWebhookDispatchResponse(
+            accepted=False,
+            connected=True,
+            replied=False,
+            session_id=session_id,
+            event=event_name,
+            sender=sender_value,
+            reason="Duplicate WhatsApp message event ignored.",
+        ))
+
+    whatsapp_metadata: dict[str, object] = {
+        "integration_source": "whatsapp",
+        "whatsapp_session_id": session_id,
+        "whatsapp_from": sender_value,
+        "whatsapp_sender_name": sender_name,
+        "whatsapp_message_id": message_id_value,
+        "whatsapp_timestamp": str(message_event["timestamp"] or ""),
+        "whatsapp_is_group": bool(message_event["is_group"]),
+        "whatsapp_event_name": event_name,
+        "whatsapp": {
+            "from": sender_value,
+            "sender_name": sender_name,
+            "message_id": message_id_value,
+            "timestamp": str(message_event["timestamp"] or ""),
+            "is_group": bool(message_event["is_group"]),
+            "text": text_value,
+            "transcription": transcription_text or None,
+        },
+    }
+    metadata_payload: dict[str, object] = {
+        **whatsapp_metadata,
+        "_agnolab_whatsapp_event": {
+            "text": text_value,
+            "metadata": whatsapp_metadata,
+        },
+    }
+
+    run_result = run_saved_flow_record(
+        record,
+        input_text=text_value or None,
+        input_metadata=metadata_payload,
+        input_files=runtime_files or None,
+        debug=False,
+        merge_metadata=True,
+    )
+
+    flow_result_text = (run_result.clean_stdout or run_result.stdout or "").strip()
+    reply_enabled = _normalize_bool(extras.get("whatsappReplyEnabled"), True)
+    reply_template = str(extras.get("whatsappReplyTemplate") or "$result_text")
+    reply_target = _normalize_whatsapp_reply_target(sender_value, is_group=bool(message_event["is_group"]))
+    reply_preview = _replace_template_tokens(
+        reply_template,
+        {
+            **metadata_payload,
+            "result_text": flow_result_text,
+            "input_text": text_value,
+            "sender": sender_value,
+            "sender_name": sender_name,
+            "session_id": session_id,
+        },
+    ).strip() or flow_result_text
+
+    replied = False
+    delivery_error: str | None = None
+    if reply_enabled and reply_target and reply_preview:
+        try:
+            gateway.send_text(
+                session_id,
+                phone=reply_target,
+                message=reply_preview,
+                is_group=bool(message_event["is_group"]),
+            )
+            replied = True
+        except Exception as error:
+            delivery_error = str(error)
+
+    return _respond(WhatsappWebhookDispatchResponse(
+        accepted=True,
+        connected=True,
+        replied=replied,
+        session_id=session_id,
+        event=event_name,
+        sender=sender_value,
+        reason=None if run_result.success else (run_result.stderr or "Flow execution failed."),
+        reply_preview=reply_preview or None,
+        flow_result=flow_result_text or None,
+        delivery_error=delivery_error,
+    ))
+
+
 @app.post("/api/flows/run", response_model=RunResult)
-def run_saved_flow_by_name(request: RunSavedFlowByNameRequest) -> RunResult:
+def run_saved_flow_by_name(request: RunSavedFlowByNameRequest, http_request: Request) -> RunResult:
     record = load_flow_record(request.name)
     if record is None:
         raise HTTPException(status_code=404, detail=f"Flow not found: {request.name}")
+    require_flow_bearer_auth(record, http_request)
     return run_saved_flow_record(
         record,
         input_text=request.input_text,
         input_metadata=request.input_metadata,
+        input_files=None,
         debug=request.debug,
-        openai_api_key=request.credentials.openai_api_key if request.credentials else None,
     )
 
 

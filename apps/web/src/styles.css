@@ -1488,7 +1488,48 @@ body {
   font-size: 0.82rem;
 }
 
+.runtime-env-list {
+  display: grid;
+  gap: 10px;
+}
+
+.runtime-env-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) auto;
+  gap: 10px;
+  align-items: center;
+}
+
+.runtime-env-row .secondary-button {
+  margin-top: 0;
+}
+
+.runtime-env-empty {
+  margin: 0 0 8px;
+}
+
+.whatsapp-qr-panel {
+  display: grid;
+  place-items: center;
+  padding: 20px;
+  border-radius: 18px;
+  border: 1px solid var(--agno-border);
+  background: rgba(var(--agno-gray-900), 0.72);
+}
+
+.whatsapp-qr-image {
+  width: min(100%, 360px);
+  height: auto;
+  border-radius: 14px;
+  background: white;
+  padding: 12px;
+}
+
 @media (max-width: 820px) {
+  .runtime-env-row {
+    grid-template-columns: 1fr;
+  }
+
   .chat-modal {
     width: calc(100vw - 24px);
     height: calc(100vh - 24px);

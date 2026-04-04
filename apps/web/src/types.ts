@@ -21,6 +21,18 @@ export type NodeType =
 export interface ProjectMeta {
   name: string;
   target: "agno-python" | "agnogo";
+  runtime?: ProjectRuntimeConfig;
+}
+
+export interface ProjectRuntimeEnvVar {
+  key: string;
+  value: string;
+}
+
+export interface ProjectRuntimeConfig {
+  envVars: ProjectRuntimeEnvVar[];
+  authEnabled: boolean;
+  authToken?: string | null;
 }
 
 export interface Position {
@@ -88,10 +100,6 @@ export interface BuiltInToolFunctionOption {
   optional_params: string[];
 }
 
-export interface RuntimeCredentials {
-  openai_api_key?: string | null;
-}
-
 export interface RunResult {
   success: boolean;
   stdout: string;
@@ -118,6 +126,18 @@ export interface FlowRecord {
   graph: CanvasGraph;
   created_at: string;
   updated_at: string;
+}
+
+export interface WhatsappSessionStatus {
+  flow_name: string;
+  node_id: string;
+  node_name: string;
+  session_id: string;
+  status: string;
+  connected: boolean;
+  qr_code?: string | null;
+  webhook_url?: string | null;
+  last_error?: string | null;
 }
 
 export interface SavedUserTool {

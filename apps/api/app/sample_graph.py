@@ -6,7 +6,23 @@ from .provider_catalog import build_provider_config
 from .models import CanvasGraph, CanvasTemplateSummary, GraphEdge, GraphNode, NodeData, Position, ProjectMeta
 
 
-REPO_ROOT = Path(__file__).resolve().parents[3]
+
+
+def _detect_repo_root() -> Path:
+    current = Path(__file__).resolve()
+    markers = ("docker-compose.dev.yml", "docker-compose.yml", "README.md")
+
+    for parent in current.parents:
+        if any((parent / marker).exists() for marker in markers) or (parent / "apps").is_dir():
+            return parent
+
+    if current.parent.name == "app":
+        return current.parent.parent
+
+    return current.parent
+
+
+REPO_ROOT = _detect_repo_root()
 EXAMPLE_SKILL_PATH = str((REPO_ROOT / "examples/skills/support-response-style").resolve())
 
 

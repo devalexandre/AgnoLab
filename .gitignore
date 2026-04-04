@@ -15,3 +15,5 @@ coverage/
 docs/
 .*od
 apps/api/data/flows/
+.*sql
+data

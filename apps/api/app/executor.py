@@ -118,10 +118,10 @@ def preflight_component_imports(code: str) -> str | None:
 def run_generated_code(
     code: str,
     *,
-    openai_api_key: str | None = None,
+    extra_env: dict[str, str] | None = None,
     timeout_seconds: float = 20.0,
 ) -> tuple[bool, str, str, int | None]:
-    effective_openai_key = openai_api_key or os.getenv("OPENAI_API_KEY")
+    effective_openai_key = (extra_env or {}).get("OPENAI_API_KEY") or os.getenv("OPENAI_API_KEY")
 
     if timeout_seconds <= 0:
         timeout_seconds = 20.0
@@ -142,6 +142,8 @@ def run_generated_code(
         script_path = Path(tmp_dir) / "main.py"
         script_path.write_text(code, encoding="utf-8")
         env = os.environ.copy()
+        if extra_env:
+            env.update(extra_env)
         if effective_openai_key:
             env["OPENAI_API_KEY"] = effective_openai_key
 

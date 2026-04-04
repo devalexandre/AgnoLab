@@ -60,7 +60,23 @@ from agno.team import Team
 
 RESULT_START_MARKER = "__AGNO_RESULT_START__"
 RESULT_END_MARKER = "__AGNO_RESULT_END__"
-PROJECT_ROOT = Path(__file__).resolve().parents[3]
+
+
+def _detect_project_root() -> Path:
+    current = Path(__file__).resolve()
+    markers = ("docker-compose.dev.yml", "docker-compose.yml", "README.md")
+
+    for parent in current.parents:
+        if any((parent / marker).exists() for marker in markers) or (parent / "apps").is_dir():
+            return parent
+
+    if current.parent.name == "app":
+        return current.parent.parent
+
+    return current.parent
+
+
+PROJECT_ROOT = _detect_project_root()
 
 DEBUG_TRACE_HELPERS = [
     "def _agnolab_build_media_kwargs(flow_input_files):",
@@ -705,7 +721,49 @@ def extract_function_name(raw_code: str, fallback: str) -> str:
     return fallback
 
 
-def render_tool_node(node: GraphNode, var_name: str) -> tuple[list[str], list[tuple[str, str]], bool]:
+def _extract_named_string_arg(expression: str, arg_name: str) -> str:
+    pattern = re.compile(rf"{re.escape(arg_name)}\s*=\s*(['\"])(.*?)\1")
+    match = pattern.search(str(expression or ""))
+    return str(match.group(2) or "").strip() if match else ""
+
+
+def infer_sqltools_config_from_graph(graph: CanvasGraph | None) -> dict[str, Any]:
+    default_config = {"db_url": "sqlite:///tmp/agno.db"}
+    if graph is None:
+        return default_config
+
+    database_nodes = [node for node in graph.nodes if node.type == NodeType.DATABASE]
+    if not database_nodes:
+        return default_config
+
+    extras = database_nodes[0].data.extras or {}
+    preset = str(extras.get("dbPreset") or "").strip().lower()
+    if preset == "sqlite-db":
+        directory = str(extras.get("dbDirectory") or "tmp").strip().strip("/") or "tmp"
+        db_name = str(extras.get("dbName") or "agno").strip() or "agno"
+        return {"db_url": f"sqlite:///{directory}/{db_name}.db"}
+
+    expression = str(extras.get("dbExpression") or "").strip()
+    if expression:
+        db_url = _extract_named_string_arg(expression, "db_url")
+        if db_url:
+            return {"db_url": db_url}
+
+        db_file = _extract_named_string_arg(expression, "db_file")
+        if db_file:
+            return {"db_url": f"sqlite:///{db_file}"}
+
+    return default_config
+
+
+def _sqlite_path_from_db_url(db_url: object) -> str:
+    raw = str(db_url or "").strip()
+    if not raw.startswith("sqlite:///"):
+        return ""
+    return raw[len("sqlite:///") :].strip()
+
+
+def render_tool_node(node: GraphNode, var_name: str, *, graph: CanvasGraph | None = None) -> tuple[list[str], list[tuple[str, str]], bool]:
     extras = node.data.extras or {}
     tool_mode = extras.get("toolMode", "builtin")
 
@@ -713,11 +771,39 @@ def render_tool_node(node: GraphNode, var_name: str) -> tuple[list[str], list[tu
         class_name = extras.get("builtinClassName", "WebSearchTools")
         import_path = extras.get("builtinImportPath", "agno.tools.websearch")
         config_raw = extras.get("builtinConfig") or ""
-        kwargs = ""
+        parsed_config: dict[str, Any] = {}
         if isinstance(config_raw, str) and config_raw.strip():
             parsed = parse_json_if_needed(config_raw)
-            if isinstance(parsed, dict) and parsed:
-                kwargs = ", ".join(f"{key}={python_literal(value)}" for key, value in parsed.items())
+            if isinstance(parsed, dict):
+                parsed_config = dict(parsed)
+
+        if str(class_name or "") == "SQLTools":
+            has_sql_connection = any(
+                key in parsed_config and parsed_config.get(key) not in (None, "")
+                for key in ("db_url", "db_engine", "host")
+            )
+            if not has_sql_connection:
+                inferred_config = infer_sqltools_config_from_graph(graph)
+                parsed_config = {**inferred_config, **parsed_config}
+
+            sqlite_file_path = _sqlite_path_from_db_url(parsed_config.get("db_url"))
+            if sqlite_file_path:
+                path_var = sanitize_identifier(f"{var_name}_sqlite_path")
+                dir_var = sanitize_identifier(f"{var_name}_sqlite_dir")
+                return (
+                    [
+                        f"{path_var} = Path({python_literal(sqlite_file_path)})",
+                        f"{dir_var} = {path_var}.parent",
+                        f"if str({dir_var}) not in ('', '.'):",
+                        f"    {dir_var}.mkdir(parents=True, exist_ok=True)",
+                        f"{var_name} = {class_name}(db_url='sqlite:///' + str({path_var}.resolve()))",
+                        "",
+                    ],
+                    [(import_path, class_name)],
+                    False,
+                )
+
+        kwargs = ", ".join(f"{key}={python_literal(value)}" for key, value in parsed_config.items()) if parsed_config else ""
         expression = f"{class_name}({kwargs})" if kwargs else f"{class_name}()"
         return [f"{var_name} = {expression}", ""], [(import_path, class_name)], False
 
@@ -1886,10 +1972,67 @@ def render_input_payload(node: GraphNode) -> list[str]:
         ]
         return lines
 
+    runtime_event_metadata_key = (
+        "_agnolab_webhook_event"
+        if input_source == "webhook"
+        else "_agnolab_form_event"
+        if input_source == "form"
+        else "_agnolab_whatsapp_event"
+        if input_source == "whatsapp"
+        else ""
+    )
     lines = [
         "flow_input_files = []",
         f"flow_input_metadata = {python_literal(metadata_payload)}",
+        "_agnolab_runtime_files = None",
+        "_agnolab_runtime_event = None",
+        "if isinstance(flow_input_metadata, dict):",
+        "    _agnolab_runtime_files = flow_input_metadata.pop('_agnolab_runtime_files', None)",
     ]
+
+    if runtime_event_metadata_key:
+        lines.append(f"    _agnolab_runtime_event = flow_input_metadata.pop({python_literal(runtime_event_metadata_key)}, None)")
+
+    lines.extend(
+        [
+            "",
+            "def _agnolab_materialize_runtime_file(index, file_item):",
+            "    if not isinstance(file_item, dict):",
+            "        return None",
+            "    _agnolab_raw_name = str(file_item.get('name') or f'input_{index}.bin')",
+            "    _agnolab_safe_name = Path(_agnolab_raw_name).name or f'input_{index}.bin'",
+            "    _agnolab_alias = str(file_item.get('alias') or _agnolab_safe_name)",
+            "    _agnolab_mime_type = str(file_item.get('mime_type') or 'application/octet-stream')",
+            "    _agnolab_encoding = str(file_item.get('encoding') or 'base64').strip().lower() or 'base64'",
+            "    _agnolab_base64 = str(file_item.get('base64') or '')",
+            "    _agnolab_content = str(file_item.get('content') or '')",
+            "    _agnolab_file_path = Path(f'{index}_{_agnolab_safe_name}')",
+            "    if _agnolab_base64:",
+            "        _agnolab_file_path.write_bytes(base64.b64decode(_agnolab_base64))",
+            "    else:",
+            "        _agnolab_file_path.write_text(_agnolab_content, encoding='utf-8')",
+            "    return {",
+            "        'name': _agnolab_safe_name,",
+            "        'alias': _agnolab_alias,",
+            "        'mime_type': _agnolab_mime_type,",
+            "        'encoding': _agnolab_encoding,",
+            "        'path': str(_agnolab_file_path.resolve()),",
+            "    }",
+            "",
+            "if isinstance(_agnolab_runtime_files, list):",
+            "    for _agnolab_index, _agnolab_file_item in enumerate(_agnolab_runtime_files, start=1):",
+            "        _agnolab_runtime_file = _agnolab_materialize_runtime_file(_agnolab_index, _agnolab_file_item)",
+            "        if _agnolab_runtime_file is not None:",
+            "            flow_input_files.append(_agnolab_runtime_file)",
+            "",
+            "_agnolab_runtime_text = ''",
+            "if isinstance(_agnolab_runtime_event, dict):",
+            "    _agnolab_runtime_text = str(_agnolab_runtime_event.get('text') or '')",
+            "    _agnolab_runtime_metadata = _agnolab_runtime_event.get('metadata')",
+            "    if isinstance(_agnolab_runtime_metadata, dict):",
+            "        flow_input_metadata.update(_agnolab_runtime_metadata)",
+        ]
+    )
 
     if attached_file_name and (attached_file_base64 or attached_file_content):
         lines.extend(
@@ -1900,13 +2043,13 @@ def render_input_payload(node: GraphNode) -> list[str]:
                 f"_input_file_encoding = {python_literal(attached_file_encoding)}",
                 f"_input_file_base64 = {python_literal(attached_file_base64)}",
                 f"_input_file_content = {python_literal(attached_file_content)}",
-                "_input_file_path = Path(_input_file_name)",
+                "_input_file_path = Path(Path(_input_file_name).name or 'input_file')",
                 "if _input_file_base64:",
                 "    _input_file_path.write_bytes(base64.b64decode(_input_file_base64))",
                 "else:",
                 "    _input_file_path.write_text(_input_file_content, encoding='utf-8')",
                 "flow_input_files.append({",
-                "    'name': _input_file_name,",
+                "    'name': Path(_input_file_name).name or 'input_file',",
                 "    'alias': _input_file_alias,",
                 "    'mime_type': _input_file_mime_type,",
                 "    'encoding': _input_file_encoding,",
@@ -1914,12 +2057,10 @@ def render_input_payload(node: GraphNode) -> list[str]:
                 "})",
             ]
         )
-    else:
-        lines.append("flow_input_files = []")
 
     lines.extend(
         [
-            f"flow_input_payload = {{'text': {python_literal(input_text)}, 'files': flow_input_files, 'metadata': flow_input_metadata}}",
+            f"flow_input_payload = {{'text': _agnolab_runtime_text or {python_literal(input_text)}, 'files': flow_input_files, 'metadata': flow_input_metadata}}",
             "flow_input_file_path = flow_input_files[0]['path'] if flow_input_files else None",
             "flow_input_parts = []",
             "if flow_input_payload.get('text'):",
@@ -1939,181 +2080,497 @@ def render_input_payload(node: GraphNode) -> list[str]:
 def render_output_api_dispatch(node: GraphNode, *, project_name: str) -> tuple[list[str], list[str]]:
     extras = node.data.extras or {}
     warnings: list[str] = []
+    output_mode = str(extras.get("outputMode") or "api").strip().lower()
+    if output_mode not in {"api", "email", "chat", "spreadsheet"}:
+        warnings.append(f"Output mode '{output_mode}' is not supported; falling back to API POST.")
+        output_mode = "api"
 
-    api_url = str(extras.get("apiUrl") or "").strip()
-    bearer_token = str(extras.get("apiBearerToken") or "").strip()
-    timeout_raw = extras.get("apiTimeoutSeconds")
-    timeout_seconds = 15.0
-    if timeout_raw not in (None, ""):
+    def parse_timeout(value: object, *, default: float, label: str) -> float:
+        if value in (None, ""):
+            return default
         try:
-            timeout_seconds = float(timeout_raw)
+            timeout_value = float(value)
         except (TypeError, ValueError):
-            warnings.append("API Output timeout is invalid; falling back to 15 seconds.")
-            timeout_seconds = 15.0
-    if timeout_seconds <= 0:
-        warnings.append("API Output timeout must be greater than zero; falling back to 15 seconds.")
-        timeout_seconds = 15.0
+            warnings.append(f"{label} timeout is invalid; falling back to {default:g} seconds.")
+            return default
+        if timeout_value <= 0:
+            warnings.append(f"{label} timeout must be greater than zero; falling back to {default:g} seconds.")
+            return default
+        return timeout_value
 
-    headers_dict: dict[str, object] = {}
-    headers_raw = str(extras.get("apiHeadersJson") or "").strip()
-    if headers_raw:
-        parsed_headers = parse_json_if_needed(headers_raw)
-        if isinstance(parsed_headers, dict):
-            headers_dict = {str(key): value for key, value in parsed_headers.items()}
-        else:
-            warnings.append("API Output additional headers JSON is invalid; ignoring custom headers.")
+    def parse_object_template(raw_text: str, *, label: str) -> dict[str, object]:
+        if not raw_text.strip():
+            return {}
+        if "$" in raw_text:
+            return {}
+        parsed_value = parse_json_if_needed(raw_text)
+        if isinstance(parsed_value, dict):
+            return {str(key): value for key, value in parsed_value.items()}
+        warnings.append(f"{label} must be a JSON object; ignoring it.")
+        return {}
 
-    payload_raw = str(extras.get("apiPayloadJson") or "").strip()
-    if payload_raw:
-        parsed_payload = parse_json_if_needed(payload_raw) if "$" not in payload_raw else None
-        if parsed_payload is None and "$" not in payload_raw:
-            warnings.append("API Output additional payload JSON is invalid; ignoring extra payload.")
-        elif parsed_payload is not None and not isinstance(parsed_payload, dict):
-            warnings.append("API Output additional payload JSON must be an object; ignoring extra payload.")
+    def parse_bool(value: object, *, default: bool) -> bool:
+        if isinstance(value, bool):
+            return value
+        normalized = str(value or "").strip().lower()
+        if normalized in {"true", "1", "yes", "on"}:
+            return True
+        if normalized in {"false", "0", "no", "off"}:
+            return False
+        return default
 
     lines = [
-        f"_agnolab_api_url = {python_literal(api_url)}",
-        f"_agnolab_api_bearer_token = {python_literal(bearer_token)}",
-        f"_agnolab_api_timeout = {timeout_seconds}",
-        f"_agnolab_api_extra_headers = {python_literal(headers_dict)}",
-        f"_agnolab_api_extra_payload_raw = {python_literal(payload_raw)}",
-        "if not _agnolab_api_url:",
-        "    pass",
-        "else:",
-        "    def _agnolab_metadata_value(key):",
-        "        if isinstance(flow_input_metadata, dict):",
-        "            return flow_input_metadata.get(key)",
+        f"_agnolab_output_mode = {python_literal(output_mode)}",
+        "_agnolab_delivery_timestamp = datetime.now(timezone.utc).isoformat()",
+        "",
+        "def _agnolab_context_value(key):",
+        "    if isinstance(flow_input_metadata, dict) and key in flow_input_metadata:",
+        "        return flow_input_metadata.get(key)",
+        "    if key in {'flow_name', 'project_name'}:",
+        f"        return {python_literal(project_name)}",
+        "    if key == 'output_node':",
+        f"        return {python_literal(node.data.name)}",
+        "    if key == 'result_text':",
+        "        return flow_result_text",
+        "    if key == 'input_text':",
+        "        if isinstance(flow_input_payload, dict):",
+        "            return flow_input_payload.get('text')",
         "        return None",
+        "    if key == 'timestamp':",
+        "        return _agnolab_delivery_timestamp",
+        "    return None",
         "",
-        "    def _agnolab_replace_metadata_tokens(text):",
-        "        _agnolab_parts = []",
-        "        _agnolab_index = 0",
-        "        while _agnolab_index < len(text):",
-        "            _agnolab_char = text[_agnolab_index]",
-        "            if (",
-        "                _agnolab_char != '$'",
-        "                or _agnolab_index + 1 >= len(text)",
-        "                or not (text[_agnolab_index + 1].isalpha() or text[_agnolab_index + 1] == '_')",
-        "            ):",
-        "                _agnolab_parts.append(_agnolab_char)",
-        "                _agnolab_index += 1",
-        "                continue",
-        "            _agnolab_end = _agnolab_index + 2",
-        "            while _agnolab_end < len(text) and (text[_agnolab_end].isalnum() or text[_agnolab_end] == '_'):",
-        "                _agnolab_end += 1",
-        "            _agnolab_value = _agnolab_metadata_value(text[_agnolab_index + 1:_agnolab_end])",
-        "            _agnolab_parts.append('' if _agnolab_value is None else str(_agnolab_value))",
-        "            _agnolab_index = _agnolab_end",
-        "        return ''.join(_agnolab_parts)",
-        "",
-        "    def _agnolab_resolve_api_payload_value(value):",
-        "        if isinstance(value, dict):",
-        "            return {key: _agnolab_resolve_api_payload_value(item) for key, item in value.items()}",
-        "        if isinstance(value, list):",
-        "            return [_agnolab_resolve_api_payload_value(item) for item in value]",
-        "        if isinstance(value, str):",
-        "            if value.startswith('__agnolab_meta__:'):",
-        "                return _agnolab_metadata_value(value[len('__agnolab_meta__:'):])",
-        "            if value.startswith('$') and len(value) > 1 and (value[1].isalpha() or value[1] == '_') and all(char.isalnum() or char == '_' for char in value[2:]):",
-        "                return _agnolab_metadata_value(value[1:])",
-        "            return _agnolab_replace_metadata_tokens(value)",
-        "        return value",
-        "",
-        "    def _agnolab_prepare_api_payload_template(raw_text):",
-        "        _agnolab_parts = []",
-        "        _agnolab_index = 0",
-        "        _agnolab_in_string = False",
-        "        _agnolab_escape = False",
-        "        while _agnolab_index < len(raw_text):",
-        "            _agnolab_char = raw_text[_agnolab_index]",
-        "            if _agnolab_in_string:",
-        "                _agnolab_parts.append(_agnolab_char)",
-        "                if _agnolab_escape:",
-        "                    _agnolab_escape = False",
-        "                elif _agnolab_char == '\\\\':",
-        "                    _agnolab_escape = True",
-        "                elif _agnolab_char == '\"':",
-        "                    _agnolab_in_string = False",
-        "                _agnolab_index += 1",
-        "                continue",
-        "            if _agnolab_char == '\"':",
-        "                _agnolab_in_string = True",
-        "                _agnolab_parts.append(_agnolab_char)",
-        "                _agnolab_index += 1",
-        "                continue",
-        "            if _agnolab_char == '$' and _agnolab_index + 1 < len(raw_text) and (raw_text[_agnolab_index + 1].isalpha() or raw_text[_agnolab_index + 1] == '_'):",
-        "                _agnolab_end = _agnolab_index + 2",
-        "                while _agnolab_end < len(raw_text) and (raw_text[_agnolab_end].isalnum() or raw_text[_agnolab_end] == '_'):",
-        "                    _agnolab_end += 1",
-        "                _agnolab_parts.append(json.dumps(f\"__agnolab_meta__:{raw_text[_agnolab_index + 1:_agnolab_end]}\"))",
-        "                _agnolab_index = _agnolab_end",
-        "                continue",
+        "def _agnolab_replace_context_tokens(text):",
+        "    _agnolab_parts = []",
+        "    _agnolab_index = 0",
+        "    while _agnolab_index < len(text):",
+        "        _agnolab_char = text[_agnolab_index]",
+        "        if (",
+        "            _agnolab_char != '$'",
+        "            or _agnolab_index + 1 >= len(text)",
+        "            or not (text[_agnolab_index + 1].isalpha() or text[_agnolab_index + 1] == '_')",
+        "        ):",
         "            _agnolab_parts.append(_agnolab_char)",
         "            _agnolab_index += 1",
-        "        return ''.join(_agnolab_parts)",
+        "            continue",
+        "        _agnolab_end = _agnolab_index + 2",
+        "        while _agnolab_end < len(text) and (text[_agnolab_end].isalnum() or text[_agnolab_end] == '_'):",
+        "            _agnolab_end += 1",
+        "        _agnolab_value = _agnolab_context_value(text[_agnolab_index + 1:_agnolab_end])",
+        "        _agnolab_parts.append('' if _agnolab_value is None else str(_agnolab_value))",
+        "        _agnolab_index = _agnolab_end",
+        "    return ''.join(_agnolab_parts)",
         "",
-        "    def _agnolab_parse_api_payload_template(raw_text):",
-        "        if not raw_text.strip():",
-        "            return None",
-        "        _agnolab_prepared_payload = _agnolab_prepare_api_payload_template(raw_text)",
-        "        _agnolab_parsed_payload = json.loads(_agnolab_prepared_payload)",
-        "        if not isinstance(_agnolab_parsed_payload, dict):",
-        "            raise ValueError('Additional payload must resolve to a JSON object.')",
-        "        return _agnolab_resolve_api_payload_value(_agnolab_parsed_payload)",
+        "def _agnolab_resolve_template_value(value):",
+        "    if isinstance(value, dict):",
+        "        return {key: _agnolab_resolve_template_value(item) for key, item in value.items()}",
+        "    if isinstance(value, list):",
+        "        return [_agnolab_resolve_template_value(item) for item in value]",
+        "    if isinstance(value, str):",
+        "        if value.startswith('__agnolab_ctx__:'):",
+        "            return _agnolab_context_value(value[len('__agnolab_ctx__:'):])",
+        "        if value.startswith('$') and len(value) > 1 and (value[1].isalpha() or value[1] == '_') and all(char.isalnum() or char == '_' for char in value[2:]):",
+        "            return _agnolab_context_value(value[1:])",
+        "        return _agnolab_replace_context_tokens(value)",
+        "    return value",
         "",
-        "    _agnolab_api_headers = {'Accept': 'application/json', 'Content-Type': 'application/json'}",
-        "    if _agnolab_api_extra_headers:",
-        "        _agnolab_api_headers.update(_agnolab_api_extra_headers)",
-        "    if _agnolab_api_bearer_token:",
-        "        _agnolab_api_headers['Authorization'] = f\"Bearer {_agnolab_api_bearer_token}\"",
+        "def _agnolab_prepare_json_template(raw_text):",
+        "    _agnolab_parts = []",
+        "    _agnolab_index = 0",
+        "    _agnolab_in_string = False",
+        "    _agnolab_escape = False",
+        "    while _agnolab_index < len(raw_text):",
+        "        _agnolab_char = raw_text[_agnolab_index]",
+        "        if _agnolab_in_string:",
+        "            _agnolab_parts.append(_agnolab_char)",
+        "            if _agnolab_escape:",
+        "                _agnolab_escape = False",
+        "            elif _agnolab_char == '\\\\':",
+        "                _agnolab_escape = True",
+        "            elif _agnolab_char == '\"':",
+        "                _agnolab_in_string = False",
+        "            _agnolab_index += 1",
+        "            continue",
+        "        if _agnolab_char == '\"':",
+        "            _agnolab_in_string = True",
+        "            _agnolab_parts.append(_agnolab_char)",
+        "            _agnolab_index += 1",
+        "            continue",
+        "        if _agnolab_char == '$' and _agnolab_index + 1 < len(raw_text) and (raw_text[_agnolab_index + 1].isalpha() or raw_text[_agnolab_index + 1] == '_'):",
+        "            _agnolab_end = _agnolab_index + 2",
+        "            while _agnolab_end < len(raw_text) and (raw_text[_agnolab_end].isalnum() or raw_text[_agnolab_end] == '_'):",
+        "                _agnolab_end += 1",
+        "            _agnolab_parts.append(json.dumps(f\"__agnolab_ctx__:{raw_text[_agnolab_index + 1:_agnolab_end]}\"))",
+        "            _agnolab_index = _agnolab_end",
+        "            continue",
+        "        _agnolab_parts.append(_agnolab_char)",
+        "        _agnolab_index += 1",
+        "    return ''.join(_agnolab_parts)",
         "",
-        "    _agnolab_api_payload_template_error = None",
-        "    _agnolab_api_extra_payload = None",
-        "    if _agnolab_api_extra_payload_raw.strip():",
-        "        try:",
-        "            _agnolab_api_extra_payload = _agnolab_parse_api_payload_template(_agnolab_api_extra_payload_raw)",
-        "        except Exception as _agnolab_api_payload_error:",
-        "            _agnolab_api_payload_template_error = str(_agnolab_api_payload_error)",
+        "def _agnolab_parse_json_template(raw_text):",
+        "    if not raw_text.strip():",
+        "        return None",
+        "    _agnolab_prepared_value = _agnolab_prepare_json_template(raw_text)",
+        "    return _agnolab_resolve_template_value(json.loads(_agnolab_prepared_value))",
         "",
-        "    _agnolab_api_payload = {",
-        "        'success': True,",
-        "        'data': {",
-        f"            'flow': {{'project': {python_literal(project_name)}, 'node': {python_literal(node.data.name)}, 'type': 'output_api'}},",
-        "            'input': flow_input_payload,",
-        "            'result': {'text': flow_result_text},",
-        "        },",
-        "        'meta': {'source': 'agnolab', 'timestamp': datetime.now(timezone.utc).isoformat()},",
-        "    }",
-        "    if _agnolab_api_payload_template_error:",
-        "        _agnolab_api_payload['meta']['payload_template_error'] = _agnolab_api_payload_template_error",
-        "    if _agnolab_api_extra_payload:",
-        "        _agnolab_api_payload['extra'] = _agnolab_api_extra_payload",
+        "def _agnolab_stringify_value(value):",
+        "    if value is None:",
+        "        return ''",
+        "    if isinstance(value, (dict, list)):",
+        "        return json.dumps(value, ensure_ascii=False)",
+        "    return str(value)",
         "",
-        "    try:",
-        "        _agnolab_api_response = requests.post(",
-        "            _agnolab_api_url,",
-        "            headers=_agnolab_api_headers,",
-        "            json=_agnolab_api_payload,",
-        "            timeout=_agnolab_api_timeout,",
-        "        )",
-        "        try:",
-        "            _agnolab_api_response_body = _agnolab_api_response.json()",
-        "        except ValueError:",
-        "            _agnolab_api_response_body = _agnolab_api_response.text",
+        "def _agnolab_find_nested_string(payload, keys):",
+        "    if isinstance(payload, dict):",
+        "        for key in keys:",
+        "            value = payload.get(key)",
+        "            if isinstance(value, str) and value.strip():",
+        "                return value.strip()",
+        "        for value in payload.values():",
+        "            found = _agnolab_find_nested_string(value, keys)",
+        "            if found:",
+        "                return found",
+        "    elif isinstance(payload, list):",
+        "        for item in payload:",
+        "            found = _agnolab_find_nested_string(item, keys)",
+        "            if found:",
+        "                return found",
+        "    return ''",
         "",
-        "        _agnolab_delivery = {",
-        "            'delivered': _agnolab_api_response.ok,",
-        "            'status_code': _agnolab_api_response.status_code,",
-        "            'response': _agnolab_api_response_body,",
-        "        }",
-        "    except Exception as exc:",
-        "        _agnolab_delivery = {'delivered': False, 'error': str(exc)}",
-        "",
-        "    print(json.dumps({'result': flow_result_text, 'delivery': _agnolab_delivery}, ensure_ascii=False))",
+        "_agnolab_delivery = {'channel': _agnolab_output_mode, 'delivered': False}",
     ]
 
-    if not api_url:
-        warnings.append("API Output node has no URL configured; execution will only print the generated result.")
+    if output_mode == "api":
+        api_url = str(extras.get("apiUrl") or "").strip()
+        bearer_token = str(extras.get("apiBearerToken") or "").strip()
+        timeout_seconds = parse_timeout(extras.get("apiTimeoutSeconds"), default=15.0, label="API Output")
+        headers_raw = str(extras.get("apiHeadersJson") or "").strip()
+        payload_raw = str(extras.get("apiPayloadJson") or "").strip()
+        headers_dict = parse_object_template(headers_raw, label="API Output additional headers JSON")
+
+        if payload_raw and "$" not in payload_raw:
+            parsed_payload = parse_json_if_needed(payload_raw)
+            if parsed_payload is not None and not isinstance(parsed_payload, dict):
+                warnings.append("API Output additional payload JSON must be an object; ignoring template errors until runtime.")
+
+        if not api_url:
+            warnings.append("API Output node has no URL configured; execution will only print the generated result.")
+
+        lines.extend(
+            [
+                f"_agnolab_api_url = {python_literal(api_url)}",
+                f"_agnolab_api_bearer_token = {python_literal(bearer_token)}",
+                f"_agnolab_api_timeout = {timeout_seconds}",
+                f"_agnolab_api_extra_headers = {python_literal(headers_dict)}",
+                f"_agnolab_api_payload_raw = {python_literal(payload_raw)}",
+                "if not _agnolab_api_url:",
+                "    _agnolab_delivery['error'] = 'API URL not configured.'",
+                "else:",
+                "    _agnolab_api_headers = {'Accept': 'application/json', 'Content-Type': 'application/json'}",
+                "    if _agnolab_api_extra_headers:",
+                "        _agnolab_api_headers.update(_agnolab_api_extra_headers)",
+                "    if _agnolab_api_bearer_token:",
+                "        _agnolab_api_headers['Authorization'] = f\"Bearer {_agnolab_api_bearer_token}\"",
+                "    _agnolab_api_extra_payload = None",
+                "    _agnolab_api_payload_template_error = None",
+                "    if _agnolab_api_payload_raw.strip():",
+                "        try:",
+                "            _agnolab_api_extra_payload = _agnolab_parse_json_template(_agnolab_api_payload_raw)",
+                "            if _agnolab_api_extra_payload is not None and not isinstance(_agnolab_api_extra_payload, dict):",
+                "                raise ValueError('Additional payload must resolve to a JSON object.')",
+                "        except Exception as exc:",
+                "            _agnolab_api_payload_template_error = str(exc)",
+                "            _agnolab_api_extra_payload = None",
+                "    _agnolab_api_payload = {",
+                "        'success': True,",
+                "        'data': {",
+                f"            'flow': {{'project': {python_literal(project_name)}, 'node': {python_literal(node.data.name)}, 'type': 'output_api', 'mode': 'api'}},",
+                "            'input': flow_input_payload,",
+                "            'result': {'text': flow_result_text},",
+                "        },",
+                "        'meta': {'source': 'agnolab', 'timestamp': _agnolab_delivery_timestamp},",
+                "    }",
+                "    if _agnolab_api_payload_template_error:",
+                "        _agnolab_api_payload['meta']['payload_template_error'] = _agnolab_api_payload_template_error",
+                "    if _agnolab_api_extra_payload is not None:",
+                "        _agnolab_api_payload['extra'] = _agnolab_api_extra_payload",
+                "    try:",
+                "        _agnolab_api_response = requests.post(",
+                "            _agnolab_api_url,",
+                "            headers=_agnolab_api_headers,",
+                "            json=_agnolab_api_payload,",
+                "            timeout=_agnolab_api_timeout,",
+                "        )",
+                "        try:",
+                "            _agnolab_api_response_body = _agnolab_api_response.json()",
+                "        except ValueError:",
+                "            _agnolab_api_response_body = _agnolab_api_response.text",
+                "        _agnolab_delivery = {",
+                "            'channel': 'api',",
+                "            'delivered': _agnolab_api_response.ok,",
+                "            'status_code': _agnolab_api_response.status_code,",
+                "            'response': _agnolab_api_response_body,",
+                "        }",
+                "    except Exception as exc:",
+                "        _agnolab_delivery = {'channel': 'api', 'delivered': False, 'error': str(exc)}",
+            ]
+        )
+    elif output_mode == "email":
+        email_security = str(extras.get("emailSecurity") or "starttls").strip().lower()
+        if email_security not in {"ssl", "starttls", "none"}:
+            warnings.append("Email Send Output security is invalid; falling back to STARTTLS.")
+            email_security = "starttls"
+        email_host = str(extras.get("emailHost") or "").strip()
+        email_from = str(extras.get("emailFrom") or "").strip()
+        email_to = str(extras.get("emailTo") or "").strip()
+        email_timeout = parse_timeout(extras.get("emailTimeoutSeconds"), default=15.0, label="Email Send Output")
+        email_port_default = 465 if email_security == "ssl" else 587
+        try:
+            email_port = int(str(extras.get("emailPort") or "").strip() or email_port_default)
+        except (TypeError, ValueError):
+            warnings.append("Email Send Output port is invalid; using the default SMTP port.")
+            email_port = email_port_default
+        if email_port <= 0:
+            warnings.append("Email Send Output port must be greater than zero; using the default SMTP port.")
+            email_port = email_port_default
+        email_attach_input_files = parse_bool(extras.get("emailAttachInputFiles"), default=False)
+
+        if not email_host or not email_from or not email_to:
+            warnings.append("Email Send Output requires host, from, and to addresses.")
+
+        lines.extend(
+            [
+                "import smtplib",
+                "import ssl",
+                "from email.message import EmailMessage",
+                f"_agnolab_email_host = {python_literal(email_host)}",
+                f"_agnolab_email_port = {email_port}",
+                f"_agnolab_email_security = {python_literal(email_security)}",
+                f"_agnolab_email_username = {python_literal(str(extras.get('emailUsername') or '').strip())}",
+                f"_agnolab_email_password = {python_literal(str(extras.get('emailPassword') or ''))}",
+                f"_agnolab_email_from = {python_literal(email_from)}",
+                f"_agnolab_email_to = {python_literal(email_to)}",
+                f"_agnolab_email_cc = {python_literal(str(extras.get('emailCc') or '').strip())}",
+                f"_agnolab_email_bcc = {python_literal(str(extras.get('emailBcc') or '').strip())}",
+                f"_agnolab_email_subject = {python_literal(str(extras.get('emailSubject') or 'Flow result for $flow_name'))}",
+                f"_agnolab_email_body_template = {python_literal(str(extras.get('emailBodyTemplate') or '$result_text'))}",
+                f"_agnolab_email_timeout = {email_timeout}",
+                f"_agnolab_email_attach_input_files = {email_attach_input_files}",
+                "if not _agnolab_email_host or not _agnolab_email_from or not _agnolab_email_to:",
+                "    _agnolab_delivery = {'channel': 'email', 'delivered': False, 'error': 'SMTP host, from, or recipient is not configured.'}",
+                "else:",
+                "    _agnolab_email_message = EmailMessage()",
+                "    _agnolab_email_message['Subject'] = _agnolab_replace_context_tokens(_agnolab_email_subject)",
+                "    _agnolab_email_message['From'] = _agnolab_replace_context_tokens(_agnolab_email_from)",
+                "    _agnolab_email_message['To'] = _agnolab_replace_context_tokens(_agnolab_email_to)",
+                "    if _agnolab_email_cc:",
+                "        _agnolab_email_message['Cc'] = _agnolab_replace_context_tokens(_agnolab_email_cc)",
+                "    if _agnolab_email_bcc:",
+                "        _agnolab_email_message['Bcc'] = _agnolab_replace_context_tokens(_agnolab_email_bcc)",
+                "    _agnolab_email_message.set_content(_agnolab_replace_context_tokens(_agnolab_email_body_template or '$result_text'))",
+                "    if _agnolab_email_attach_input_files:",
+                "        for _agnolab_file in flow_input_files:",
+                "            _agnolab_file_path = _agnolab_file.get('path')",
+                "            if not _agnolab_file_path:",
+                "                continue",
+                "            _agnolab_file_bytes = Path(_agnolab_file_path).read_bytes()",
+                "            _agnolab_mime_type = str(_agnolab_file.get('mime_type') or 'application/octet-stream')",
+                "            _agnolab_maintype, _agnolab_separator, _agnolab_subtype = _agnolab_mime_type.partition('/')",
+                "            if not _agnolab_separator:",
+                "                _agnolab_maintype, _agnolab_subtype = 'application', 'octet-stream'",
+                "            _agnolab_email_message.add_attachment(",
+                "                _agnolab_file_bytes,",
+                "                maintype=_agnolab_maintype or 'application',",
+                "                subtype=_agnolab_subtype or 'octet-stream',",
+                "                filename=str(_agnolab_file.get('name') or Path(_agnolab_file_path).name),",
+                "            )",
+                "    _agnolab_smtp_client = None",
+                "    try:",
+                "        if _agnolab_email_security == 'ssl':",
+                "            _agnolab_smtp_client = smtplib.SMTP_SSL(",
+                "                _agnolab_email_host,",
+                "                _agnolab_email_port,",
+                "                timeout=_agnolab_email_timeout,",
+                "                context=ssl.create_default_context(),",
+                "            )",
+                "        else:",
+                "            _agnolab_smtp_client = smtplib.SMTP(_agnolab_email_host, _agnolab_email_port, timeout=_agnolab_email_timeout)",
+                "            if _agnolab_email_security == 'starttls':",
+                "                _agnolab_smtp_client.starttls(context=ssl.create_default_context())",
+                "        if _agnolab_email_username:",
+                "            _agnolab_smtp_client.login(_agnolab_email_username, _agnolab_email_password)",
+                "        _agnolab_smtp_client.send_message(_agnolab_email_message)",
+                "        _agnolab_delivery = {",
+                "            'channel': 'email',",
+                "            'delivered': True,",
+                "            'to': _agnolab_email_message.get('To', ''),",
+                "            'subject': _agnolab_email_message.get('Subject', ''),",
+                "        }",
+                "    except Exception as exc:",
+                "        _agnolab_delivery = {'channel': 'email', 'delivered': False, 'error': str(exc)}",
+                "    finally:",
+                "        if _agnolab_smtp_client is not None:",
+                "            try:",
+                "                _agnolab_smtp_client.quit()",
+                "            except Exception:",
+                "                pass",
+            ]
+        )
+    elif output_mode == "chat":
+        chat_provider = str(extras.get("chatProvider") or "slack").strip().lower()
+        if chat_provider not in {"slack", "discord", "telegram", "generic", "whatsapp"}:
+            warnings.append("Chat Message Output provider is invalid; falling back to Slack webhook.")
+            chat_provider = "slack"
+        chat_timeout = parse_timeout(extras.get("chatTimeoutSeconds"), default=15.0, label="Chat Message Output")
+        chat_headers_raw = str(extras.get("chatHeadersJson") or "").strip()
+        chat_headers_dict = parse_object_template(chat_headers_raw, label="Chat Message Output additional headers JSON")
+        if chat_provider == "telegram":
+            if not str(extras.get("chatBotToken") or "").strip() or not str(extras.get("chatChannelId") or "").strip():
+                warnings.append("Chat Message Output with Telegram requires bot token and chat id.")
+        elif chat_provider == "whatsapp":
+            if not str(extras.get("chatWhatsappSessionId") or "").strip() or not str(extras.get("chatChannelId") or "").strip():
+                warnings.append("Chat Message Output with WhatsApp requires a session id and target phone or chat id.")
+        elif not str(extras.get("chatWebhookUrl") or "").strip():
+            warnings.append("Chat Message Output requires a webhook URL for the selected provider.")
+
+        lines.extend(
+            [
+                f"_agnolab_chat_provider = {python_literal(chat_provider)}",
+                f"_agnolab_chat_webhook_url = {python_literal(str(extras.get('chatWebhookUrl') or '').strip())}",
+                f"_agnolab_chat_bot_token = {python_literal(str(extras.get('chatBotToken') or '').strip())}",
+                f"_agnolab_chat_channel_id = {python_literal(str(extras.get('chatChannelId') or '').strip())}",
+                f"_agnolab_chat_whatsapp_session_id = {python_literal(str(extras.get('chatWhatsappSessionId') or '').strip())}",
+                f"_agnolab_chat_message_template = {python_literal(str(extras.get('chatMessageTemplate') or '$result_text'))}",
+                f"_agnolab_chat_headers = {python_literal(chat_headers_dict)}",
+                f"_agnolab_chat_timeout = {chat_timeout}",
+                "_agnolab_chat_message = _agnolab_replace_context_tokens(_agnolab_chat_message_template or '$result_text')",
+                "try:",
+                "    if _agnolab_chat_provider == 'telegram':",
+                "        if not _agnolab_chat_bot_token or not _agnolab_chat_channel_id:",
+                "            raise ValueError('Telegram output requires bot token and chat id.')",
+                "        _agnolab_chat_response = requests.post(",
+                "            f\"https://api.telegram.org/bot{_agnolab_chat_bot_token}/sendMessage\",",
+                "            json={'chat_id': _agnolab_replace_context_tokens(_agnolab_chat_channel_id), 'text': _agnolab_chat_message},",
+                "            timeout=_agnolab_chat_timeout,",
+                "        )",
+                "    elif _agnolab_chat_provider == 'whatsapp':",
+                "        _agnolab_whatsapp_session_id = _agnolab_replace_context_tokens(_agnolab_chat_whatsapp_session_id)",
+                "        _agnolab_whatsapp_target = _agnolab_replace_context_tokens(_agnolab_chat_channel_id)",
+                "        if not _agnolab_whatsapp_session_id or not _agnolab_whatsapp_target:",
+                "            raise ValueError('WhatsApp output requires a session id and target phone or chat id.')",
+                "        _agnolab_whatsapp_base_url = (os.getenv('WHATSAPP_GATEWAY_BASE_URL') or 'http://whatsapp:21465').rstrip('/')",
+                "        _agnolab_whatsapp_secret = (os.getenv('WHATSAPP_GATEWAY_SECRET_KEY') or 'agnolab_wppconnect_secret').strip()",
+                "        _agnolab_whatsapp_is_group = _agnolab_whatsapp_target.endswith('@g.us')",
+                "        if not _agnolab_whatsapp_is_group and '@' in _agnolab_whatsapp_target:",
+                "            _agnolab_whatsapp_target = _agnolab_whatsapp_target.split('@', 1)[0]",
+                "        if not _agnolab_whatsapp_is_group:",
+                "            _agnolab_whatsapp_digits = ''.join(char for char in _agnolab_whatsapp_target if char.isdigit())",
+                "            _agnolab_whatsapp_target = _agnolab_whatsapp_digits or _agnolab_whatsapp_target",
+                "        _agnolab_whatsapp_token_response = requests.post(",
+                "            f\"{_agnolab_whatsapp_base_url}/api/{_agnolab_whatsapp_session_id}/{_agnolab_whatsapp_secret}/generate-token\",",
+                "            timeout=_agnolab_chat_timeout,",
+                "        )",
+                "        _agnolab_whatsapp_token_response.raise_for_status()",
+                "        try:",
+                "            _agnolab_whatsapp_token_payload = _agnolab_whatsapp_token_response.json()",
+                "        except ValueError as exc:",
+                "            raise ValueError('WhatsApp gateway did not return JSON while generating the session token.') from exc",
+                "        _agnolab_whatsapp_token = _agnolab_find_nested_string(_agnolab_whatsapp_token_payload, ('token', 'access_token', 'bearer', 'jwt'))",
+                "        if not _agnolab_whatsapp_token:",
+                "            raise ValueError('WhatsApp gateway did not return a usable session token.')",
+                "        _agnolab_chat_response = requests.post(",
+                "            f\"{_agnolab_whatsapp_base_url}/api/{_agnolab_whatsapp_session_id}/send-message\",",
+                "            headers={'Authorization': f\"Bearer {_agnolab_whatsapp_token}\"},",
+                "            json={'phone': _agnolab_whatsapp_target, 'message': _agnolab_chat_message, 'isGroup': _agnolab_whatsapp_is_group},",
+                "            timeout=_agnolab_chat_timeout,",
+                "        )",
+                "    else:",
+                "        if not _agnolab_chat_webhook_url:",
+                "            raise ValueError('Webhook URL is not configured.')",
+                "        _agnolab_chat_payload = {'text': _agnolab_chat_message}",
+                "        if _agnolab_chat_provider == 'discord':",
+                "            _agnolab_chat_payload = {'content': _agnolab_chat_message}",
+                "        elif _agnolab_chat_provider == 'generic':",
+                "            _agnolab_chat_payload = {",
+                "                'text': _agnolab_chat_message,",
+                "                'result': flow_result_text,",
+                "                'metadata': flow_input_metadata,",
+                f"                'flow': {{'project': {python_literal(project_name)}, 'node': {python_literal(node.data.name)}}},",
+                "            }",
+                "        _agnolab_chat_response = requests.post(",
+                "            _agnolab_chat_webhook_url,",
+                "            headers={'Accept': 'application/json', 'Content-Type': 'application/json', **_agnolab_chat_headers},",
+                "            json=_agnolab_chat_payload,",
+                "            timeout=_agnolab_chat_timeout,",
+                "        )",
+                "    try:",
+                "        _agnolab_chat_response_body = _agnolab_chat_response.json()",
+                "    except ValueError:",
+                "        _agnolab_chat_response_body = _agnolab_chat_response.text",
+                "    _agnolab_delivery = {",
+                "        'channel': 'chat',",
+                "        'provider': _agnolab_chat_provider,",
+                "        'delivered': _agnolab_chat_response.ok,",
+                "        'status_code': _agnolab_chat_response.status_code,",
+                "        'response': _agnolab_chat_response_body,",
+                "    }",
+                "except Exception as exc:",
+                "    _agnolab_delivery = {'channel': 'chat', 'provider': _agnolab_chat_provider, 'delivered': False, 'error': str(exc)}",
+            ]
+        )
+    else:
+        sheet_file_path = str(extras.get("sheetFilePath") or "").strip()
+        sheet_include_header = parse_bool(extras.get("sheetIncludeHeader"), default=True)
+        sheet_row_raw = str(extras.get("sheetRowJson") or "").strip()
+        if not sheet_file_path:
+            warnings.append("Spreadsheet Output requires a CSV file path.")
+        if sheet_row_raw and "$" not in sheet_row_raw:
+            parsed_row = parse_json_if_needed(sheet_row_raw)
+            if parsed_row is not None and not isinstance(parsed_row, dict):
+                warnings.append("Spreadsheet Output row JSON must be an object; runtime will fall back to a default row.")
+
+        lines.extend(
+            [
+                "import csv",
+                f"_agnolab_sheet_file_path = {python_literal(sheet_file_path)}",
+                f"_agnolab_sheet_include_header = {sheet_include_header}",
+                f"_agnolab_sheet_row_raw = {python_literal(sheet_row_raw)}",
+                "if not _agnolab_sheet_file_path:",
+                "    _agnolab_delivery = {'channel': 'spreadsheet', 'delivered': False, 'error': 'CSV file path not configured.'}",
+                "else:",
+                "    _agnolab_sheet_row = None",
+                "    _agnolab_sheet_row_error = None",
+                "    if _agnolab_sheet_row_raw.strip():",
+                "        try:",
+                "            _agnolab_sheet_row = _agnolab_parse_json_template(_agnolab_sheet_row_raw)",
+                "            if _agnolab_sheet_row is not None and not isinstance(_agnolab_sheet_row, dict):",
+                "                raise ValueError('Spreadsheet row must resolve to a JSON object.')",
+                "        except Exception as exc:",
+                "            _agnolab_sheet_row_error = str(exc)",
+                "            _agnolab_sheet_row = None",
+                "    if _agnolab_sheet_row is None:",
+                "        _agnolab_sheet_row = {'timestamp': _agnolab_delivery_timestamp, 'flow_name': _agnolab_context_value('flow_name'), 'result': flow_result_text}",
+                "    _agnolab_sheet_path = Path(_agnolab_sheet_file_path)",
+                "    _agnolab_sheet_path.parent.mkdir(parents=True, exist_ok=True)",
+                "    _agnolab_sheet_row_serialized = {str(key): _agnolab_stringify_value(value) for key, value in _agnolab_sheet_row.items()}",
+                "    _agnolab_write_header = _agnolab_sheet_include_header and (not _agnolab_sheet_path.exists() or _agnolab_sheet_path.stat().st_size == 0)",
+                "    with _agnolab_sheet_path.open('a', encoding='utf-8', newline='') as _agnolab_sheet_file:",
+                "        _agnolab_sheet_writer = csv.DictWriter(_agnolab_sheet_file, fieldnames=list(_agnolab_sheet_row_serialized.keys()))",
+                "        if _agnolab_write_header:",
+                "            _agnolab_sheet_writer.writeheader()",
+                "        _agnolab_sheet_writer.writerow(_agnolab_sheet_row_serialized)",
+                "    _agnolab_delivery = {",
+                "        'channel': 'spreadsheet',",
+                "        'delivered': True,",
+                "        'path': str(_agnolab_sheet_path.resolve()),",
+                "        'row': _agnolab_sheet_row_serialized,",
+                "    }",
+                "    if _agnolab_sheet_row_error:",
+                "        _agnolab_delivery['warning'] = _agnolab_sheet_row_error",
+            ]
+        )
+
+    lines.append("print(json.dumps({'result': flow_result_text, 'delivery': _agnolab_delivery}, ensure_ascii=False))")
 
     return lines, warnings
 
@@ -2353,7 +2810,7 @@ def compile_graph(graph: CanvasGraph) -> tuple[str, list[str]]:
         symbol_map[node.id] = var_name
 
         if node.type == NodeType.TOOL:
-            tool_lines, node_imports, needs_decorator = render_tool_node(node, var_name)
+            tool_lines, node_imports, needs_decorator = render_tool_node(node, var_name, graph=graph)
             tool_imports.update(node_imports)
             needs_tool_decorator = needs_tool_decorator or needs_decorator
             lines.extend(tool_lines)
@@ -2852,6 +3309,22 @@ def compile_graph(graph: CanvasGraph) -> tuple[str, list[str]]:
             and node_map[source_id].type in {NodeType.INPUT, NodeType.AGENT, NodeType.TEAM, NodeType.WORKFLOW, NodeType.TOOL}
         ]
 
+        if len(upstream) > 1:
+            node_type_priority = {
+                NodeType.AGENT: 0,
+                NodeType.TEAM: 1,
+                NodeType.WORKFLOW: 2,
+                NodeType.TOOL: 3,
+                NodeType.INPUT: 4,
+            }
+            upstream = sorted(
+                upstream,
+                key=lambda source_id: (
+                    node_type_priority.get(node_map[source_id].type, 99),
+                    incoming_ids(graph, output_node.id).index(source_id),
+                ),
+            )
+
         producer_node = node_map.get(upstream[0]) if upstream else None
         producer_symbol = symbol_map.get(upstream[0]) if upstream else None
         if producer_node and producer_node.type in {NodeType.AGENT, NodeType.TEAM} and producer_symbol:
@@ -2864,10 +3337,10 @@ def compile_graph(graph: CanvasGraph) -> tuple[str, list[str]]:
             lines.append(f"result = {producer_symbol}(flow_input)")
             lines.append("flow_result_text = str(result) if result is not None else ''")
         elif producer_node and producer_node.type == NodeType.INPUT:
-            lines.append("flow_result_text = flow_input")
+            lines.append("flow_result_text = str(flow_input_payload.get('text') or flow_input)")
         else:
             warnings.append("Output node has no valid upstream producer.")
-            lines.append("flow_result_text = flow_input")
+            lines.append("flow_result_text = str(flow_input_payload.get('text') or flow_input)")
 
         lines.append(f"print({python_literal(RESULT_START_MARKER)})")
         lines.append("print(flow_result_text)")
@@ -2878,8 +3351,50 @@ def compile_graph(graph: CanvasGraph) -> tuple[str, list[str]]:
             lines.extend(output_lines)
             warnings.extend(output_warnings)
     else:
-        warnings.append("No output node found; preview prints the raw flow input.")
-        lines.append("print(flow_input)")
+        executable_types = {NodeType.AGENT, NodeType.TEAM, NodeType.WORKFLOW, NodeType.TOOL}
+        executable_nodes = [node for node in ordered_nodes if node.type in executable_types]
+
+        inferred_producer_node: GraphNode | None = None
+        for candidate in reversed(executable_nodes):
+            has_executable_downstream = any(
+                edge.source == candidate.id
+                and node_map.get(edge.target)
+                and node_map[edge.target].type in executable_types
+                for edge in graph.edges
+            )
+            if not has_executable_downstream:
+                inferred_producer_node = candidate
+                break
+
+        if inferred_producer_node is None and executable_nodes:
+            inferred_producer_node = executable_nodes[-1]
+
+        inferred_symbol = symbol_map.get(inferred_producer_node.id) if inferred_producer_node else None
+        if inferred_producer_node and inferred_producer_node.type in {NodeType.AGENT, NodeType.TEAM} and inferred_symbol:
+            warnings.append(
+                f"No output node found; inferring flow result from '{inferred_producer_node.data.name}' to support runtime integrations."
+            )
+            lines.append(f"result = _agnolab_run_with_debug({inferred_symbol}, flow_input, _agnolab_media_kwargs)")
+            lines.append("flow_result_text = result.content if result is not None else ''")
+        elif inferred_producer_node and inferred_producer_node.type == NodeType.WORKFLOW and inferred_symbol:
+            warnings.append(
+                f"No output node found; inferring flow result from workflow '{inferred_producer_node.data.name}' to support runtime integrations."
+            )
+            lines.append(f"result = _agnolab_run_workflow_with_debug({inferred_symbol}, flow_input, _agnolab_media_kwargs)")
+            lines.append("flow_result_text = _agnolab_workflow_result_text(result)")
+        elif inferred_producer_node and inferred_producer_node.type == NodeType.TOOL and inferred_symbol:
+            warnings.append(
+                f"No output node found; inferring flow result from Tool '{inferred_producer_node.data.name}' to support runtime integrations."
+            )
+            lines.append(f"result = {inferred_symbol}(flow_input)")
+            lines.append("flow_result_text = str(result) if result is not None else ''")
+        else:
+            warnings.append("No output node found; preview uses the raw flow input.")
+            lines.append("flow_result_text = str(flow_input_payload.get('text') or flow_input)")
+
+        lines.append(f"print({python_literal(RESULT_START_MARKER)})")
+        lines.append("print(flow_result_text)")
+        lines.append(f"print({python_literal(RESULT_END_MARKER)})")
 
     full_code = "\n".join(import_lines + lines).strip() + "\n"
     return full_code, warnings

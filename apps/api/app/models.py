@@ -66,9 +66,21 @@ class GraphEdge(BaseModel):
     target_handle: str | None = None
 
 
+class ProjectRuntimeEnvVar(BaseModel):
+    key: str = ""
+    value: str = ""
+
+
+class ProjectRuntimeConfig(BaseModel):
+    envVars: list[ProjectRuntimeEnvVar] = Field(default_factory=list)
+    authEnabled: bool = False
+    authToken: str | None = None
+
+
 class ProjectMeta(BaseModel):
     name: str = "Untitled Agno Flow"
     target: TargetRuntime = TargetRuntime.AGNO_PYTHON
+    runtime: ProjectRuntimeConfig = Field(default_factory=ProjectRuntimeConfig)
 
 
 class CanvasGraph(BaseModel):
@@ -121,10 +133,6 @@ class ListBuiltInToolFunctionsResponse(BaseModel):
     error: str | None = None
 
 
-class RuntimeCredentials(BaseModel):
-    openai_api_key: str | None = None
-
-
 class SaveFlowRequest(BaseModel):
     name: str = Field(min_length=1, max_length=120)
     graph: CanvasGraph
@@ -162,6 +170,31 @@ class ListEmailListenerStatusesResponse(BaseModel):
     listeners: list[EmailListenerStatus] = Field(default_factory=list)
 
 
+class WhatsappSessionStatus(BaseModel):
+    flow_name: str
+    node_id: str
+    node_name: str
+    session_id: str
+    status: str = "unknown"
+    connected: bool = False
+    qr_code: str | None = None
+    webhook_url: str | None = None
+    last_error: str | None = None
+
+
+class WhatsappWebhookDispatchResponse(BaseModel):
+    accepted: bool = False
+    connected: bool | None = None
+    replied: bool = False
+    session_id: str | None = None
+    event: str | None = None
+    sender: str | None = None
+    reason: str | None = None
+    reply_preview: str | None = None
+    flow_result: str | None = None
+    delivery_error: str | None = None
+
+
 class ListFlowsResponse(BaseModel):
     flows: list[FlowSummary] = Field(default_factory=list)
 
@@ -174,7 +207,6 @@ class FlowRecord(BaseModel):
 
 
 class RunSavedFlowRequest(BaseModel):
-    credentials: RuntimeCredentials | None = None
     input_text: str | None = None
     input_metadata: dict[str, Any] | None = None
     debug: bool = True
@@ -186,7 +218,6 @@ class RunSavedFlowByNameRequest(RunSavedFlowRequest):
 
 class CodegenRequest(BaseModel):
     graph: CanvasGraph
-    credentials: RuntimeCredentials | None = None
     response_only: bool = False
 
 

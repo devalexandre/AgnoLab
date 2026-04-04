@@ -113,6 +113,15 @@ docker compose up --build
 The API will be available at `http://localhost:8000` and the web app at `http://localhost:5173`.
 The services stay separated in Docker, but `docker compose` starts both together. The web image receives `VITE_API_URL` at build time, so you can point it to another backend later without changing the source code.
 If you want to connect to a local Ollama instance from inside Docker, use `http://host.docker.internal:11434` as the provider base URL.
+Saved flows, runtime variables, and flow authentication settings persist on the host under `apps/api/data`.
+
+### Docker Dev
+
+```bash
+docker compose -f docker-compose.dev.yml up --build
+```
+
+This development compose mounts `apps/api` and `apps/web` into the containers, runs `uvicorn --reload` for the API, and starts the Vite dev server with polling enabled for reliable hot reload inside Docker. The dev web app stays on `http://localhost:5173`, the API on `http://localhost:8000`, and the WhatsApp gateway on `http://localhost:21465`.
 
 ### Render
 

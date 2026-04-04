@@ -1,4 +1,4 @@
-import { BuiltInToolFunctionOption, CanvasGraph, CanvasTemplateSummary, FlowRecord, FlowSummary, RunResult, RuntimeCredentials, SaveFlowResponse, SkillPathOption } from "./types";
+import { BuiltInToolFunctionOption, CanvasGraph, CanvasTemplateSummary, FlowRecord, FlowSummary, RunResult, SaveFlowResponse, SkillPathOption, WhatsappSessionStatus } from "./types";
 
 function trimTrailingSlash(value: string): string {
   return value.replace(/\/+$/, "");
@@ -96,13 +96,12 @@ export async function previewCode(graph: CanvasGraph): Promise<{ code: string; w
 
 export async function runGraph(
   graph: CanvasGraph,
-  credentials: RuntimeCredentials,
   responseOnly = false,
 ): Promise<RunResult> {
   const response = await fetch(`${API_BASE}/api/executor/run`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ graph, credentials, response_only: responseOnly }),
+    body: JSON.stringify({ graph, response_only: responseOnly }),
   });
   if (!response.ok) {
     throw new Error("Failed to run graph");
@@ -143,16 +142,20 @@ export async function runFlowByName(
   name: string,
   inputText: string,
   inputMetadata: Record<string, unknown> | null,
-  credentials: RuntimeCredentials,
+  authToken?: string | null,
 ): Promise<RunResult> {
+  const headers: Record<string, string> = { "Content-Type": "application/json" };
+  if (authToken?.trim()) {
+    headers.Authorization = `Bearer ${authToken.trim()}`;
+  }
+
   const response = await fetch(`${API_BASE}/api/flows/run`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers,
     body: JSON.stringify({
       name,
       input_text: inputText || null,
       input_metadata: inputMetadata,
-      credentials,
     }),
   });
   if (!response.ok) {
@@ -169,4 +172,40 @@ export async function listOllamaModels(baseUrl?: string): Promise<string[]> {
   }
   const payload = (await response.json()) as { models?: string[] };
   return Array.isArray(payload.models) ? payload.models : [];
+}
+
+export async function fetchWhatsappSessionStatus(flowName: string, nodeId: string): Promise<WhatsappSessionStatus> {
+  const response = await fetch(
+    `${API_BASE}/api/integrations/whatsapp/${encodeURIComponent(flowName)}/${encodeURIComponent(nodeId)}/session/status`,
+  );
+  if (!response.ok) {
+    throw new Error("Failed to load WhatsApp session status");
+  }
+  return response.json();
+}
+
+export async function startWhatsappSession(flowName: string, nodeId: string): Promise<WhatsappSessionStatus> {
+  const response = await fetch(
+    `${API_BASE}/api/integrations/whatsapp/${encodeURIComponent(flowName)}/${encodeURIComponent(nodeId)}/session/start`,
+    {
+      method: "POST",
+    },
+  );
+  if (!response.ok) {
+    throw new Error("Failed to start WhatsApp session");
+  }
+  return response.json();
+}
+
+export async function stopWhatsappSession(flowName: string, nodeId: string): Promise<WhatsappSessionStatus> {
+  const response = await fetch(
+    `${API_BASE}/api/integrations/whatsapp/${encodeURIComponent(flowName)}/${encodeURIComponent(nodeId)}/session/stop`,
+    {
+      method: "POST",
+    },
+  );
+  if (!response.ok) {
+    throw new Error("Failed to stop WhatsApp session");
+  }
+  return response.json();
 }
