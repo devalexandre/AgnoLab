@@ -1,5 +1,5 @@
 import { type ChangeEvent, type MouseEvent as ReactMouseEvent, type WheelEvent as ReactWheelEvent, useEffect, useMemo, useRef, useState } from "react";
-import { API_BASE, fetchCanvasTemplate, fetchDefaultGraph, fetchFlowByName, fetchQueueSubscriberStatus, fetchWhatsappSessionStatus, listBuiltInToolFunctions, listCanvasTemplates, listFlowRuntimeStatuses, listFlows, listOllamaModels, listSkillPaths, previewCode, runFlowByName, runGraph, saveFlow, startQueueSubscriber, startWhatsappSession, stopQueueSubscriber, stopWhatsappSession } from "./api";
+import { API_BASE, deleteFlowByName, fetchCanvasTemplate, fetchDefaultGraph, fetchFlowByName, fetchQueueSubscriberStatus, fetchWhatsappSessionStatus, listBuiltInToolFunctions, listCanvasTemplates, listFlowRuntimeStatuses, listFlows, listOllamaModels, listSkillPaths, previewCode, runFlowByName, runGraph, saveFlow, startQueueSubscriber, startWhatsappSession, stopQueueSubscriber, stopWhatsappSession } from "./api";
 import { AGENT_FIELDS, AGENT_FIELD_GROUPS, AGNO_MODEL_PROVIDER_OPTIONS, type AgentFieldDefinition } from "./agentConfig";
 import MonacoToolEditor from "./MonacoToolEditor";
 import { NODE_CATALOG, NODE_CATEGORIES, canConnect, listNodeTypes } from "./nodeCatalog";
@@ -8,7 +8,7 @@ import { TEAM_FIELDS, TEAM_FIELD_GROUPS } from "./teamConfig";
 import { STARTER_TOOLS } from "./starterTools";
 import { BUILT_IN_TOOLS, BUILT_IN_TOOL_CATEGORIES, getBuiltInTool, type BuiltInToolDefinition } from "./toolCatalog";
 import { ToolIcon, toolIconColor } from "./toolIcons";
-import { BuiltInToolFunctionOption, CanvasGraph, CanvasTemplateSummary, FlowRuntimeStatus, FlowSummary, GraphEdge, GraphNode, NodeData, NodeType, ProjectRuntimeConfig, ProjectRuntimeEnvVar, QueueSubscriberStatus, RunResult, SaveFlowResponse, SavedUserTool, SkillPathOption, StarterToolTemplate, WhatsappSessionStatus } from "./types";
+import { BuiltInToolFunctionOption, CanvasGraph, CanvasTemplateSummary, FlowRuntimeStatus, FlowSummary, GraphEdge, GraphNode, NodeData, NodeType, Position, ProjectRuntimeConfig, ProjectRuntimeEnvVar, QueueSubscriberStatus, RunResult, SaveFlowResponse, SavedUserTool, SkillPathOption, StarterToolTemplate, WhatsappSessionStatus } from "./types";
 
 const MY_TOOLS_STORAGE_KEY = "agnolab.my_tools";
 const FLOW_DRAFT_STORAGE_KEY_PREFIX = "agnolab.flow_draft.v1:";
@@ -20,6 +20,9 @@ const CANVAS_WORLD_MAX = 8000;
 const MIN_CANVAS_ZOOM = 0.5;
 const MAX_CANVAS_ZOOM = 2.5;
 const CANVAS_ZOOM_STEP = 0.1;
+const HISTORY_MAX_ENTRIES = 80;
+const MINIMAP_WIDTH = 220;
+const MINIMAP_HEIGHT = 140;
 const DEFAULT_SECTION_OPEN = false;
 const FLOW_INPUT_FILE_ACCEPT = [
   ".pdf",
@@ -2025,6 +2028,47 @@ function centerGraphInCanvas(graph: CanvasGraph, canvasWidth: number, canvasHeig
   };
 }
 
+function cloneGraph(graph: CanvasGraph): CanvasGraph {
+  return JSON.parse(JSON.stringify(graph)) as CanvasGraph;
+}
+
+function organizeGraphNodes(graph: CanvasGraph): CanvasGraph {
+  if (graph.nodes.length <= 1) {
+    return graph;
+  }
+
+  const sortedNodes = [...graph.nodes].sort((left, right) => {
+    if (left.position.y === right.position.y) {
+      return left.position.x - right.position.x;
+    }
+    return left.position.y - right.position.y;
+  });
+
+  const columns = Math.max(1, Math.ceil(Math.sqrt(sortedNodes.length)));
+  const startX = 180;
+  const startY = 240;
+  const xGap = 260;
+  const yGap = 180;
+
+  const nextPositionById = new Map<string, Position>();
+  sortedNodes.forEach((node, index) => {
+    const row = Math.floor(index / columns);
+    const column = index % columns;
+    nextPositionById.set(node.id, {
+      x: startX + column * xGap,
+      y: startY + row * yGap,
+    });
+  });
+
+  return {
+    ...graph,
+    nodes: graph.nodes.map((node) => ({
+      ...node,
+      position: nextPositionById.get(node.id) ?? node.position,
+    })),
+  };
+}
+
 function getAgentConfig(data: NodeData): Record<string, unknown> {
   return (data.extras?.agentConfig as Record<string, unknown> | undefined) ?? {};
 }
@@ -3649,6 +3693,13 @@ export default function App() {
   const [librarySearchInput, setLibrarySearchInput] = useState("");
   const [outputResponseOnly, setOutputResponseOnly] = useState(false);
   const [flowName, setFlowName] = useState("support_agent_flow");
+  const [themeMode, setThemeMode] = useState<"dark" | "light">(() => {
+    const persisted = window.localStorage.getItem("agnolab.theme");
+    if (persisted === "dark" || persisted === "light") {
+      return persisted;
+    }
+    return window.matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark";
+  });
   const [savedFlows, setSavedFlows] = useState<FlowSummary[]>([]);
   const [runByNameInputText, setRunByNameInputText] = useState("");
   const [runByNameMetadata, setRunByNameMetadata] = useState("{}\n");
@@ -3665,6 +3716,8 @@ export default function App() {
   const [isUpdatingWhatsappSession, setIsUpdatingWhatsappSession] = useState(false);
   const [queueSubscriberStatusByNodeId, setQueueSubscriberStatusByNodeId] = useState<Record<string, QueueSubscriberStatus>>({});
   const [flowRuntimeStatusByName, setFlowRuntimeStatusByName] = useState<Record<string, FlowRuntimeStatus>>({});
+  const [historyPast, setHistoryPast] = useState<CanvasGraph[]>([]);
+  const [historyFuture, setHistoryFuture] = useState<CanvasGraph[]>([]);
   const [isUpdatingQueueSubscriber, setIsUpdatingQueueSubscriber] = useState(false);
   const [isLoadingRouteFlow, setIsLoadingRouteFlow] = useState(false);
   const [homeError, setHomeError] = useState<string | null>(null);
@@ -3695,6 +3748,9 @@ export default function App() {
   const [isHitlRunConfirmOpen, setIsHitlRunConfirmOpen] = useState(false);
   const [hitlRunConfirmMessage, setHitlRunConfirmMessage] = useState("");
   const previousRuntimeActiveRunsRef = useRef(0);
+  const isApplyingHistoryRef = useRef(false);
+  const historyLastSnapshotRef = useRef<string | null>(null);
+  const historyCommitTimeoutRef = useRef<number | null>(null);
 
   const isHomeRoute = currentPath === "/";
   const routeFlowName = useMemo(() => getFlowNameFromPath(currentPath), [currentPath]);
@@ -3715,6 +3771,67 @@ export default function App() {
       })
       .catch(console.error);
   }, []);
+
+  useEffect(() => {
+    document.documentElement.setAttribute("data-theme", themeMode);
+    window.localStorage.setItem("agnolab.theme", themeMode);
+  }, [themeMode]);
+
+  useEffect(() => {
+    setHistoryPast([]);
+    setHistoryFuture([]);
+    historyLastSnapshotRef.current = null;
+    if (historyCommitTimeoutRef.current !== null) {
+      window.clearTimeout(historyCommitTimeoutRef.current);
+      historyCommitTimeoutRef.current = null;
+    }
+  }, [currentPath, currentSearch]);
+
+  useEffect(() => {
+    if (!graph) {
+      historyLastSnapshotRef.current = null;
+      return;
+    }
+
+    const snapshot = JSON.stringify(graph);
+    if (isApplyingHistoryRef.current) {
+      isApplyingHistoryRef.current = false;
+      historyLastSnapshotRef.current = snapshot;
+      return;
+    }
+
+    if (snapshot === historyLastSnapshotRef.current) {
+      return;
+    }
+
+    if (historyCommitTimeoutRef.current !== null) {
+      window.clearTimeout(historyCommitTimeoutRef.current);
+    }
+
+    const previousSnapshot = historyLastSnapshotRef.current;
+    historyCommitTimeoutRef.current = window.setTimeout(() => {
+      if (previousSnapshot) {
+        try {
+          const previousGraph = JSON.parse(previousSnapshot) as CanvasGraph;
+          setHistoryPast((current) => {
+            const next = [...current, previousGraph];
+            return next.length > HISTORY_MAX_ENTRIES ? next.slice(next.length - HISTORY_MAX_ENTRIES) : next;
+          });
+          setHistoryFuture([]);
+        } catch (error) {
+          console.error(error);
+        }
+      }
+      historyLastSnapshotRef.current = snapshot;
+      historyCommitTimeoutRef.current = null;
+    }, 220);
+
+    return () => {
+      if (historyCommitTimeoutRef.current !== null) {
+        window.clearTimeout(historyCommitTimeoutRef.current);
+      }
+    };
+  }, [graph]);
 
   useEffect(() => {
     if (isHomeRoute) {
@@ -4261,10 +4378,6 @@ export default function App() {
 
   useEffect(() => {
     const handleKeyDown = (event: KeyboardEvent) => {
-      if (!selectedNodeId && !selectedEdgeId) {
-        return;
-      }
-
       const target = event.target as HTMLElement | null;
       const isEditableTarget =
         target instanceof HTMLInputElement ||
@@ -4273,6 +4386,27 @@ export default function App() {
         Boolean(target?.closest(".monaco-editor"));
 
       if (isEditableTarget) {
+        return;
+      }
+
+      const isUndoShortcut = (event.ctrlKey || event.metaKey) && !event.shiftKey && event.key.toLowerCase() === "z";
+      const isRedoShortcut =
+        ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "y") ||
+        ((event.ctrlKey || event.metaKey) && event.shiftKey && event.key.toLowerCase() === "z");
+
+      if (isUndoShortcut) {
+        event.preventDefault();
+        handleUndo();
+        return;
+      }
+
+      if (isRedoShortcut) {
+        event.preventDefault();
+        handleRedo();
+        return;
+      }
+
+      if (!selectedNodeId && !selectedEdgeId) {
         return;
       }
 
@@ -4290,7 +4424,7 @@ export default function App() {
     return () => {
       window.removeEventListener("keydown", handleKeyDown);
     };
-  }, [selectedNodeId, selectedEdgeId, graph, pendingConnectionSourceId, editingFunctionNodeId]);
+  }, [selectedNodeId, selectedEdgeId, graph, pendingConnectionSourceId, editingFunctionNodeId, historyPast.length, historyFuture.length]);
 
   const selectedNode = graph?.nodes.find((node) => node.id === selectedNodeId) ?? null;
   const selectedEdge = graph?.edges.find((edge) => edge.id === selectedEdgeId) ?? null;
@@ -4301,6 +4435,57 @@ export default function App() {
     () => Object.fromEntries((graph?.nodes ?? []).map((node) => [node.id, node])),
     [graph],
   );
+  const minimapModel = useMemo(() => {
+    if (!graph || graph.nodes.length === 0) {
+      return null;
+    }
+
+    const padding = 120;
+    const minX = Math.min(...graph.nodes.map((node) => node.position.x)) - padding;
+    const minY = Math.min(...graph.nodes.map((node) => node.position.y)) - padding;
+    const maxX = Math.max(...graph.nodes.map((node) => node.position.x + NODE_WIDTH)) + padding;
+    const maxY = Math.max(...graph.nodes.map((node) => node.position.y + NODE_MIN_HEIGHT)) + padding;
+    const worldWidth = Math.max(1, maxX - minX);
+    const worldHeight = Math.max(1, maxY - minY);
+
+    const scale = Math.min(MINIMAP_WIDTH / worldWidth, MINIMAP_HEIGHT / worldHeight);
+    if (!Number.isFinite(scale) || scale <= 0) {
+      return null;
+    }
+    const contentWidth = worldWidth * scale;
+    const contentHeight = worldHeight * scale;
+    const contentOffsetX = (MINIMAP_WIDTH - contentWidth) / 2;
+    const contentOffsetY = (MINIMAP_HEIGHT - contentHeight) / 2;
+
+    const nodes = graph.nodes.map((node) => ({
+      id: node.id,
+      x: Math.max(0, Math.min(MINIMAP_WIDTH - 6, contentOffsetX + (node.position.x - minX) * scale)),
+      y: Math.max(0, Math.min(MINIMAP_HEIGHT - 4, contentOffsetY + (node.position.y - minY) * scale)),
+      width: Math.max(6, Math.min(MINIMAP_WIDTH, NODE_WIDTH * scale)),
+      height: Math.max(4, Math.min(MINIMAP_HEIGHT, NODE_MIN_HEIGHT * scale)),
+      selected: node.id === selectedNodeId,
+    }));
+
+    const viewportWidth = (canvasRef.current?.clientWidth ?? 1) / canvasZoom;
+    const viewportHeight = (canvasRef.current?.clientHeight ?? 1) / canvasZoom;
+    const viewportWorldX = -canvasOffset.x / canvasZoom;
+    const viewportWorldY = -canvasOffset.y / canvasZoom;
+
+    return {
+      minX,
+      minY,
+      scale,
+      contentOffsetX,
+      contentOffsetY,
+      nodes,
+      viewport: {
+        x: Math.max(0, Math.min(MINIMAP_WIDTH - 12, contentOffsetX + (viewportWorldX - minX) * scale)),
+        y: Math.max(0, Math.min(MINIMAP_HEIGHT - 8, contentOffsetY + (viewportWorldY - minY) * scale)),
+        width: Math.max(12, viewportWidth * scale),
+        height: Math.max(8, viewportHeight * scale),
+      },
+    };
+  }, [graph, selectedNodeId, canvasOffset.x, canvasOffset.y, canvasZoom]);
 
   useEffect(() => {
     if (!selectedQueueNode || !isQueueInputNodeType(selectedQueueNode.type)) {
@@ -5434,6 +5619,28 @@ export default function App() {
     navigateToRoute(buildFlowPath(normalizedName));
   }
 
+  async function handleDeleteFlowFromHome(name: string) {
+    const normalizedName = slugifyFlowName(name);
+    if (!normalizedName) {
+      return;
+    }
+
+    const confirmed = window.confirm(`Delete flow '${normalizedName}'? This action cannot be undone.`);
+    if (!confirmed) {
+      return;
+    }
+
+    try {
+      await deleteFlowByName(normalizedName);
+      setSavedFlows((current) => current.filter((item) => item.name !== normalizedName));
+      setConnectionMessage(`Flow '${normalizedName}' deleted.`);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Failed to delete flow.";
+      setConnectionMessage(message);
+      setHomeError(message);
+    }
+  }
+
   function handleCreateFlowFromHome() {
     navigateToRoute(buildFlowPath("new"));
   }
@@ -6036,6 +6243,70 @@ export default function App() {
   function handleZoomReset() {
     setCanvasZoom(1);
     setCanvasOffset({ x: 0, y: 0 });
+  }
+
+  function handleToggleTheme() {
+    setThemeMode((current) => (current === "dark" ? "light" : "dark"));
+  }
+
+  function handleUndo() {
+    if (!graph || historyPast.length === 0) {
+      return;
+    }
+    const previousGraph = historyPast[historyPast.length - 1];
+    setHistoryPast((current) => current.slice(0, -1));
+    setHistoryFuture((current) => {
+      const next = [cloneGraph(graph), ...current];
+      return next.length > HISTORY_MAX_ENTRIES ? next.slice(0, HISTORY_MAX_ENTRIES) : next;
+    });
+    isApplyingHistoryRef.current = true;
+    setGraph(cloneGraph(previousGraph));
+    setConnectionMessage("Undo applied.");
+  }
+
+  function handleRedo() {
+    if (!graph || historyFuture.length === 0) {
+      return;
+    }
+    const nextGraph = historyFuture[0];
+    setHistoryFuture((current) => current.slice(1));
+    setHistoryPast((current) => {
+      const next = [...current, cloneGraph(graph)];
+      return next.length > HISTORY_MAX_ENTRIES ? next.slice(next.length - HISTORY_MAX_ENTRIES) : next;
+    });
+    isApplyingHistoryRef.current = true;
+    setGraph(cloneGraph(nextGraph));
+    setConnectionMessage("Redo applied.");
+  }
+
+  function handleOrganizeNodes() {
+    if (!graph) {
+      return;
+    }
+    setGraph(organizeGraphNodes(graph));
+    setConnectionMessage("Nodes organized automatically.");
+  }
+
+  function handleMinimapClick(event: ReactMouseEvent<SVGSVGElement>) {
+    if (!minimapModel || !canvasRef.current) {
+      return;
+    }
+
+    const rect = event.currentTarget.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0) {
+      return;
+    }
+
+    const minimapX = ((event.clientX - rect.left) / rect.width) * MINIMAP_WIDTH;
+    const minimapY = ((event.clientY - rect.top) / rect.height) * MINIMAP_HEIGHT;
+    const worldX = (minimapX - minimapModel.contentOffsetX) / minimapModel.scale + minimapModel.minX;
+    const worldY = (minimapY - minimapModel.contentOffsetY) / minimapModel.scale + minimapModel.minY;
+
+    setCanvasOffset({
+      x: canvasRef.current.clientWidth / 2 - worldX * canvasZoom,
+      y: canvasRef.current.clientHeight / 2 - worldY * canvasZoom,
+    });
+    ignoreCanvasClickRef.current = true;
   }
 
   function handleNodeMouseDown(nodeId: string, event: ReactMouseEvent<HTMLDivElement>) {
@@ -10636,6 +10907,9 @@ export default function App() {
                           <button type="button" className="secondary-button" onClick={() => handleOpenIntegrationModal(flow.name)}>
                             Integration
                           </button>
+                          <button type="button" className="danger-button" onClick={() => handleDeleteFlowFromHome(flow.name)}>
+                            Delete
+                          </button>
                         </div>
                       </article>
                     ))
@@ -11663,21 +11937,39 @@ export default function App() {
           <p className="eyebrow">AgnoLab</p>
           <h1>{graph.project.name}</h1>
           <p className="muted">Visual canvas for Agno</p>
-          <div className="button-row">
+          <div className="canvas-brand-actions">
             <button type="button" className="secondary-button" onClick={handleGoHome}>
               Home
             </button>
+            <details className="canvas-settings-menu">
+              <summary className="secondary-button">Settings</summary>
+              <div className="canvas-settings-menu-items">
+                <button type="button" className="secondary-button" onClick={handleTriggerImportFlow}>
+                  Import Flow
+                </button>
+                <button type="button" className="secondary-button" onClick={handleExportFlow}>
+                  Export Flow
+                </button>
+                <button type="button" className="secondary-button" onClick={handleExportPython}>
+                  Export .py
+                </button>
+                <button type="button" className="secondary-button" onClick={handleUndo} disabled={historyPast.length === 0} title="Undo (Ctrl/Cmd+Z)">
+                  Undo
+                </button>
+                <button type="button" className="secondary-button" onClick={handleRedo} disabled={historyFuture.length === 0} title="Redo (Ctrl/Cmd+Y)">
+                  Redo
+                </button>
+              </div>
+            </details>
           </div>
         </div>
-
-
         <div className="run-cta">
           <button type="button" className="primary-button run-button" onClick={handleRun} disabled={isRunning || isRunningSavedFlow}>
             {isRunning ? "Running..." : "Run"}
           </button>
         </div>
 
-        <div className="flow-actions">
+        <div className="flow-actions" role="toolbar" aria-label="Flow actions">
           <input
             className="flow-name-input"
             value={flowName}
@@ -11685,21 +11977,37 @@ export default function App() {
             list="saved-flow-names"
             placeholder="flow_name"
           />
-          <button type="button" className="secondary-button" onClick={handleSaveFlow} disabled={isSavingFlow}>
+          <button type="button" className="secondary-button save-button" onClick={handleSaveFlow} disabled={isSavingFlow}>
             {isSavingFlow ? "Saving..." : "Save Flow"}
-          </button>
-          <button type="button" className="secondary-button" onClick={handleExportFlow}>
-            Export Flow
-          </button>
-          <button type="button" className="secondary-button" onClick={handleTriggerImportFlow}>
-            Import Flow
-          </button>
-          <button type="button" className="secondary-button" onClick={handleExportPython}>
-            Export .py
           </button>
           <button type="button" className="secondary-button" onClick={() => handleOpenIntegrationModal()}>
             Integration
           </button>
+          <datalist id="saved-flow-names">
+            {savedFlows.map((flow) => (
+              <option key={flow.name} value={flow.name} />
+            ))}
+          </datalist>
+        </div>
+
+        <div className="canvas-controls" role="toolbar" aria-label="Canvas view controls">
+          <button type="button" className="secondary-button" onClick={handleToggleTheme} title="Toggle dark/light theme">
+            Theme: {themeMode === "dark" ? "Dark" : "Light"}
+          </button>
+          <div className="zoom-control" role="group" aria-label="Zoom controls">
+            <button type="button" className="secondary-button" onClick={handleZoomOut} disabled={canvasZoom <= MIN_CANVAS_ZOOM}>
+              Zoom -
+            </button>
+            <button type="button" className="secondary-button canvas-zoom-readout" onClick={handleZoomReset} title="Reset zoom to 100%">
+              {Math.round(canvasZoom * 100)}%
+            </button>
+            <button type="button" className="secondary-button" onClick={handleZoomIn} disabled={canvasZoom >= MAX_CANVAS_ZOOM}>
+              Zoom +
+            </button>
+          </div>
+        </div>
+
+        <div className="canvas-footer-left">
           <span className="muted small-note">
             {autosaveState === "saving"
               ? "Autosaving..."
@@ -11709,11 +12017,6 @@ export default function App() {
                   ? autosaveError || "Autosave failed."
                   : "Autosave on"}
           </span>
-          <datalist id="saved-flow-names">
-            {savedFlows.map((flow) => (
-              <option key={flow.name} value={flow.name} />
-            ))}
-          </datalist>
         </div>
 
         <input
@@ -11724,17 +12027,34 @@ export default function App() {
           onChange={handleImportFlowFileChange}
         />
 
-        <div className="canvas-controls">
-          <button type="button" className="secondary-button" onClick={handleZoomOut} disabled={canvasZoom <= MIN_CANVAS_ZOOM}>
-            -
-          </button>
-          <button type="button" className="secondary-button canvas-zoom-readout" onClick={handleZoomReset} title="Reset zoom to 100%">
-            {Math.round(canvasZoom * 100)}%
-          </button>
-          <button type="button" className="secondary-button" onClick={handleZoomIn} disabled={canvasZoom >= MAX_CANVAS_ZOOM}>
-            +
-          </button>
-        </div>
+        {minimapModel ? (
+          <div className="canvas-minimap" aria-label="Flow minimap">
+            <svg viewBox={`0 0 ${MINIMAP_WIDTH} ${MINIMAP_HEIGHT}`} role="img" onClick={handleMinimapClick}>
+              <rect className="canvas-minimap-background" x={0} y={0} width={MINIMAP_WIDTH} height={MINIMAP_HEIGHT} rx={4} ry={4} />
+              {minimapModel.nodes.map((node) => (
+                <rect
+                  key={node.id}
+                  x={node.x}
+                  y={node.y}
+                  width={node.width}
+                  height={node.height}
+                  className={`canvas-minimap-node ${node.selected ? "selected" : ""}`}
+                  rx={2}
+                  ry={2}
+                />
+              ))}
+              <rect
+                x={minimapModel.viewport.x}
+                y={minimapModel.viewport.y}
+                width={minimapModel.viewport.width}
+                height={minimapModel.viewport.height}
+                className="canvas-minimap-viewport"
+                rx={3}
+                ry={3}
+              />
+            </svg>
+          </div>
+        ) : null}
 
         <div className="canvas-hint">
           <p>
