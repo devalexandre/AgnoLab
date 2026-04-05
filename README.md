@@ -4,6 +4,10 @@ AgnoLab is a visual builder for Agno workflows with a low-code canvas, code prev
 
 ![AgnoLab running flow](docs/agno-agent-flow.png)
 
+## Demo Video
+
+- Watch on YouTube: https://www.youtube.com/watch?v=fQjQHiIHMsM
+
 ## What It Does
 
 - Build flows with `input`, `agent`, `team`, `tool`, `condition`, `output`, and `output_api` nodes.
@@ -15,6 +19,25 @@ AgnoLab is a visual builder for Agno workflows with a low-code canvas, code prev
 - Save, load, and rerun flows by name.
 - Export the generated project as code, requirements, and a starter README.
 - Inspect runtime output in a cleaner "response only" view when needed.
+
+## Available Resources
+
+- Visual flow builder (canvas-based editor)
+- Provider presets and manual provider/model configuration
+- Built-in tools, starter function tools, and Excel helper tool
+- Python code preview and local backend execution
+- Save/load flows and run saved flows by name
+- Export generated projects with `main.py`, `requirements.txt`, and starter `README.md`
+- Docker and Docker Dev environments
+- Optional WhatsApp gateway in development compose
+
+## How to Run the Project
+
+You can run AgnoLab either locally (API + Web) or with Docker.
+
+- Local run: follow [Local Setup](#local-setup)
+- Production-like containers: follow [Docker](#docker)
+- Development containers with hot reload: follow [Development Mode (Docker Dev)](#development-mode-docker-dev)
 
 ## Main Features
 
@@ -115,7 +138,7 @@ The services stay separated in Docker, but `docker compose` starts both together
 If you want to connect to a local Ollama instance from inside Docker, use `http://host.docker.internal:11434` as the provider base URL.
 Saved flows, runtime variables, and flow authentication settings persist on the host under `apps/api/data`.
 
-### Docker Dev
+### Development Mode (Docker Dev)
 
 ```bash
 docker compose -f docker-compose.dev.yml up --build

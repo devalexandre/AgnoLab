@@ -12,7 +12,7 @@ build/
 coverage/
 *.pyc
 
-docs/
+
 .*od
 apps/api/data/flows/
 .*sql

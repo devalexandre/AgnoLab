@@ -14,6 +14,7 @@ That means the system is:
 
 ### 1. Visual editor
 
+
 The frontend owns:
 
 - node rendering
