@@ -57,6 +57,14 @@ def load_flow_record(name: str) -> FlowRecord | None:
     return FlowRecord.model_validate_json(path.read_text(encoding="utf-8"))
 
 
+def delete_flow_record(name: str) -> bool:
+    path = _flow_path_by_name(name)
+    if not path.exists():
+        return False
+    path.unlink()
+    return True
+
+
 def list_flow_summaries() -> list[FlowSummary]:
     if not FLOWS_DIR.exists():
         return []

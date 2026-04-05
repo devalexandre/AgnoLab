@@ -26,7 +26,7 @@ from .compiler import compile_graph
 from .email_listener import EmailListenerManager
 from .executor import run_generated_code
 from .exporter import export_project
-from .flow_store import list_flow_summaries, load_flow_record, normalize_flow_name, save_flow_record
+from .flow_store import delete_flow_record, list_flow_summaries, load_flow_record, normalize_flow_name, save_flow_record
 from .models import (
     CanvasGraph,
     BuiltInToolFunctionOption,
@@ -516,6 +516,22 @@ def get_flow(name: str) -> FlowRecord:
     if record is None:
         raise HTTPException(status_code=404, detail=f"Flow not found: {name}")
     return record
+
+
+@app.delete("/api/flows/{name}")
+def delete_flow(name: str) -> dict[str, str]:
+    record = load_flow_record(name)
+    if record is None:
+        raise HTTPException(status_code=404, detail=f"Flow not found: {name}")
+
+    deleted = delete_flow_record(name)
+    if not deleted:
+        raise HTTPException(status_code=404, detail=f"Flow not found: {name}")
+
+    email_listener_manager.sync_saved_flows()
+    queue_subscriber_manager.sync_saved_flows()
+
+    return {"name": normalize_flow_name(name), "status": "deleted"}
 
 
 def normalize_ollama_base_url(base_url: str | None) -> str:
