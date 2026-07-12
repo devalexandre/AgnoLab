@@ -82,11 +82,14 @@ export async function listBuiltInToolFunctions(input: {
   };
 }
 
-export async function previewCode(graph: CanvasGraph): Promise<{ code: string; warnings: string[] }> {
+export async function previewCode(
+  graph: CanvasGraph,
+  options?: { serve?: boolean },
+): Promise<{ code: string; warnings: string[] }> {
   const response = await fetch(`${API_BASE}/api/codegen/preview`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ graph }),
+    body: JSON.stringify({ graph, serve: options?.serve ?? false }),
   });
   if (!response.ok) {
     throw new Error("Failed to generate code preview");

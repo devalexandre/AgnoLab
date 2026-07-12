@@ -486,7 +486,7 @@ def list_builtin_tool_functions(request: BuiltInToolFunctionsRequest) -> ListBui
 
 @app.post("/api/codegen/preview", response_model=CodegenResponse)
 def preview_code(request: CodegenRequest) -> CodegenResponse:
-    code, warnings = compile_graph(request.graph)
+    code, warnings = compile_graph(request.graph, serve=request.serve)
     return CodegenResponse(code=code, warnings=warnings)
 
 
@@ -2112,4 +2112,4 @@ def run_saved_flow_by_name(request: RunSavedFlowByNameRequest, http_request: Req
 
 @app.post("/api/project/export", response_model=ExportProjectResponse)
 def export_code(request: CodegenRequest) -> ExportProjectResponse:
-    return export_project(request.graph)
+    return export_project(request.graph, serve=request.serve)

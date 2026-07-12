@@ -2862,7 +2862,46 @@ def render_knowledge_file_ingestion(knowledge_targets: list[dict[str, object]]) 
     return lines
 
 
-def compile_graph(graph: CanvasGraph) -> tuple[str, list[str]]:
+def render_agent_os_serve(
+    ordered_nodes: list[GraphNode],
+    symbol_map: dict[str, str],
+    graph: CanvasGraph,
+) -> tuple[list[str], list[str]]:
+    """Emit an AgentOS app that serves the graph's agents/teams/workflows.
+
+    Returns (code_lines, warnings). This is the 'serve' export target: instead of a
+    run-once script, the generated main.py exposes a FastAPI app runnable with uvicorn.
+    """
+    warnings: list[str] = []
+    agents = [symbol_map[n.id] for n in ordered_nodes if n.type == NodeType.AGENT and n.id in symbol_map]
+    teams = [symbol_map[n.id] for n in ordered_nodes if n.type == NodeType.TEAM and n.id in symbol_map]
+    workflows = [symbol_map[n.id] for n in ordered_nodes if n.type == NodeType.WORKFLOW and n.id in symbol_map]
+
+    if not (agents or teams or workflows):
+        warnings.append("AgentOS serve target has no agent, team, or workflow to serve.")
+
+    args: list[str] = []
+    if graph.project.name:
+        args.append(f"name={python_literal(graph.project.name)}")
+    if agents:
+        args.append(f"agents=[{', '.join(agents)}]")
+    if teams:
+        args.append(f"teams=[{', '.join(teams)}]")
+    if workflows:
+        args.append(f"workflows=[{', '.join(workflows)}]")
+
+    lines = [
+        "",
+        f"agent_os = AgentOS({', '.join(args)})",
+        "app = agent_os.get_app()",
+        "",
+        'if __name__ == "__main__":',
+        '    agent_os.serve(app="main:app", host="0.0.0.0", port=7777)',
+    ]
+    return lines, warnings
+
+
+def compile_graph(graph: CanvasGraph, *, serve: bool = False) -> tuple[str, list[str]]:
     warnings: list[str] = []
 
     if graph.project.target != TargetRuntime.AGNO_PYTHON:
@@ -3398,6 +3437,18 @@ def compile_graph(graph: CanvasGraph) -> tuple[str, list[str]]:
     if has_output_api:
         import_lines.append("from datetime import datetime, timezone")
         import_lines.append("import requests")
+
+    if serve:
+        # Serve target: expose the graph's agents/teams/workflows as an AgentOS app
+        # instead of a run-once script. Skips the input/run/output machinery entirely.
+        import_lines.append("from agno.os import AgentOS")
+        import_lines.append("")
+        serve_lines, serve_warnings = render_agent_os_serve(ordered_nodes, symbol_map, graph)
+        warnings.extend(serve_warnings)
+        lines.extend(serve_lines)
+        full_code = "\n".join(import_lines + lines).strip() + "\n"
+        return full_code, warnings
+
     import_lines.append("")
     lines.extend(DEBUG_TRACE_HELPERS)
 

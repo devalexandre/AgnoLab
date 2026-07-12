@@ -270,6 +270,8 @@ class RunSavedFlowByNameRequest(RunSavedFlowRequest):
 class CodegenRequest(BaseModel):
     graph: CanvasGraph
     response_only: bool = False
+    # When true, export/codegen targets an AgentOS server app instead of a run-once script.
+    serve: bool = False
 
 
 class CodegenResponse(BaseModel):
