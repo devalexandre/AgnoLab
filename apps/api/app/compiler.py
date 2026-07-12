@@ -453,6 +453,11 @@ RAW_EXPRESSION_IMPORTS = {
     "Slack": ("agno.os.interfaces.slack", "Slack"),
     "A2A": ("agno.os.interfaces.a2a", "A2A"),
     "AGUI": ("agno.os.interfaces.agui", "AGUI"),
+    # Guardrails — usable via an agent/team pre_hooks / post_hooks expression.
+    "PIIDetectionGuardrail": ("agno.guardrails", "PIIDetectionGuardrail"),
+    "PromptInjectionGuardrail": ("agno.guardrails", "PromptInjectionGuardrail"),
+    "OpenAIModerationGuardrail": ("agno.guardrails", "OpenAIModerationGuardrail"),
+    "BaseGuardrail": ("agno.guardrails", "BaseGuardrail"),
 }
 
 INTERFACE_IMPORTS: dict[str, tuple[str, str]] = {
