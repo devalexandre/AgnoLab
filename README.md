@@ -126,17 +126,46 @@ export VITE_API_URL=http://localhost:8000
 npm run dev
 ```
 
-### Docker
+### Docker (production)
+
+The production compose runs AgnoLab plus every self-hostable resource its flows can
+use: Postgres with pgvector, Redis, RabbitMQ, Kafka, NATS, and the WhatsApp gateway.
 
 ```bash
-export OPENAI_API_KEY="your-key"
-docker compose up --build
+cp .env.example .env
+# Fill in the required secrets. Generate them with: openssl rand -hex 32
+docker compose up --build -d
 ```
 
-The API will be available at `http://localhost:8000` and the web app at `http://localhost:5173`.
-The services stay separated in Docker, but `docker compose` starts both together. The web image receives `VITE_API_URL` at build time, so you can point it to another backend later without changing the source code.
-If you want to connect to a local Ollama instance from inside Docker, use `http://host.docker.internal:11434` as the provider base URL.
-Saved flows, runtime variables, and flow authentication settings persist on the host under `apps/api/data`.
+Compose refuses to start until the required secrets are set — `AGNOLAB_API_KEY`,
+`WHATSAPP_GATEWAY_SECRET_KEY`, `POSTGRES_PASSWORD`, `REDIS_PASSWORD`, and
+`RABBITMQ_PASSWORD`. See [Security](#security) for why the API key is mandatory.
+
+The web app is served on `http://localhost:5173` and the API on `http://localhost:8000`.
+
+**Backing services are not published to the host.** The API reaches them over the
+internal network, so use these hostnames inside your flow nodes (not `localhost`):
+
+| Resource | Use this in the node |
+| --- | --- |
+| Postgres / pgvector | `postgresql+psycopg://agnolab:<POSTGRES_PASSWORD>@postgres:5432/agnolab` |
+| Redis | `redis://:<REDIS_PASSWORD>@redis:6379/0` |
+| RabbitMQ | `amqp://agnolab:<RABBITMQ_PASSWORD>@rabbitmq:5672/` |
+| Kafka | `kafka:19092` |
+| NATS | `nats://nats:4222` |
+
+The RabbitMQ management UI (`:15672`) and the WhatsApp gateway (`:21465`, needed to
+scan the pairing QR code) are bound to loopback only.
+
+AWS SQS and Google Pub/Sub are cloud services: point those nodes at the real
+endpoints and supply credentials. The local emulators are development-only.
+
+The web image receives `VITE_API_URL` at build time, so you can point it at another
+backend without changing the source. To reach a local Ollama instance from inside
+Docker, use `http://host.docker.internal:11434` as the provider base URL.
+
+Saved flows, runtime variables, and flow authentication settings persist under
+`apps/api/data` by default; set `AGNOLAB_DATA_DIR` to relocate it, and back it up.
 
 ### Development Mode (Docker Dev)
 
@@ -156,6 +185,45 @@ For Render, keep the services separate:
 
 This keeps backend and frontend independent while still letting you deploy both parts of the same repository.
 
+## Security
+
+**AgnoLab generates and executes Python code.** Anyone who can reach the API can make
+it run arbitrary code on the host. Treat the API as a privileged service and never
+expose it to an untrusted network without an API key.
+
+### Authentication
+
+Set `AGNOLAB_API_KEY` to a long random secret. Clients then send it as `X-API-Key: <key>`
+or `Authorization: Bearer <key>`. When the variable is unset the API runs open — fine
+for single-user local development, and the server logs a warning at startup. The
+production compose **requires** it.
+
+External trigger endpoints (webhook/form, WhatsApp events, run-by-name) are exempt from
+the global key: they authenticate per-flow with the bearer token configured on the flow.
+
+### Secrets
+
+No secret you type into the canvas is written into generated or exported code. Provider
+API keys, provider environment values, and email passwords are read via `os.getenv(...)`
+in the generated source and injected into the runner's environment at execution time.
+
+### Executor guards
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `AGNOLAB_MAX_EXECUTION_SECONDS` | `300` | Hard ceiling on any run, overriding per-flow timeouts |
+| `AGNOLAB_MAX_OUTPUT_MB` | `128` | Cap on what a run may write to disk |
+| `AGNOLAB_MAX_MEMORY_MB` | off | Optional memory cap (off by default: ML/vector libraries reserve large address ranges) |
+| `AGNOLAB_ISOLATE_ENV` | off (on in prod compose) | Runner sees only system essentials, known provider credential vars, and the flow's own secrets — not the full host environment |
+| `AGNOLAB_FORWARD_ENV` | — | Extra host env vars to forward into the isolated runner |
+
+Runs also get POSIX CPU/output limits and are killed as a whole process group on timeout.
+
+### CORS
+
+`AGNOLAB_CORS_ORIGINS` takes a comma-separated list of allowed browser origins; it
+defaults to the local dev servers. A wildcard is accepted but disables credentialed CORS.
+
 ## Provider Support
 
 AgnoLab supports multiple providers through the canvas properties panel, including local options like Ollama as well as remote providers such as OpenAI, Anthropic, Google, Groq, Mistral, Cohere, Cerebras, OpenRouter, LiteLLM, Azure, Bedrock, Vertex, IBM WatsonX, Portkey, LangDB, and others supported by Agno.
@@ -169,6 +237,15 @@ When you export a flow, AgnoLab generates:
 - `main.py` with the compiled Agno workflow
 - `requirements.txt` with the runtime dependencies for the selected nodes
 - `README.md` for the exported project
+
+There are two export targets:
+
+- **Run-once script** (`Export .py`) — the flow executes once and prints its result.
+- **AgentOS server app** (`Export Server App`) — emits an `AgentOS(...)` FastAPI app that
+  serves the flow's agents, teams, and workflows as an API. Run it with `python main.py`
+  and it listens on port 7777.
+
+No secrets are included in either export; supply them via the environment.
 
 ## License
 

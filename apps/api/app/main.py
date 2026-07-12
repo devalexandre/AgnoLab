@@ -66,7 +66,11 @@ from .models import (
 from .provider_catalog import known_provider_credential_env_names
 from .queue_subscriber import QueueSubscriberManager, extract_queue_subscriber_configs
 from .sample_graph import build_sample_graph, get_canvas_template, list_canvas_templates
-from .whatsapp_gateway import WhatsappGatewayClient, normalize_whatsapp_session_id
+from .whatsapp_gateway import (
+    DEFAULT_WHATSAPP_GATEWAY_SECRET_KEY,
+    WhatsappGatewayClient,
+    normalize_whatsapp_session_id,
+)
 
 load_dotenv()
 
@@ -127,6 +131,11 @@ async def lifespan(_app: FastAPI):
             "AGNOLAB_API_KEY is not set: the code generation and execution endpoints "
             "are unauthenticated. Set AGNOLAB_API_KEY before exposing this API beyond localhost."
         )
+    if os.getenv("WHATSAPP_GATEWAY_SECRET_KEY", "").strip() in ("", DEFAULT_WHATSAPP_GATEWAY_SECRET_KEY):
+        logger.warning(
+            "WHATSAPP_GATEWAY_SECRET_KEY is unset or still the built-in default. Anyone who can "
+            "reach the WhatsApp gateway could control its sessions. Set a strong secret before deploying."
+        )
     email_listener_manager.start()
     queue_subscriber_manager.start()
     try:
@@ -138,7 +147,7 @@ async def lifespan(_app: FastAPI):
 
 app = FastAPI(
     title="AgnoLab API",
-    version="0.1.0",
+    version="0.2.0",
     dependencies=[Depends(require_api_key)],
     lifespan=lifespan,
 )

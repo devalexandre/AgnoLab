@@ -1,6 +1,6 @@
 [project]
 name = "agnolab-api"
-version = "0.1.0"
+version = "0.2.0"
 description = "API for the AgnoLab visual builder"
 requires-python = ">=3.11"
 # Core dependencies required to import and serve the API itself.

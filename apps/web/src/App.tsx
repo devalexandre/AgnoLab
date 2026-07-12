@@ -50,10 +50,17 @@ import {
   getGraphProjectRuntime,
   normalizeImportedFlowPayload,
 } from "./flowNormalize";
+import { MAX_CANVAS_ZOOM, MIN_CANVAS_ZOOM, clampCanvasZoom, isCanvasBackgroundTarget } from "./canvas";
 import { MarkdownRenderer } from "./markdown";
 import type { MonacoToolEditorProps } from "./MonacoToolEditor";
+import {
+  buildFlowPath,
+  buildPersistedFlowSnapshot,
+  getFlowNameFromPath,
+  getTemplateIdFromSearch,
+} from "./routing";
 import { extractAgentResponse, sanitizeGeneratedCode } from "./runOutput";
-import { fieldValueAsString, isObjectRecord, slugifyFlowName } from "./utils";
+import { downloadAsFile, fieldValueAsString, isObjectRecord, slugifyFlowName } from "./utils";
 
 // Lazy-load the Monaco editor so its (large, bundled) chunk is only fetched when an
 // editor is actually opened, keeping the initial app bundle small.
@@ -78,8 +85,6 @@ const MY_TOOLS_STORAGE_KEY = "agnolab.my_tools";
 const FLOW_AUTOSAVE_DELAY_MS = 1200;
 const CANVAS_WORLD_MIN = -4000;
 const CANVAS_WORLD_MAX = 8000;
-const MIN_CANVAS_ZOOM = 0.5;
-const MAX_CANVAS_ZOOM = 2.5;
 const CANVAS_ZOOM_STEP = 0.1;
 const HISTORY_MAX_ENTRIES = 80;
 const MINIMAP_WIDTH = 220;
@@ -647,70 +652,6 @@ const KNOWLEDGE_READER_OPTIONS: Array<{ key: KnowledgeReaderKey; label: string; 
   { key: "markdown", label: "Markdown Reader", description: "For `.md` and `.markdown` files." },
   { key: "text", label: "Text Reader", description: "For plain text ingestion or forcing text mode." },
 ];
-
-function downloadAsFile(content: string, fileName: string, mimeType: string) {
-  const blob = new Blob([content], { type: mimeType });
-  const url = window.URL.createObjectURL(blob);
-  const anchor = document.createElement("a");
-  anchor.href = url;
-  anchor.download = fileName;
-  document.body.appendChild(anchor);
-  anchor.click();
-  document.body.removeChild(anchor);
-  window.URL.revokeObjectURL(url);
-}
-
-function getFlowNameFromPath(pathname: string): string | null {
-  const prefix = "/flow/";
-  if (!pathname.startsWith(prefix)) {
-    return null;
-  }
-  const raw = pathname.slice(prefix.length).trim();
-  if (!raw) {
-    return null;
-  }
-  return decodeURIComponent(raw);
-}
-
-function buildFlowPath(flowName: string): string {
-  return `/flow/${encodeURIComponent(flowName)}`;
-}
-
-function buildPersistedFlowSnapshot(flowName: string, graph: CanvasGraph | null): string {
-  if (!graph) {
-    return "";
-  }
-  const normalizedName = slugifyFlowName(flowName) || flowName.trim();
-  return JSON.stringify({
-    flowName: normalizedName,
-    graph,
-  });
-}
-
-function clampCanvasZoom(value: number): number {
-  return Math.max(MIN_CANVAS_ZOOM, Math.min(MAX_CANVAS_ZOOM, Number(value.toFixed(2))));
-}
-
-function isCanvasBackgroundTarget(target: EventTarget | null, currentTarget: EventTarget | null): boolean {
-  if (!(target instanceof Element)) {
-    return false;
-  }
-
-  if (target.closest(".canvas-node, .canvas-brand, .run-cta, .flow-actions, .canvas-hint, .edge-hit-area")) {
-    return false;
-  }
-
-  if (currentTarget instanceof Element && target === currentTarget) {
-    return true;
-  }
-
-  return target.classList.contains("canvas-viewport") || target.classList.contains("edges");
-}
-
-function getTemplateIdFromSearch(search: string): string | null {
-  const templateId = new URLSearchParams(search).get("template")?.trim();
-  return templateId ? templateId : null;
-}
 
 function getAgentConfig(data: NodeData): Record<string, unknown> {
   return (data.extras?.agentConfig as Record<string, unknown> | undefined) ?? {};

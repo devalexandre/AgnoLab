@@ -14,6 +14,18 @@ export function isObjectRecord(value: unknown): value is Record<string, unknown>
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }
 
+export function downloadAsFile(content: string, fileName: string, mimeType: string) {
+  const blob = new Blob([content], { type: mimeType });
+  const url = window.URL.createObjectURL(blob);
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = fileName;
+  document.body.appendChild(anchor);
+  anchor.click();
+  document.body.removeChild(anchor);
+  window.URL.revokeObjectURL(url);
+}
+
 export function slugifyFlowName(value: string): string {
   return value
     .trim()
