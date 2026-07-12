@@ -1,7 +1,19 @@
-import { type ChangeEvent, type MouseEvent as ReactMouseEvent, type WheelEvent as ReactWheelEvent, useEffect, useMemo, useRef, useState } from "react";
+import { type ChangeEvent, type MouseEvent as ReactMouseEvent, type WheelEvent as ReactWheelEvent, Suspense, lazy, useEffect, useMemo, useRef, useState } from "react";
 import { API_BASE, deleteFlowByName, fetchCanvasTemplate, fetchDefaultGraph, fetchFlowByName, fetchQueueSubscriberStatus, fetchWhatsappSessionStatus, listBuiltInToolFunctions, listCanvasTemplates, listFlowRuntimeStatuses, listFlows, listOllamaModels, listSkillPaths, previewCode, runFlowByName, runGraph, saveFlow, startQueueSubscriber, startWhatsappSession, stopQueueSubscriber, stopWhatsappSession } from "./api";
 import { AGENT_FIELDS, AGENT_FIELD_GROUPS, AGNO_MODEL_PROVIDER_OPTIONS, type AgentFieldDefinition } from "./agentConfig";
-import MonacoToolEditor from "./MonacoToolEditor";
+import type { MonacoToolEditorProps } from "./MonacoToolEditor";
+
+// Lazy-load the Monaco editor so its (large, bundled) chunk is only fetched when an
+// editor is actually opened, keeping the initial app bundle small.
+const LazyMonacoEditor = lazy(() => import("./MonacoToolEditor"));
+
+function MonacoToolEditor(props: MonacoToolEditorProps) {
+  return (
+    <Suspense fallback={<div className="monaco-editor-loading">Loading editor…</div>}>
+      <LazyMonacoEditor {...props} />
+    </Suspense>
+  );
+}
 import { NODE_CATALOG, NODE_CATEGORIES, canConnect, listNodeTypes } from "./nodeCatalog";
 import { buildProviderConfig, getProviderDefinition, normalizeProviderId } from "./providerCatalog";
 import { TEAM_FIELDS, TEAM_FIELD_GROUPS } from "./teamConfig";
@@ -4268,12 +4280,25 @@ export default function App() {
     if (!graph) {
       return;
     }
-    previewCode(graph)
-      .then((response) => {
-        setCode(response.code);
-        setWarnings(response.warnings);
-      })
-      .catch(console.error);
+    // Debounce: coalesce rapid graph changes (e.g. dragging a node) into a single
+    // codegen request instead of firing one POST per mousemove frame.
+    let cancelled = false;
+    const timeoutId = window.setTimeout(() => {
+      previewCode(graph)
+        .then((response) => {
+          if (cancelled) {
+            return;
+          }
+          setCode(response.code);
+          setWarnings(response.warnings);
+        })
+        .catch(console.error);
+    }, 300);
+
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timeoutId);
+    };
   }, [graph]);
 
   useEffect(() => {
