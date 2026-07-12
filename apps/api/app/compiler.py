@@ -3020,6 +3020,113 @@ def render_agent_node(
     return lines, warnings
 
 
+def render_team_node(
+    node: GraphNode,
+    var_name: str,
+    graph: CanvasGraph,
+    node_map: dict[str, GraphNode],
+    symbol_map: dict[str, str],
+    provider_class_refs: dict[str, str],
+    register_knowledge_target: Callable[..., None],
+) -> tuple[list[str], list[str]]:
+    """Emit the definition for a single team node, wiring members and connected resources."""
+    lines: list[str] = []
+    warnings: list[str] = []
+
+    provider_id = get_node_provider_id(node)
+    incoming_source_ids = incoming_ids(graph, node.id)
+
+    def _connected_symbol(node_type: NodeType) -> str | None:
+        return next(
+            (
+                symbol_map[source_id]
+                for source_id in incoming_source_ids
+                if source_id in symbol_map and node_map.get(source_id) and node_map[source_id].type == node_type
+            ),
+            None,
+        )
+
+    def _connected_node(node_type: NodeType) -> GraphNode | None:
+        return next(
+            (
+                node_map[source_id]
+                for source_id in incoming_source_ids
+                if source_id in symbol_map and node_map.get(source_id) and node_map[source_id].type == node_type
+            ),
+            None,
+        )
+
+    member_symbols = [
+        symbol_map[source_id]
+        for source_id in incoming_source_ids
+        if source_id in symbol_map
+        and node_map.get(source_id)
+        and node_map[source_id].type in {NodeType.AGENT, NodeType.TEAM}
+    ]
+    tool_symbols = [
+        symbol_map[source_id]
+        for source_id in incoming_source_ids
+        if source_id in symbol_map and node_map.get(source_id) and node_map[source_id].type == NodeType.TOOL
+    ]
+    connected_db_symbol = _connected_symbol(NodeType.DATABASE)
+    connected_knowledge_symbol = _connected_symbol(NodeType.KNOWLEDGE)
+    connected_knowledge_node = _connected_node(NodeType.KNOWLEDGE)
+    connected_vector_symbol = _connected_symbol(NodeType.VECTOR_DB)
+    connected_memory_manager_symbol = _connected_symbol(NodeType.MEMORY_MANAGER)
+    connected_session_summary_manager_symbol = _connected_symbol(NodeType.SESSION_SUMMARY_MANAGER)
+    connected_compression_manager_symbol = _connected_symbol(NodeType.COMPRESSION_MANAGER)
+    connected_learning_machine_symbol = _connected_symbol(NodeType.LEARNING_MACHINE)
+
+    env_setup_lines = build_provider_env_setup(node)
+    if env_setup_lines:
+        lines.extend(env_setup_lines)
+    provider_class_ref = provider_class_refs.get(provider_id)
+    excluded_fields: set[str] = set()
+    if connected_db_symbol:
+        excluded_fields.add("db")
+    if connected_knowledge_symbol or connected_vector_symbol:
+        excluded_fields.add("knowledge")
+    if connected_memory_manager_symbol:
+        excluded_fields.add("memory_manager")
+    if connected_session_summary_manager_symbol:
+        excluded_fields.add("session_summary_manager")
+    if connected_compression_manager_symbol:
+        excluded_fields.add("compression_manager")
+    if connected_learning_machine_symbol:
+        excluded_fields.add("learning")
+    team_kwargs, team_warnings = build_team_kwargs(node, member_symbols, tool_symbols, provider_class_ref, excluded_fields)
+    warnings.extend(team_warnings)
+    if connected_db_symbol:
+        team_kwargs += f"\n    db={connected_db_symbol},"
+    if connected_knowledge_symbol:
+        team_kwargs += f"\n    knowledge={connected_knowledge_symbol},"
+    elif connected_vector_symbol:
+        team_kwargs += f"\n    knowledge=Knowledge(vector_db={connected_vector_symbol}),"
+    if connected_memory_manager_symbol:
+        team_kwargs += f"\n    memory_manager={connected_memory_manager_symbol},"
+    if connected_session_summary_manager_symbol:
+        team_kwargs += f"\n    session_summary_manager={connected_session_summary_manager_symbol},"
+    if connected_compression_manager_symbol:
+        team_kwargs += f"\n    compression_manager={connected_compression_manager_symbol},"
+    if connected_learning_machine_symbol:
+        team_kwargs += f"\n    learning={connected_learning_machine_symbol},"
+    extras = node.data.extras or {}
+    team_config = extras.get("teamConfig") or {}
+    has_manual_knowledge = isinstance(team_config, dict) and team_config.get("knowledge") not in (None, "", [], {})
+    if connected_knowledge_symbol and connected_knowledge_node:
+        register_knowledge_target(var_name, connected_knowledge_node)
+    elif connected_vector_symbol or has_manual_knowledge:
+        register_knowledge_target(var_name)
+    lines.append(
+        TEAM_TEMPLATE.render(
+            var_name=var_name,
+            kwargs=team_kwargs,
+        ).rstrip()
+    )
+    lines.append("")
+    return lines, warnings
+
+
 def render_input_setup(
     input_nodes: list[GraphNode],
     knowledge_target_specs: list[dict[str, object]],
@@ -3356,131 +3463,11 @@ def compile_graph(graph: CanvasGraph, *, serve: bool = False) -> tuple[str, list
             continue
 
         if node.type == NodeType.TEAM:
-            provider_id = get_node_provider_id(node)
-            incoming_source_ids = incoming_ids(graph, node.id)
-            member_symbols = [
-                symbol_map[source_id]
-                for source_id in incoming_source_ids
-                if source_id in symbol_map
-                and node_map.get(source_id)
-                and node_map[source_id].type in {NodeType.AGENT, NodeType.TEAM}
-            ]
-            tool_symbols = [
-                symbol_map[source_id]
-                for source_id in incoming_source_ids
-                if source_id in symbol_map and node_map.get(source_id) and node_map[source_id].type == NodeType.TOOL
-            ]
-            connected_db_symbol = next(
-                (
-                    symbol_map[source_id]
-                    for source_id in incoming_source_ids
-                    if source_id in symbol_map and node_map.get(source_id) and node_map[source_id].type == NodeType.DATABASE
-                ),
-                None,
+            team_lines, team_warnings = render_team_node(
+                node, var_name, graph, node_map, symbol_map, provider_class_refs, register_knowledge_target
             )
-            connected_knowledge_symbol = next(
-                (
-                    symbol_map[source_id]
-                    for source_id in incoming_source_ids
-                    if source_id in symbol_map and node_map.get(source_id) and node_map[source_id].type == NodeType.KNOWLEDGE
-                ),
-                None,
-            )
-            connected_knowledge_node = next(
-                (
-                    node_map[source_id]
-                    for source_id in incoming_source_ids
-                    if source_id in symbol_map and node_map.get(source_id) and node_map[source_id].type == NodeType.KNOWLEDGE
-                ),
-                None,
-            )
-            connected_vector_symbol = next(
-                (
-                    symbol_map[source_id]
-                    for source_id in incoming_source_ids
-                    if source_id in symbol_map and node_map.get(source_id) and node_map[source_id].type == NodeType.VECTOR_DB
-                ),
-                None,
-            )
-            connected_memory_manager_symbol = next(
-                (
-                    symbol_map[source_id]
-                    for source_id in incoming_source_ids
-                    if source_id in symbol_map and node_map.get(source_id) and node_map[source_id].type == NodeType.MEMORY_MANAGER
-                ),
-                None,
-            )
-            connected_session_summary_manager_symbol = next(
-                (
-                    symbol_map[source_id]
-                    for source_id in incoming_source_ids
-                    if source_id in symbol_map and node_map.get(source_id) and node_map[source_id].type == NodeType.SESSION_SUMMARY_MANAGER
-                ),
-                None,
-            )
-            connected_compression_manager_symbol = next(
-                (
-                    symbol_map[source_id]
-                    for source_id in incoming_source_ids
-                    if source_id in symbol_map and node_map.get(source_id) and node_map[source_id].type == NodeType.COMPRESSION_MANAGER
-                ),
-                None,
-            )
-            connected_learning_machine_symbol = next(
-                (
-                    symbol_map[source_id]
-                    for source_id in incoming_source_ids
-                    if source_id in symbol_map and node_map.get(source_id) and node_map[source_id].type == NodeType.LEARNING_MACHINE
-                ),
-                None,
-            )
-            env_setup_lines = build_provider_env_setup(node)
-            if env_setup_lines:
-                lines.extend(env_setup_lines)
-            provider_class_ref = provider_class_refs.get(provider_id)
-            excluded_fields: set[str] = set()
-            if connected_db_symbol:
-                excluded_fields.add("db")
-            if connected_knowledge_symbol or connected_vector_symbol:
-                excluded_fields.add("knowledge")
-            if connected_memory_manager_symbol:
-                excluded_fields.add("memory_manager")
-            if connected_session_summary_manager_symbol:
-                excluded_fields.add("session_summary_manager")
-            if connected_compression_manager_symbol:
-                excluded_fields.add("compression_manager")
-            if connected_learning_machine_symbol:
-                excluded_fields.add("learning")
-            team_kwargs, team_warnings = build_team_kwargs(node, member_symbols, tool_symbols, provider_class_ref, excluded_fields)
+            lines.extend(team_lines)
             warnings.extend(team_warnings)
-            if connected_db_symbol:
-                team_kwargs += f"\n    db={connected_db_symbol},"
-            if connected_knowledge_symbol:
-                team_kwargs += f"\n    knowledge={connected_knowledge_symbol},"
-            elif connected_vector_symbol:
-                team_kwargs += f"\n    knowledge=Knowledge(vector_db={connected_vector_symbol}),"
-            if connected_memory_manager_symbol:
-                team_kwargs += f"\n    memory_manager={connected_memory_manager_symbol},"
-            if connected_session_summary_manager_symbol:
-                team_kwargs += f"\n    session_summary_manager={connected_session_summary_manager_symbol},"
-            if connected_compression_manager_symbol:
-                team_kwargs += f"\n    compression_manager={connected_compression_manager_symbol},"
-            if connected_learning_machine_symbol:
-                team_kwargs += f"\n    learning={connected_learning_machine_symbol},"
-            extras = node.data.extras or {}
-            team_config = extras.get("teamConfig") or {}
-            has_manual_knowledge = isinstance(team_config, dict) and team_config.get("knowledge") not in (None, "", [], {})
-            if connected_knowledge_symbol and connected_knowledge_node:
-                register_knowledge_target(var_name, connected_knowledge_node)
-            elif connected_vector_symbol or has_manual_knowledge:
-                register_knowledge_target(var_name)
-            lines.append(
-                TEAM_TEMPLATE.render(
-                    var_name=var_name,
-                    kwargs=team_kwargs,
-                ).rstrip()
-            )
-            lines.append("")
             continue
 
         if node.type == NodeType.WORKFLOW_STEP:
