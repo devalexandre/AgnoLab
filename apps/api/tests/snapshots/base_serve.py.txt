@@ -1,0 +1,35 @@
+import base64
+import json
+import os
+from pathlib import Path
+
+from agno.agent import Agent
+from agno.media import Audio, File, Image, Video
+from agno.team import Team
+from agno.tools import tool
+from agno.models.openai import OpenAIChat
+from agno.os import AgentOS
+
+@tool
+def search_tool(value: str) -> str:
+    return f'Search stub: {value}'
+tool_tool_1 = search_tool
+
+os.environ['OPENAI_BASE_URL'] = 'https://api.openai.com/v1'
+agent_agent_1 = Agent(
+    name='Search Agent',
+    model=OpenAIChat(id='gpt-4.1-mini', api_key=os.getenv('OPENAI_API_KEY'), base_url='https://api.openai.com/v1'),
+    instructions='Responda de forma objetiva e com foco em automação com agents.\n\nRuntime input context available to this flow:\n- `flow_input`: formatted string with the user text, attached files and metadata.\n- `flow_input_payload`: dict with keys `text`, `files` and `metadata`.\n- `flow_input_files`: list of attached files with `name`, `alias`, `mime_type` and `path`.\n- `flow_input_file_path`: absolute path to the first attached file, or `None`.\n- `flow_input_metadata`: dict parsed from the input metadata JSON.\n\nWhen you use tools:\n- If a tool needs a file path, prefer `flow_input_file_path`.\n- If there are multiple files, inspect `flow_input_files`.\n- If the user attached a CSV, pass the file path explicitly to the tool.\n- Mention when you are relying on attached files versus plain text input.\n- If a tool returns `numeric_summary` or `financial_summary`, use those exact totals in the final answer.\n- Do not estimate, infer, or recompute totals from preview rows when a tool already returned aggregate values.',
+    tools=[tool_tool_1],
+    description='Agente base para pesquisas rápidas.',
+    markdown=True,
+    add_datetime_to_context=True,
+    debug_mode=True,
+)
+
+
+agent_os = AgentOS(name='Support Agent Flow', agents=[agent_agent_1])
+app = agent_os.get_app()
+
+if __name__ == "__main__":
+    agent_os.serve(app="main:app", host="0.0.0.0", port=7777)

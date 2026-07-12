@@ -1,0 +1,257 @@
+import base64
+import json
+import os
+from pathlib import Path
+
+from agno.agent import Agent
+from agno.media import Audio, File, Image, Video
+from agno.team import Team
+from agno.tools import tool
+from agno.models.openai import OpenAIChat
+
+@tool
+def search_tool(value: str) -> str:
+    return f'Search stub: {value}'
+tool_tool_1 = search_tool
+
+os.environ['OPENAI_BASE_URL'] = 'https://api.openai.com/v1'
+agent_agent_1 = Agent(
+    name='Support Researcher',
+    model=OpenAIChat(id='gpt-4.1-mini', api_key=os.getenv('OPENAI_API_KEY'), base_url='https://api.openai.com/v1'),
+    instructions='Pesquise rapidamente boas práticas e pontos de atenção para operações de suporte com Agno.\n\nRuntime input context available to this flow:\n- `flow_input`: formatted string with the user text, attached files and metadata.\n- `flow_input_payload`: dict with keys `text`, `files` and `metadata`.\n- `flow_input_files`: list of attached files with `name`, `alias`, `mime_type` and `path`.\n- `flow_input_file_path`: absolute path to the first attached file, or `None`.\n- `flow_input_metadata`: dict parsed from the input metadata JSON.\n\nWhen you use tools:\n- If a tool needs a file path, prefer `flow_input_file_path`.\n- If there are multiple files, inspect `flow_input_files`.\n- If the user attached a CSV, pass the file path explicitly to the tool.\n- Mention when you are relying on attached files versus plain text input.\n- If a tool returns `numeric_summary` or `financial_summary`, use those exact totals in the final answer.\n- Do not estimate, infer, or recompute totals from preview rows when a tool already returned aggregate values.',
+    description='Levanta contexto e casos de uso aplicáveis.',
+    markdown=True,
+    add_datetime_to_context=True,
+    debug_mode=True,
+)
+
+os.environ['OPENAI_BASE_URL'] = 'https://api.openai.com/v1'
+agent_agent_2 = Agent(
+    name='Onboarding Planner',
+    model=OpenAIChat(id='gpt-4.1-mini', api_key=os.getenv('OPENAI_API_KEY'), base_url='https://api.openai.com/v1'),
+    instructions='Organize a resposta em passos claros de onboarding e adoção para o time do cliente.\n\nRuntime input context available to this flow:\n- `flow_input`: formatted string with the user text, attached files and metadata.\n- `flow_input_payload`: dict with keys `text`, `files` and `metadata`.\n- `flow_input_files`: list of attached files with `name`, `alias`, `mime_type` and `path`.\n- `flow_input_file_path`: absolute path to the first attached file, or `None`.\n- `flow_input_metadata`: dict parsed from the input metadata JSON.\n\nWhen you use tools:\n- If a tool needs a file path, prefer `flow_input_file_path`.\n- If there are multiple files, inspect `flow_input_files`.\n- If the user attached a CSV, pass the file path explicitly to the tool.\n- Mention when you are relying on attached files versus plain text input.\n- If a tool returns `numeric_summary` or `financial_summary`, use those exact totals in the final answer.\n- Do not estimate, infer, or recompute totals from preview rows when a tool already returned aggregate values.',
+    description='Transforma pesquisa em um plano acionável.',
+    markdown=True,
+    add_datetime_to_context=True,
+    debug_mode=True,
+)
+
+os.environ['OPENAI_BASE_URL'] = 'https://api.openai.com/v1'
+team_team_1 = Team(
+    members=[agent_agent_1, agent_agent_2],
+    name='Support Strategy Team',
+    model=OpenAIChat(id='gpt-4.1-mini', api_key=os.getenv('OPENAI_API_KEY'), base_url='https://api.openai.com/v1'),
+    instructions='Coordene os especialistas, resolva conflitos e entregue uma resposta única, clara e pronta para o cliente.\n\nRuntime input context available to this flow:\n- `flow_input`: formatted string with the user text, attached files and metadata.\n- `flow_input_payload`: dict with keys `text`, `files` and `metadata`.\n- `flow_input_files`: list of attached files with `name`, `alias`, `mime_type` and `path`.\n- `flow_input_file_path`: absolute path to the first attached file, or `None`.\n- `flow_input_metadata`: dict parsed from the input metadata JSON.\n\nWhen you use tools:\n- If a tool needs a file path, prefer `flow_input_file_path`.\n- If there are multiple files, inspect `flow_input_files`.\n- If the user attached a CSV, pass the file path explicitly to the tool.\n- Mention when you are relying on attached files versus plain text input.\n- If a tool returns `numeric_summary` or `financial_summary`, use those exact totals in the final answer.\n- Do not estimate, infer, or recompute totals from preview rows when a tool already returned aggregate values.',
+    tools=[tool_tool_1],
+    description='Time que consolida pesquisa e plano operacional em uma resposta final.',
+    mode='coordinate',
+    markdown=True,
+    respond_directly=True,
+    add_datetime_to_context=True,
+    debug_mode=True,
+)
+
+def _agnolab_build_media_kwargs(flow_input_files):
+    media_kwargs = {'images': [], 'audio': [], 'videos': [], 'files': []}
+    valid_file_mimes = set(File.valid_mime_types())
+    for item in flow_input_files:
+        file_path = item.get('path')
+        if not file_path:
+            continue
+        mime_type = str(item.get('mime_type') or '').strip().lower()
+        file_name = str(item.get('name') or '')
+        file_format = Path(file_name).suffix.lstrip('.').lower() or None
+        if mime_type.startswith('image/'):
+            media_kwargs['images'].append(Image(filepath=file_path, mime_type=mime_type or None, format=file_format))
+            continue
+        if mime_type.startswith('audio/'):
+            media_kwargs['audio'].append(Audio(filepath=file_path, mime_type=mime_type or None, format=file_format))
+            continue
+        if mime_type.startswith('video/'):
+            media_kwargs['videos'].append(Video(filepath=file_path, mime_type=mime_type or None, format=file_format))
+            continue
+        file_kwargs = {'filepath': file_path, 'filename': file_name or None, 'format': file_format}
+        if mime_type and mime_type in valid_file_mimes:
+            file_kwargs['mime_type'] = mime_type
+        media_kwargs['files'].append(File(**file_kwargs))
+    return {key: value for key, value in media_kwargs.items() if value}
+
+def _agnolab_run_with_debug(runner, flow_input, media_kwargs=None):
+    debug_enabled = bool(getattr(runner, "debug_mode", False))
+    stream_enabled = bool(getattr(runner, "stream_events", False))
+    media_kwargs = media_kwargs or {}
+    run_output = runner.run(flow_input, debug_mode=debug_enabled, stream_events=stream_enabled, **media_kwargs)
+    if hasattr(run_output, "content"):
+        return run_output
+    final_output = None
+    for item in run_output:
+        if not hasattr(item, "event"):
+            final_output = item
+    return final_output
+
+def _agnolab_is_paused_status(status):
+    if status is None:
+        return False
+    normalized = str(getattr(status, 'value', status)).strip().lower()
+    return normalized == 'paused'
+
+def _agnolab_requirement_needs_confirmation(req):
+    return bool(getattr(req, 'requires_confirmation', False)) and getattr(req, 'confirmed', None) is None
+
+def _agnolab_requirement_needs_user_input(req):
+    if not bool(getattr(req, 'requires_user_input', False)):
+        return False
+    current_input = getattr(req, 'user_input', None)
+    if isinstance(current_input, dict):
+        return len(current_input) == 0
+    return current_input is None
+
+def _agnolab_apply_auto_hitl(step_requirements, flow_input_metadata):
+    metadata = flow_input_metadata if isinstance(flow_input_metadata, dict) else {}
+    auto_approve = bool(metadata.get('hitl_auto_approve') or metadata.get('auto_approve'))
+    if not auto_approve:
+        return False, step_requirements
+
+    auto_user_input = metadata.get('hitl_user_input')
+    changed = False
+    for req in step_requirements:
+        if _agnolab_requirement_needs_confirmation(req):
+            req.confirmed = True
+            changed = True
+        if _agnolab_requirement_needs_user_input(req) and isinstance(auto_user_input, dict):
+            req.user_input = auto_user_input
+            changed = True
+
+    return changed, step_requirements
+
+def _agnolab_run_workflow_with_debug(runner, flow_input, media_kwargs=None):
+    flow_input_metadata = {}
+    if isinstance(media_kwargs, dict) and '__flow_input_metadata__' in media_kwargs:
+        flow_input_metadata = media_kwargs.get('__flow_input_metadata__') or {}
+        media_kwargs = {key: value for key, value in media_kwargs.items() if key != '__flow_input_metadata__'}
+    stream_enabled = bool(getattr(runner, "stream_events", False))
+    stream_run = getattr(runner, "stream", None)
+    media_kwargs = media_kwargs or {}
+    run_output = runner.run(flow_input, stream=stream_run, stream_events=stream_enabled, **media_kwargs)
+    if not hasattr(run_output, 'status'):
+        final_output = None
+        for item in run_output:
+            if not hasattr(item, 'event'):
+                final_output = item
+        run_output = final_output
+
+    max_auto_rounds = 5
+    if isinstance(flow_input_metadata, dict):
+        try:
+            max_auto_rounds = max(1, int(flow_input_metadata.get('hitl_auto_max_rounds', 5)))
+        except (TypeError, ValueError):
+            max_auto_rounds = 5
+
+    for _ in range(max_auto_rounds):
+        if run_output is None or not _agnolab_is_paused_status(getattr(run_output, 'status', None)):
+            break
+        step_requirements = list(getattr(run_output, 'step_requirements', None) or [])
+        if not step_requirements:
+            break
+        changed, updated_requirements = _agnolab_apply_auto_hitl(step_requirements, flow_input_metadata)
+        if not changed:
+            break
+        try:
+            run_output = runner.continue_run(
+                run_response=run_output,
+                step_requirements=updated_requirements,
+                stream=stream_run,
+                stream_events=stream_enabled,
+            )
+        except Exception:
+            break
+        if not hasattr(run_output, 'status'):
+            final_output = None
+            for item in run_output:
+                if not hasattr(item, 'event'):
+                    final_output = item
+            run_output = final_output
+
+    return run_output
+
+def _agnolab_workflow_result_text(result):
+    if result is None:
+        return ''
+    status = getattr(result, 'status', None)
+    if _agnolab_is_paused_status(status):
+        paused_step = getattr(result, 'paused_step_name', None) or 'unknown step'
+        requirement_notes = []
+        for req in list(getattr(result, 'step_requirements', None) or []):
+            if bool(getattr(req, 'requires_confirmation', False)) and getattr(req, 'confirmed', None) is None:
+                requirement_notes.append('confirmation required')
+            if _agnolab_requirement_needs_user_input(req):
+                requirement_notes.append('user input required')
+            if bool(getattr(req, 'requires_route_selection', False)) and not getattr(req, 'selected_choices', None):
+                requirement_notes.append('route selection required')
+        notes = ', '.join(requirement_notes) if requirement_notes else 'manual continuation required'
+        return f"Workflow paused at '{paused_step}' ({notes}). Set input metadata `hitl_auto_approve=true` and optional `hitl_user_input` to auto-continue preview."
+    content = getattr(result, 'content', None)
+    return str(content) if content is not None else ''
+
+flow_input_files = []
+flow_input_metadata = {'source': 'team_support_desk'}
+_agnolab_runtime_files = None
+_agnolab_runtime_event = None
+if isinstance(flow_input_metadata, dict):
+    _agnolab_runtime_files = flow_input_metadata.pop('_agnolab_runtime_files', None)
+
+def _agnolab_materialize_runtime_file(index, file_item):
+    if not isinstance(file_item, dict):
+        return None
+    _agnolab_raw_name = str(file_item.get('name') or f'input_{index}.bin')
+    _agnolab_safe_name = Path(_agnolab_raw_name).name or f'input_{index}.bin'
+    _agnolab_alias = str(file_item.get('alias') or _agnolab_safe_name)
+    _agnolab_mime_type = str(file_item.get('mime_type') or 'application/octet-stream')
+    _agnolab_encoding = str(file_item.get('encoding') or 'base64').strip().lower() or 'base64'
+    _agnolab_base64 = str(file_item.get('base64') or '')
+    _agnolab_content = str(file_item.get('content') or '')
+    _agnolab_file_path = Path(f'{index}_{_agnolab_safe_name}')
+    if _agnolab_base64:
+        _agnolab_file_path.write_bytes(base64.b64decode(_agnolab_base64))
+    else:
+        _agnolab_file_path.write_text(_agnolab_content, encoding='utf-8')
+    return {
+        'name': _agnolab_safe_name,
+        'alias': _agnolab_alias,
+        'mime_type': _agnolab_mime_type,
+        'encoding': _agnolab_encoding,
+        'path': str(_agnolab_file_path.resolve()),
+    }
+
+if isinstance(_agnolab_runtime_files, list):
+    for _agnolab_index, _agnolab_file_item in enumerate(_agnolab_runtime_files, start=1):
+        _agnolab_runtime_file = _agnolab_materialize_runtime_file(_agnolab_index, _agnolab_file_item)
+        if _agnolab_runtime_file is not None:
+            flow_input_files.append(_agnolab_runtime_file)
+
+_agnolab_runtime_text = ''
+if isinstance(_agnolab_runtime_event, dict):
+    _agnolab_runtime_text = str(_agnolab_runtime_event.get('text') or '')
+    _agnolab_runtime_metadata = _agnolab_runtime_event.get('metadata')
+    if isinstance(_agnolab_runtime_metadata, dict):
+        flow_input_metadata.update(_agnolab_runtime_metadata)
+flow_input_payload = {'text': _agnolab_runtime_text or 'Monte uma resposta para um cliente que quer usar Agno Teams em suporte e onboarding.', 'files': flow_input_files, 'metadata': flow_input_metadata}
+flow_input_file_path = flow_input_files[0]['path'] if flow_input_files else None
+flow_input_parts = []
+if flow_input_payload.get('text'):
+    flow_input_parts.append(f"User input:\n{flow_input_payload['text']}")
+if flow_input_files:
+    file_lines = [f"- {item.get('alias') or item.get('name')} ({item.get('mime_type') or 'unknown'}) at {item.get('path')}" for item in flow_input_files]
+    flow_input_parts.append("Attached files:\n" + "\n".join(file_lines))
+if flow_input_metadata:
+    flow_input_parts.append("Payload metadata:\n" + json.dumps(flow_input_metadata, ensure_ascii=False, indent=2))
+flow_input = "\n\n".join(flow_input_parts) if flow_input_parts else json.dumps(flow_input_payload, ensure_ascii=False)
+
+_agnolab_media_kwargs = _agnolab_build_media_kwargs(flow_input_files)
+_agnolab_media_kwargs['__flow_input_metadata__'] = flow_input_metadata
+
+result = _agnolab_run_with_debug(team_team_1, flow_input, _agnolab_media_kwargs)
+flow_result_text = result.content if result is not None else ''
+print('__AGNO_RESULT_START__')
+print(flow_result_text)
+print('__AGNO_RESULT_END__')

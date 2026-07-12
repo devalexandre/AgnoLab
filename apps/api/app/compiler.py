@@ -2901,6 +2901,170 @@ def render_agent_os_serve(
     return lines, warnings
 
 
+def render_flow_run_block(
+    graph: CanvasGraph,
+    node_map: dict[str, GraphNode],
+    symbol_map: dict[str, str],
+    ordered_nodes: list[GraphNode],
+    terminal_nodes: list[GraphNode],
+) -> tuple[list[str], list[str]]:
+    """Emit the run-once execution block: pick a producer, run it, print the result.
+
+    Returns (code_lines, warnings). Handles the output-node path (with condition
+    gating and output-API/queue dispatch) and the no-output-node inference path.
+    """
+    lines: list[str] = []
+    warnings: list[str] = []
+
+    if terminal_nodes:
+        output_node = terminal_nodes[0]
+        if len(terminal_nodes) > 1:
+            warnings.append("Multiple output nodes found; using the first connected output in topological order.")
+
+        upstream = [
+            source_id
+            for source_id in incoming_ids(graph, output_node.id)
+            if node_map.get(source_id)
+            and node_map[source_id].type in {
+                NodeType.INPUT,
+                *QUEUE_INPUT_NODE_TYPES,
+                NodeType.AGENT,
+                NodeType.TEAM,
+                NodeType.WORKFLOW,
+                NodeType.TOOL,
+                NodeType.CONDITION,
+            }
+        ]
+
+        if len(upstream) > 1:
+            node_type_priority = {
+                NodeType.CONDITION: 0,
+                NodeType.AGENT: 0,
+                NodeType.TEAM: 1,
+                NodeType.WORKFLOW: 2,
+                NodeType.TOOL: 3,
+                NodeType.INPUT: 4,
+                NodeType.RABBITMQ_INPUT: 4,
+                NodeType.KAFKA_INPUT: 4,
+                NodeType.REDIS_INPUT: 4,
+                NodeType.NATS_INPUT: 4,
+                NodeType.SQS_INPUT: 4,
+                NodeType.PUBSUB_INPUT: 4,
+            }
+            upstream = sorted(
+                upstream,
+                key=lambda source_id: (
+                    node_type_priority.get(node_map[source_id].type, 99),
+                    incoming_ids(graph, output_node.id).index(source_id),
+                ),
+            )
+
+        producer_node = node_map.get(upstream[0]) if upstream else None
+        producer_symbol = symbol_map.get(upstream[0]) if upstream else None
+
+        # A condition node gates an upstream producer's result. Resolve the real
+        # producer behind it and apply the rule as a runtime gate on the result.
+        condition_expression = ""
+        if producer_node and producer_node.type == NodeType.CONDITION:
+            condition_node = producer_node
+            condition_expression = get_condition_expression(condition_node)
+            if len(outgoing_ids(graph, condition_node.id)) > 1:
+                warnings.append(
+                    f"Condition node '{condition_node.data.name}' has multiple downstream targets; "
+                    "branching to different targets is not supported yet, so the rule only gates the single flow result."
+                )
+            resolved_producer = resolve_condition_producer(graph, node_map, condition_node)
+            if resolved_producer is None:
+                warnings.append(
+                    f"Condition node '{condition_node.data.name}' has no agent/team/workflow/tool producer upstream; "
+                    "the rule cannot be evaluated."
+                )
+                producer_node = None
+                producer_symbol = None
+            else:
+                producer_node = resolved_producer
+                producer_symbol = symbol_map.get(resolved_producer.id)
+
+        if producer_node and producer_node.type in {NodeType.AGENT, NodeType.TEAM} and producer_symbol:
+            lines.append(f"result = _agnolab_run_with_debug({producer_symbol}, flow_input, _agnolab_media_kwargs)")
+            lines.append("flow_result_text = result.content if result is not None else ''")
+        elif producer_node and producer_node.type == NodeType.WORKFLOW and producer_symbol:
+            lines.append(f"result = _agnolab_run_workflow_with_debug({producer_symbol}, flow_input, _agnolab_media_kwargs)")
+            lines.append("flow_result_text = _agnolab_workflow_result_text(result)")
+        elif producer_node and producer_node.type == NodeType.TOOL and producer_symbol:
+            lines.append(f"result = {producer_symbol}(flow_input)")
+            lines.append("flow_result_text = str(result) if result is not None else ''")
+        elif producer_node and producer_node.type in {NodeType.INPUT, *QUEUE_INPUT_NODE_TYPES}:
+            lines.append("flow_result_text = str(flow_input_payload.get('text') or flow_input)")
+        else:
+            warnings.append("Output node has no valid upstream producer.")
+            lines.append("flow_result_text = str(flow_input_payload.get('text') or flow_input)")
+
+        if condition_expression:
+            lines.extend(render_condition_gate(condition_expression))
+
+        lines.append(f"print({python_literal(RESULT_START_MARKER)})")
+        lines.append("print(flow_result_text)")
+        lines.append(f"print({python_literal(RESULT_END_MARKER)})")
+
+        if output_node.type == NodeType.OUTPUT_API:
+            output_lines, output_warnings = render_output_api_dispatch(output_node, project_name=graph.project.name)
+            lines.extend(output_lines)
+            warnings.extend(output_warnings)
+        elif output_node.type in QUEUE_OUTPUT_NODE_TYPES:
+            warnings.append(
+                f"Queue output node '{output_node.data.name}' is dispatched when the flow runs through AgnoLab, "
+                "but the exported standalone script does not publish to it yet."
+            )
+    else:
+        executable_types = {NodeType.AGENT, NodeType.TEAM, NodeType.WORKFLOW, NodeType.TOOL}
+        executable_nodes = [node for node in ordered_nodes if node.type in executable_types]
+
+        inferred_producer_node: GraphNode | None = None
+        for candidate in reversed(executable_nodes):
+            has_executable_downstream = any(
+                edge.source == candidate.id
+                and node_map.get(edge.target)
+                and node_map[edge.target].type in executable_types
+                for edge in graph.edges
+            )
+            if not has_executable_downstream:
+                inferred_producer_node = candidate
+                break
+
+        if inferred_producer_node is None and executable_nodes:
+            inferred_producer_node = executable_nodes[-1]
+
+        inferred_symbol = symbol_map.get(inferred_producer_node.id) if inferred_producer_node else None
+        if inferred_producer_node and inferred_producer_node.type in {NodeType.AGENT, NodeType.TEAM} and inferred_symbol:
+            warnings.append(
+                f"No output node found; inferring flow result from '{inferred_producer_node.data.name}' to support runtime integrations."
+            )
+            lines.append(f"result = _agnolab_run_with_debug({inferred_symbol}, flow_input, _agnolab_media_kwargs)")
+            lines.append("flow_result_text = result.content if result is not None else ''")
+        elif inferred_producer_node and inferred_producer_node.type == NodeType.WORKFLOW and inferred_symbol:
+            warnings.append(
+                f"No output node found; inferring flow result from workflow '{inferred_producer_node.data.name}' to support runtime integrations."
+            )
+            lines.append(f"result = _agnolab_run_workflow_with_debug({inferred_symbol}, flow_input, _agnolab_media_kwargs)")
+            lines.append("flow_result_text = _agnolab_workflow_result_text(result)")
+        elif inferred_producer_node and inferred_producer_node.type == NodeType.TOOL and inferred_symbol:
+            warnings.append(
+                f"No output node found; inferring flow result from Tool '{inferred_producer_node.data.name}' to support runtime integrations."
+            )
+            lines.append(f"result = {inferred_symbol}(flow_input)")
+            lines.append("flow_result_text = str(result) if result is not None else ''")
+        else:
+            warnings.append("No output node found; preview uses the raw flow input.")
+            lines.append("flow_result_text = str(flow_input_payload.get('text') or flow_input)")
+
+        lines.append(f"print({python_literal(RESULT_START_MARKER)})")
+        lines.append("print(flow_result_text)")
+        lines.append(f"print({python_literal(RESULT_END_MARKER)})")
+
+    return lines, warnings
+
+
 def compile_graph(graph: CanvasGraph, *, serve: bool = False) -> tuple[str, list[str]]:
     warnings: list[str] = []
 
@@ -3472,151 +3636,9 @@ def compile_graph(graph: CanvasGraph, *, serve: bool = False) -> tuple[str, list
     lines.append("")
     lines.extend(render_knowledge_file_ingestion(knowledge_target_specs))
 
-    if terminal_nodes:
-        output_node = terminal_nodes[0]
-        if len(terminal_nodes) > 1:
-            warnings.append("Multiple output nodes found; using the first connected output in topological order.")
-
-        upstream = [
-            source_id
-            for source_id in incoming_ids(graph, output_node.id)
-            if node_map.get(source_id)
-            and node_map[source_id].type in {
-                NodeType.INPUT,
-                *QUEUE_INPUT_NODE_TYPES,
-                NodeType.AGENT,
-                NodeType.TEAM,
-                NodeType.WORKFLOW,
-                NodeType.TOOL,
-                NodeType.CONDITION,
-            }
-        ]
-
-        if len(upstream) > 1:
-            node_type_priority = {
-                NodeType.CONDITION: 0,
-                NodeType.AGENT: 0,
-                NodeType.TEAM: 1,
-                NodeType.WORKFLOW: 2,
-                NodeType.TOOL: 3,
-                NodeType.INPUT: 4,
-                NodeType.RABBITMQ_INPUT: 4,
-                NodeType.KAFKA_INPUT: 4,
-                NodeType.REDIS_INPUT: 4,
-                NodeType.NATS_INPUT: 4,
-                NodeType.SQS_INPUT: 4,
-                NodeType.PUBSUB_INPUT: 4,
-            }
-            upstream = sorted(
-                upstream,
-                key=lambda source_id: (
-                    node_type_priority.get(node_map[source_id].type, 99),
-                    incoming_ids(graph, output_node.id).index(source_id),
-                ),
-            )
-
-        producer_node = node_map.get(upstream[0]) if upstream else None
-        producer_symbol = symbol_map.get(upstream[0]) if upstream else None
-
-        # A condition node gates an upstream producer's result. Resolve the real
-        # producer behind it and apply the rule as a runtime gate on the result.
-        condition_expression = ""
-        if producer_node and producer_node.type == NodeType.CONDITION:
-            condition_node = producer_node
-            condition_expression = get_condition_expression(condition_node)
-            if len(outgoing_ids(graph, condition_node.id)) > 1:
-                warnings.append(
-                    f"Condition node '{condition_node.data.name}' has multiple downstream targets; "
-                    "branching to different targets is not supported yet, so the rule only gates the single flow result."
-                )
-            resolved_producer = resolve_condition_producer(graph, node_map, condition_node)
-            if resolved_producer is None:
-                warnings.append(
-                    f"Condition node '{condition_node.data.name}' has no agent/team/workflow/tool producer upstream; "
-                    "the rule cannot be evaluated."
-                )
-                producer_node = None
-                producer_symbol = None
-            else:
-                producer_node = resolved_producer
-                producer_symbol = symbol_map.get(resolved_producer.id)
-
-        if producer_node and producer_node.type in {NodeType.AGENT, NodeType.TEAM} and producer_symbol:
-            lines.append(f"result = _agnolab_run_with_debug({producer_symbol}, flow_input, _agnolab_media_kwargs)")
-            lines.append("flow_result_text = result.content if result is not None else ''")
-        elif producer_node and producer_node.type == NodeType.WORKFLOW and producer_symbol:
-            lines.append(f"result = _agnolab_run_workflow_with_debug({producer_symbol}, flow_input, _agnolab_media_kwargs)")
-            lines.append("flow_result_text = _agnolab_workflow_result_text(result)")
-        elif producer_node and producer_node.type == NodeType.TOOL and producer_symbol:
-            lines.append(f"result = {producer_symbol}(flow_input)")
-            lines.append("flow_result_text = str(result) if result is not None else ''")
-        elif producer_node and producer_node.type in {NodeType.INPUT, *QUEUE_INPUT_NODE_TYPES}:
-            lines.append("flow_result_text = str(flow_input_payload.get('text') or flow_input)")
-        else:
-            warnings.append("Output node has no valid upstream producer.")
-            lines.append("flow_result_text = str(flow_input_payload.get('text') or flow_input)")
-
-        if condition_expression:
-            lines.extend(render_condition_gate(condition_expression))
-
-        lines.append(f"print({python_literal(RESULT_START_MARKER)})")
-        lines.append("print(flow_result_text)")
-        lines.append(f"print({python_literal(RESULT_END_MARKER)})")
-
-        if output_node.type == NodeType.OUTPUT_API:
-            output_lines, output_warnings = render_output_api_dispatch(output_node, project_name=graph.project.name)
-            lines.extend(output_lines)
-            warnings.extend(output_warnings)
-        elif output_node.type in QUEUE_OUTPUT_NODE_TYPES:
-            warnings.append(
-                f"Queue output node '{output_node.data.name}' is dispatched when the flow runs through AgnoLab, "
-                "but the exported standalone script does not publish to it yet."
-            )
-    else:
-        executable_types = {NodeType.AGENT, NodeType.TEAM, NodeType.WORKFLOW, NodeType.TOOL}
-        executable_nodes = [node for node in ordered_nodes if node.type in executable_types]
-
-        inferred_producer_node: GraphNode | None = None
-        for candidate in reversed(executable_nodes):
-            has_executable_downstream = any(
-                edge.source == candidate.id
-                and node_map.get(edge.target)
-                and node_map[edge.target].type in executable_types
-                for edge in graph.edges
-            )
-            if not has_executable_downstream:
-                inferred_producer_node = candidate
-                break
-
-        if inferred_producer_node is None and executable_nodes:
-            inferred_producer_node = executable_nodes[-1]
-
-        inferred_symbol = symbol_map.get(inferred_producer_node.id) if inferred_producer_node else None
-        if inferred_producer_node and inferred_producer_node.type in {NodeType.AGENT, NodeType.TEAM} and inferred_symbol:
-            warnings.append(
-                f"No output node found; inferring flow result from '{inferred_producer_node.data.name}' to support runtime integrations."
-            )
-            lines.append(f"result = _agnolab_run_with_debug({inferred_symbol}, flow_input, _agnolab_media_kwargs)")
-            lines.append("flow_result_text = result.content if result is not None else ''")
-        elif inferred_producer_node and inferred_producer_node.type == NodeType.WORKFLOW and inferred_symbol:
-            warnings.append(
-                f"No output node found; inferring flow result from workflow '{inferred_producer_node.data.name}' to support runtime integrations."
-            )
-            lines.append(f"result = _agnolab_run_workflow_with_debug({inferred_symbol}, flow_input, _agnolab_media_kwargs)")
-            lines.append("flow_result_text = _agnolab_workflow_result_text(result)")
-        elif inferred_producer_node and inferred_producer_node.type == NodeType.TOOL and inferred_symbol:
-            warnings.append(
-                f"No output node found; inferring flow result from Tool '{inferred_producer_node.data.name}' to support runtime integrations."
-            )
-            lines.append(f"result = {inferred_symbol}(flow_input)")
-            lines.append("flow_result_text = str(result) if result is not None else ''")
-        else:
-            warnings.append("No output node found; preview uses the raw flow input.")
-            lines.append("flow_result_text = str(flow_input_payload.get('text') or flow_input)")
-
-        lines.append(f"print({python_literal(RESULT_START_MARKER)})")
-        lines.append("print(flow_result_text)")
-        lines.append(f"print({python_literal(RESULT_END_MARKER)})")
+    run_lines, run_warnings = render_flow_run_block(graph, node_map, symbol_map, ordered_nodes, terminal_nodes)
+    lines.extend(run_lines)
+    warnings.extend(run_warnings)
 
     full_code = "\n".join(import_lines + lines).strip() + "\n"
     return full_code, warnings
