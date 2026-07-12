@@ -86,7 +86,7 @@ QUEUE_OUTPUT_NODE_TYPES = {
 }
 
 
-def _detect_project_root() -> Path:
+def detect_project_root() -> Path:
     current = Path(__file__).resolve()
     markers = ("docker-compose.dev.yml", "docker-compose.yml", "README.md")
 
@@ -100,7 +100,7 @@ def _detect_project_root() -> Path:
     return current.parent
 
 
-PROJECT_ROOT = _detect_project_root()
+PROJECT_ROOT = detect_project_root()
 
 DEBUG_TRACE_HELPERS = [
     "def _agnolab_build_media_kwargs(flow_input_files):",

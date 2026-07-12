@@ -25,7 +25,13 @@ from fastapi.responses import HTMLResponse
 from starlette.datastructures import UploadFile as StarletteUploadFile
 
 from .builtin_tools import inspect_builtin_tool_functions
-from .compiler import collect_graph_runtime_secrets, compile_graph
+from .compiler import (
+    QUEUE_INPUT_NODE_TYPES,
+    QUEUE_OUTPUT_NODE_TYPES,
+    collect_graph_runtime_secrets,
+    compile_graph,
+    detect_project_root,
+)
 from .email_listener import EmailListenerManager
 from .executor import run_generated_code
 from .exporter import export_project
@@ -146,24 +152,6 @@ _recent_whatsapp_events: dict[str, float] = {}
 _flow_runtime_lock = threading.Lock()
 _flow_runtime_stats_by_name: dict[str, dict[str, object]] = {}
 
-QUEUE_INPUT_NODE_TYPES = {
-    NodeType.RABBITMQ_INPUT,
-    NodeType.KAFKA_INPUT,
-    NodeType.REDIS_INPUT,
-    NodeType.NATS_INPUT,
-    NodeType.SQS_INPUT,
-    NodeType.PUBSUB_INPUT,
-}
-
-QUEUE_OUTPUT_NODE_TYPES = {
-    NodeType.RABBITMQ_OUTPUT,
-    NodeType.KAFKA_OUTPUT,
-    NodeType.REDIS_OUTPUT,
-    NodeType.NATS_OUTPUT,
-    NodeType.SQS_OUTPUT,
-    NodeType.PUBSUB_OUTPUT,
-}
-
 
 def _runtime_timestamp_now() -> str:
     return datetime.now(UTC).isoformat()
@@ -244,25 +232,12 @@ def _list_flow_runtime_statuses(flow_name: str | None = None) -> list[FlowRuntim
     return statuses
 
 
-def _detect_project_root() -> Path:
-    current = Path(__file__).resolve()
-    markers = ("docker-compose.dev.yml", "docker-compose.yml", "README.md")
-
-    for parent in current.parents:
-        if any((parent / marker).exists() for marker in markers) or (parent / "apps").is_dir():
-            return parent
-
-    if current.parent.name == "app":
-        return current.parent.parent
-
-    return current.parent
-
-
-PROJECT_ROOT = _detect_project_root()
+PROJECT_ROOT = detect_project_root()
 SKILL_DISCOVERY_ROOTS = [
     ("repo", PROJECT_ROOT / "examples/skills"),
     ("user", Path.home() / ".agents/skills"),
 ]
+
 
 def _resolve_cors_origins() -> tuple[list[str], bool]:
     """Resolve allowed CORS origins from ``AGNOLAB_CORS_ORIGINS``.
