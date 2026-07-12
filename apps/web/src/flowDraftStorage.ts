@@ -1,6 +1,6 @@
 // Per-route flow draft persistence in localStorage. Extracted from App.tsx.
 
-import { CanvasGraph } from "./types";
+import type { CanvasGraph } from "./types";
 
 const FLOW_DRAFT_STORAGE_KEY_PREFIX = "agnolab.flow_draft.v1:";
 
