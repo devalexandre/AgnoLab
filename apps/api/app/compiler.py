@@ -629,8 +629,25 @@ def get_node_provider_id(node: GraphNode) -> str:
     return normalize_provider_id(str(provider_value))
 
 
+def _provider_extra_env_items(provider_config: dict[str, object]) -> list[tuple[str, str]]:
+    raw = provider_config.get("provider_env_json")
+    items: list[tuple[str, str]] = []
+    if isinstance(raw, str) and raw.strip():
+        parsed = parse_json_if_needed(raw)
+        if isinstance(parsed, dict):
+            for key, value in parsed.items():
+                if value in (None, ""):
+                    continue
+                items.append((str(key), str(value)))
+    return items
+
+
+def email_password_env_name(node_id: str) -> str:
+    return f"AGNOLAB_EMAIL_PASSWORD_{sanitize_identifier(node_id)}"
+
+
 def collect_provider_runtime_env(graph: CanvasGraph) -> dict[str, str]:
-    """Collect provider API-key secrets from the graph, keyed by env var name.
+    """Collect provider secrets (API keys + extra env values) keyed by env var name.
 
     These are injected into the code runner's environment at execution time so the
     generated source (which reads them via os.getenv) never contains the secrets.
@@ -643,6 +660,27 @@ def collect_provider_runtime_env(graph: CanvasGraph) -> dict[str, str]:
         env_name, value = resolve_api_key_env_and_value(get_node_provider_id(node), provider_config)
         if env_name and value:
             runtime_env[env_name] = value
+        for key, extra_value in _provider_extra_env_items(provider_config):
+            runtime_env[key] = extra_value
+    return runtime_env
+
+
+def collect_email_password_env(graph: CanvasGraph) -> dict[str, str]:
+    """Collect email passwords, keyed by a deterministic per-node env var name."""
+    runtime_env: dict[str, str] = {}
+    for node in graph.nodes:
+        extras = node.data.extras if isinstance(node.data.extras, dict) else {}
+        password = str(extras.get("emailPassword") or "")
+        if password:
+            runtime_env[email_password_env_name(node.id)] = password
+    return runtime_env
+
+
+def collect_graph_runtime_secrets(graph: CanvasGraph) -> dict[str, str]:
+    """Aggregate every user-supplied secret routed through the runner environment."""
+    runtime_env: dict[str, str] = {}
+    runtime_env.update(collect_provider_runtime_env(graph))
+    runtime_env.update(collect_email_password_env(graph))
     return runtime_env
 
 
@@ -652,22 +690,14 @@ def build_provider_env_setup(node: GraphNode) -> list[str]:
 
     base_url_env_var = str(provider_config.get("provider_base_url_env") or (definition.base_url_env if definition else "") or "").strip()
     base_url_value = str(provider_config.get("provider_base_url") or "").strip()
-    extra_env_raw = provider_config.get("provider_env_json")
 
     lines: list[str] = []
-    # The API key is intentionally NOT written here: it is read via os.getenv() in
-    # the model constructor and injected into the runner env at execution time so it
-    # never lands in generated/exported source. See collect_provider_runtime_env.
+    # Secrets are intentionally NOT written here. The API key is read via os.getenv()
+    # in the model constructor, and extra provider env values (provider_env_json) are
+    # injected into the runner env at execution time — neither lands in generated or
+    # exported source. See collect_provider_runtime_env. base_url is not a secret.
     if base_url_env_var and base_url_value:
         lines.append(f"os.environ[{python_literal(base_url_env_var)}] = {python_literal(base_url_value)}")
-
-    if isinstance(extra_env_raw, str) and extra_env_raw.strip():
-        parsed = parse_json_if_needed(extra_env_raw)
-        if isinstance(parsed, dict):
-            for key, value in parsed.items():
-                if value in (None, ""):
-                    continue
-                lines.append(f"os.environ[{python_literal(str(key))}] = {python_literal(str(value))}")
 
     return lines
 
@@ -1810,7 +1840,8 @@ def render_input_payload(node: GraphNode) -> list[str]:
             "port": email_port,
             "mailbox": str(extras.get("emailMailbox") or "INBOX").strip() or "INBOX",
             "username": str(extras.get("emailUsername") or "").strip(),
-            "password": str(extras.get("emailPassword") or ""),
+            # Password is injected via the runner environment, never inlined here.
+            "password": "",
             "max_messages": email_max_messages,
             "unread_only": normalize_bool(extras.get("emailUnreadOnly"), True if email_protocol == "imap" else False),
             "subject_filter": str(extras.get("emailSubjectFilter") or "").strip(),
@@ -1831,6 +1862,7 @@ def render_input_payload(node: GraphNode) -> list[str]:
             "flow_input_files = []",
             f"flow_input_metadata = {python_literal(metadata_payload)}",
             f"_agnolab_email_config = {python_literal(email_config)}",
+            f"_agnolab_email_config['password'] = os.getenv({python_literal(email_password_env_name(node.id))}, '')",
             "",
             "def _agnolab_decode_email_header(value):",
             "    if not value:",
@@ -2434,7 +2466,7 @@ def render_output_api_dispatch(node: GraphNode, *, project_name: str) -> tuple[l
                 f"_agnolab_email_port = {email_port}",
                 f"_agnolab_email_security = {python_literal(email_security)}",
                 f"_agnolab_email_username = {python_literal(str(extras.get('emailUsername') or '').strip())}",
-                f"_agnolab_email_password = {python_literal(str(extras.get('emailPassword') or ''))}",
+                f"_agnolab_email_password = os.getenv({python_literal(email_password_env_name(node.id))}, '')",
                 f"_agnolab_email_from = {python_literal(email_from)}",
                 f"_agnolab_email_to = {python_literal(email_to)}",
                 f"_agnolab_email_cc = {python_literal(str(extras.get('emailCc') or '').strip())}",

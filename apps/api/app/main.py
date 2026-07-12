@@ -22,7 +22,7 @@ from fastapi.responses import HTMLResponse
 from starlette.datastructures import UploadFile as StarletteUploadFile
 
 from .builtin_tools import inspect_builtin_tool_functions
-from .compiler import collect_provider_runtime_env, compile_graph
+from .compiler import collect_graph_runtime_secrets, compile_graph
 from .email_listener import EmailListenerManager
 from .executor import run_generated_code
 from .exporter import export_project
@@ -658,8 +658,9 @@ def get_graph_execution_timeout_seconds(graph: CanvasGraph) -> float:
 
 
 def get_graph_runtime_env(graph: CanvasGraph) -> dict[str, str]:
-    # Provider API-key secrets are injected here (not inlined into generated code).
-    resolved_env: dict[str, str] = collect_provider_runtime_env(graph)
+    # User-supplied secrets (provider keys/env, email passwords) are injected here,
+    # not inlined into generated code.
+    resolved_env: dict[str, str] = collect_graph_runtime_secrets(graph)
 
     runtime = getattr(graph.project, "runtime", None)
     env_items = getattr(runtime, "envVars", []) if runtime is not None else []
