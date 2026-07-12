@@ -1,6 +1,13 @@
 import { type ChangeEvent, type MouseEvent as ReactMouseEvent, type WheelEvent as ReactWheelEvent, Suspense, lazy, useEffect, useMemo, useRef, useState } from "react";
 import { API_BASE, deleteFlowByName, fetchCanvasTemplate, fetchDefaultGraph, fetchFlowByName, fetchQueueSubscriberStatus, fetchWhatsappSessionStatus, listBuiltInToolFunctions, listCanvasTemplates, listFlowRuntimeStatuses, listFlows, listOllamaModels, listSkillPaths, previewCode, runFlowByName, runGraph, saveFlow, startQueueSubscriber, startWhatsappSession, stopQueueSubscriber, stopWhatsappSession } from "./api";
 import { AGENT_FIELDS, AGENT_FIELD_GROUPS, AGNO_MODEL_PROVIDER_OPTIONS, type AgentFieldDefinition } from "./agentConfig";
+import {
+  buildFlowDraftRouteKey,
+  clearFlowDraftFromStorage,
+  type FlowDraftStorageRecord,
+  loadFlowDraftFromStorage,
+  saveFlowDraftToStorage,
+} from "./flowDraftStorage";
 import { MarkdownRenderer } from "./markdown";
 import type { MonacoToolEditorProps } from "./MonacoToolEditor";
 
@@ -24,7 +31,6 @@ import { ToolIcon, toolIconColor } from "./toolIcons";
 import { BuiltInToolFunctionOption, CanvasGraph, CanvasTemplateSummary, FlowRuntimeStatus, FlowSummary, GraphEdge, GraphNode, NodeData, NodeType, Position, ProjectRuntimeConfig, ProjectRuntimeEnvVar, QueueSubscriberStatus, RunResult, SaveFlowResponse, SavedUserTool, SkillPathOption, StarterToolTemplate, WhatsappSessionStatus } from "./types";
 
 const MY_TOOLS_STORAGE_KEY = "agnolab.my_tools";
-const FLOW_DRAFT_STORAGE_KEY_PREFIX = "agnolab.flow_draft.v1:";
 const FLOW_AUTOSAVE_DELAY_MS = 1200;
 const NODE_WIDTH = 180;
 const NODE_MIN_HEIGHT = 80;
@@ -130,80 +136,6 @@ interface ChatMessage {
   role: "user" | "assistant";
   text: string;
   attachmentName?: string;
-}
-
-interface FlowDraftStorageRecord {
-  flowName: string;
-  graph: CanvasGraph;
-  updatedAt: string;
-}
-
-function buildFlowDraftRouteKey(routeFlowName: string | null, routeTemplateId: string | null): string | null {
-  if (!routeFlowName) {
-    return null;
-  }
-  if (routeFlowName === "new" && routeTemplateId) {
-    return `new::template:${routeTemplateId}`;
-  }
-  return routeFlowName;
-}
-
-function buildFlowDraftStorageKey(routeKey: string): string {
-  return `${FLOW_DRAFT_STORAGE_KEY_PREFIX}${routeKey}`;
-}
-
-function isCanvasGraph(value: unknown): value is CanvasGraph {
-  if (!value || typeof value !== "object") {
-    return false;
-  }
-  const candidate = value as Partial<CanvasGraph>;
-  return Boolean(candidate.project) && Array.isArray(candidate.nodes) && Array.isArray(candidate.edges);
-}
-
-function loadFlowDraftFromStorage(routeKey: string | null): FlowDraftStorageRecord | null {
-  if (!routeKey) {
-    return null;
-  }
-  try {
-    const rawValue = window.localStorage.getItem(buildFlowDraftStorageKey(routeKey));
-    if (!rawValue) {
-      return null;
-    }
-    const parsed = JSON.parse(rawValue) as Partial<FlowDraftStorageRecord>;
-    if (!parsed || typeof parsed.flowName !== "string" || !isCanvasGraph(parsed.graph)) {
-      return null;
-    }
-    return {
-      flowName: parsed.flowName,
-      graph: parsed.graph,
-      updatedAt: typeof parsed.updatedAt === "string" ? parsed.updatedAt : "",
-    };
-  } catch (error) {
-    console.error(error);
-    return null;
-  }
-}
-
-function saveFlowDraftToStorage(routeKey: string | null, draft: FlowDraftStorageRecord) {
-  if (!routeKey) {
-    return;
-  }
-  try {
-    window.localStorage.setItem(buildFlowDraftStorageKey(routeKey), JSON.stringify(draft));
-  } catch (error) {
-    console.error(error);
-  }
-}
-
-function clearFlowDraftFromStorage(routeKey: string | null) {
-  if (!routeKey) {
-    return;
-  }
-  try {
-    window.localStorage.removeItem(buildFlowDraftStorageKey(routeKey));
-  } catch (error) {
-    console.error(error);
-  }
 }
 
 interface LibraryFeatureCard {
