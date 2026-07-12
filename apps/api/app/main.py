@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hmac
 import html
 import json
+import logging
 import os
 import re
 import threading
@@ -14,13 +16,13 @@ from typing import Any
 
 import requests
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 from starlette.datastructures import UploadFile as StarletteUploadFile
 
 from .builtin_tools import inspect_builtin_tool_functions
-from .compiler import compile_graph
+from .compiler import collect_provider_runtime_env, compile_graph
 from .email_listener import EmailListenerManager
 from .executor import run_generated_code
 from .exporter import export_project
@@ -58,7 +60,57 @@ from .whatsapp_gateway import WhatsappGatewayClient, normalize_whatsapp_session_
 
 load_dotenv()
 
-app = FastAPI(title="AgnoLab API", version="0.1.0")
+logger = logging.getLogger("agnolab")
+
+# Paths that never require the global API key: liveness/UI plus the external
+# trigger endpoints, which authenticate per-flow via a bearer token instead.
+_AUTH_EXEMPT_EXACT = {"/", "/health"}
+_AUTH_EXEMPT_PATTERNS = (
+    re.compile(r"^/api/flows/run/?$"),
+    re.compile(r"^/api/integrations/form/[^/]+/[^/]+/?$"),
+    re.compile(r"^/api/integrations/whatsapp/[^/]+/[^/]+/events/?$"),
+)
+
+
+def get_configured_api_key() -> str:
+    return str(os.getenv("AGNOLAB_API_KEY") or "").strip()
+
+
+def _extract_request_api_key(request: Request) -> str:
+    header_key = request.headers.get("x-api-key", "").strip()
+    if header_key:
+        return header_key
+    authorization = request.headers.get("authorization", "").strip()
+    scheme, _, token = authorization.partition(" ")
+    if scheme.lower() == "bearer":
+        return token.strip()
+    return ""
+
+
+def require_api_key(request: Request) -> None:
+    """Global gate: require ``AGNOLAB_API_KEY`` on management/build endpoints.
+
+    When the env var is unset the gate is disabled (single-user local dev). This
+    protects the otherwise-unauthenticated code generation and execution
+    endpoints, which are the arbitrary-code-execution surface.
+    """
+    configured = get_configured_api_key()
+    if not configured:
+        return
+
+    if request.method == "OPTIONS":
+        return
+
+    path = request.url.path
+    if path in _AUTH_EXEMPT_EXACT or any(pattern.match(path) for pattern in _AUTH_EXEMPT_PATTERNS):
+        return
+
+    provided = _extract_request_api_key(request)
+    if not provided or not hmac.compare_digest(provided, configured):
+        raise HTTPException(status_code=401, detail="Missing or invalid API key.")
+
+
+app = FastAPI(title="AgnoLab API", version="0.1.0", dependencies=[Depends(require_api_key)])
 
 DEFAULT_GENERATED_CODE_TIMEOUT_SECONDS = 20.0
 RESULT_START_MARKER = "__AGNO_RESULT_START__"
@@ -277,6 +329,11 @@ def discover_skill_paths() -> list[SkillPathOption]:
 
 @app.on_event("startup")
 def start_email_listener_service() -> None:
+    if not get_configured_api_key():
+        logger.warning(
+            "AGNOLAB_API_KEY is not set: the code generation and execution endpoints "
+            "are unauthenticated. Set AGNOLAB_API_KEY before exposing this API beyond localhost."
+        )
     email_listener_manager.start()
     queue_subscriber_manager.start()
 
@@ -601,9 +658,11 @@ def get_graph_execution_timeout_seconds(graph: CanvasGraph) -> float:
 
 
 def get_graph_runtime_env(graph: CanvasGraph) -> dict[str, str]:
+    # Provider API-key secrets are injected here (not inlined into generated code).
+    resolved_env: dict[str, str] = collect_provider_runtime_env(graph)
+
     runtime = getattr(graph.project, "runtime", None)
     env_items = getattr(runtime, "envVars", []) if runtime is not None else []
-    resolved_env: dict[str, str] = {}
 
     for item in env_items:
         key = str(getattr(item, "key", "") or "").strip()

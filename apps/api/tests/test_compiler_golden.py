@@ -92,15 +92,21 @@ def _inject_api_key(graph, secret: str) -> None:
     raise AssertionError("no agent node found to inject a key into")
 
 
-@pytest.mark.xfail(
-    reason="KNOWN SECURITY ISSUE: provider API keys are inlined as literals into "
-    "generated code (compiler.py build_provider_env_setup / model constructor). "
-    "Remove the xfail once codegen reads keys from the environment only.",
-    strict=True,
-)
 def test_api_key_is_not_inlined_into_generated_code() -> None:
     secret = "sk-GOLDEN-SECRET-should-never-appear"
     graph = build_base_graph()
     _inject_api_key(graph, secret)
     code, _ = compile_graph(graph)
     assert secret not in code
+    # The key must instead be read from the environment.
+    assert "os.getenv('OPENAI_API_KEY')" in code
+
+
+def test_provider_secret_is_routed_through_runtime_env() -> None:
+    from app.compiler import collect_provider_runtime_env
+
+    secret = "sk-ROUTED-SECRET"
+    graph = build_base_graph()
+    _inject_api_key(graph, secret)
+    runtime_env = collect_provider_runtime_env(graph)
+    assert runtime_env.get("OPENAI_API_KEY") == secret

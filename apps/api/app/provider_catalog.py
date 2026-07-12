@@ -756,6 +756,30 @@ def _render_kwargs(arguments: list[tuple[str, str]]) -> str:
     return ", ".join(f"{name}={value}" for name, value in arguments if value is not None)
 
 
+def resolve_api_key_env_and_value(
+    provider_id: str | None,
+    provider_config: dict[str, Any] | None,
+) -> tuple[str | None, str]:
+    """Return the (env var name, secret value) for a provider's API key.
+
+    The generated code always reads the key via ``os.getenv(<env name>)`` and the
+    value is injected into the runner's environment at execution time, so secrets
+    are never written into generated/exported source. When the user supplies a key
+    value without naming an env var, a stable name is synthesized so the value can
+    still be routed through the environment instead of being inlined.
+    """
+    definition = get_provider_definition(provider_id)
+    if definition is None or not definition.api_key_param:
+        return None, ""
+
+    config = provider_config if isinstance(provider_config, dict) else {}
+    api_key_env = str(config.get("provider_api_key_env") or definition.api_key_env or "").strip() or None
+    api_key_value = str(config.get("provider_api_key") or "").strip()
+    if not api_key_env and api_key_value:
+        api_key_env = f"{(normalize_provider_id(provider_id) or 'provider').upper()}_API_KEY"
+    return api_key_env, api_key_value
+
+
 def render_provider_model_expression(
     provider_id: str | None,
     model_name: str | None,
@@ -801,10 +825,11 @@ def render_provider_model_expression(
         else:
             kwargs.append(("temperature", python_literal(temperature)))
 
-    api_key_env = str(config.get("provider_api_key_env") or definition.api_key_env or "").strip() or None
-    api_key_expr = _config_value(config, "provider_api_key", api_key_env)
-    if definition.api_key_param and api_key_expr is not None:
-        kwargs.append((definition.api_key_param, api_key_expr))
+    # Never inline the API key value: emit an os.getenv() lookup and inject the
+    # actual value into the runner env at execution time (see resolve_api_key_env_and_value).
+    api_key_env, _api_key_value = resolve_api_key_env_and_value(provider_id, config)
+    if definition.api_key_param and api_key_env:
+        kwargs.append((definition.api_key_param, f"os.getenv({python_literal(api_key_env)})"))
 
     base_url_env = str(config.get("provider_base_url_env") or definition.base_url_env or "").strip() or None
     base_url_expr = _config_value(config, "provider_base_url", base_url_env, definition.base_url)

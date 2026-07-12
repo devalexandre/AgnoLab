@@ -11,7 +11,12 @@ from jinja2 import Template
 
 from .builtin_tools import inspect_builtin_tool_functions
 from .models import CanvasGraph, GraphNode, NodeType, TargetRuntime
-from .provider_catalog import get_provider_definition, normalize_provider_id, render_provider_model_expression
+from .provider_catalog import (
+    get_provider_definition,
+    normalize_provider_id,
+    render_provider_model_expression,
+    resolve_api_key_env_and_value,
+)
 
 AGENT_TEMPLATE = Template(
     """{{ var_name }} = Agent(
@@ -499,6 +504,53 @@ def incoming_ids(graph: CanvasGraph, node_id: str) -> list[str]:
     return [edge.source for edge in graph.edges if edge.target == node_id]
 
 
+def outgoing_ids(graph: CanvasGraph, node_id: str) -> list[str]:
+    return [edge.target for edge in graph.edges if edge.source == node_id]
+
+
+CONDITION_PRODUCER_TYPES = {NodeType.AGENT, NodeType.TEAM, NodeType.WORKFLOW, NodeType.TOOL}
+
+
+def resolve_condition_producer(
+    graph: CanvasGraph,
+    node_map: dict[str, GraphNode],
+    condition_node: GraphNode,
+) -> GraphNode | None:
+    """Return the real producer (agent/team/workflow/tool) feeding a condition node.
+
+    A condition node routes an upstream result, so the executable producer sits
+    behind it. Returns None when no compilable producer is connected.
+    """
+    for source_id in incoming_ids(graph, condition_node.id):
+        source = node_map.get(source_id)
+        if source and source.type in CONDITION_PRODUCER_TYPES:
+            return source
+    return None
+
+
+def get_condition_expression(condition_node: GraphNode) -> str:
+    return str(getattr(condition_node.data, "condition", "") or "").strip()
+
+
+def render_condition_gate(expression: str) -> list[str]:
+    """Emit code that gates the flow result on a condition rule.
+
+    The rule is evaluated with ``resultado`` (the upstream result text) in scope.
+    A false rule blanks the result; an invalid rule is reported and treated as
+    not met rather than crashing the run.
+    """
+    return [
+        "resultado = flow_result_text",
+        "try:",
+        f"    _agnolab_condition_met = bool({expression})",
+        "except Exception as _agnolab_condition_error:",
+        "    print(f'[condition] rule evaluation failed: {_agnolab_condition_error}')",
+        "    _agnolab_condition_met = False",
+        "if not _agnolab_condition_met:",
+        "    flow_result_text = ''",
+    ]
+
+
 def python_literal(value):
     return repr(value)
 
@@ -577,19 +629,35 @@ def get_node_provider_id(node: GraphNode) -> str:
     return normalize_provider_id(str(provider_value))
 
 
+def collect_provider_runtime_env(graph: CanvasGraph) -> dict[str, str]:
+    """Collect provider API-key secrets from the graph, keyed by env var name.
+
+    These are injected into the code runner's environment at execution time so the
+    generated source (which reads them via os.getenv) never contains the secrets.
+    """
+    runtime_env: dict[str, str] = {}
+    for node in graph.nodes:
+        provider_config = get_node_provider_config(node)
+        if not provider_config:
+            continue
+        env_name, value = resolve_api_key_env_and_value(get_node_provider_id(node), provider_config)
+        if env_name and value:
+            runtime_env[env_name] = value
+    return runtime_env
+
+
 def build_provider_env_setup(node: GraphNode) -> list[str]:
     provider_config = get_node_provider_config(node)
     definition = get_provider_definition(get_node_provider_id(node))
 
-    api_key_env_var = str(provider_config.get("provider_api_key_env") or (definition.api_key_env if definition else "") or "").strip()
-    api_key_value = str(provider_config.get("provider_api_key") or "").strip()
     base_url_env_var = str(provider_config.get("provider_base_url_env") or (definition.base_url_env if definition else "") or "").strip()
     base_url_value = str(provider_config.get("provider_base_url") or "").strip()
     extra_env_raw = provider_config.get("provider_env_json")
 
     lines: list[str] = []
-    if api_key_env_var and api_key_value:
-        lines.append(f"os.environ[{python_literal(api_key_env_var)}] = {python_literal(api_key_value)}")
+    # The API key is intentionally NOT written here: it is read via os.getenv() in
+    # the model constructor and injected into the runner env at execution time so it
+    # never lands in generated/exported source. See collect_provider_runtime_env.
     if base_url_env_var and base_url_value:
         lines.append(f"os.environ[{python_literal(base_url_env_var)}] = {python_literal(base_url_value)}")
 
@@ -3332,11 +3400,13 @@ def compile_graph(graph: CanvasGraph) -> tuple[str, list[str]]:
                 NodeType.TEAM,
                 NodeType.WORKFLOW,
                 NodeType.TOOL,
+                NodeType.CONDITION,
             }
         ]
 
         if len(upstream) > 1:
             node_type_priority = {
+                NodeType.CONDITION: 0,
                 NodeType.AGENT: 0,
                 NodeType.TEAM: 1,
                 NodeType.WORKFLOW: 2,
@@ -3359,6 +3429,30 @@ def compile_graph(graph: CanvasGraph) -> tuple[str, list[str]]:
 
         producer_node = node_map.get(upstream[0]) if upstream else None
         producer_symbol = symbol_map.get(upstream[0]) if upstream else None
+
+        # A condition node gates an upstream producer's result. Resolve the real
+        # producer behind it and apply the rule as a runtime gate on the result.
+        condition_expression = ""
+        if producer_node and producer_node.type == NodeType.CONDITION:
+            condition_node = producer_node
+            condition_expression = get_condition_expression(condition_node)
+            if len(outgoing_ids(graph, condition_node.id)) > 1:
+                warnings.append(
+                    f"Condition node '{condition_node.data.name}' has multiple downstream targets; "
+                    "branching to different targets is not supported yet, so the rule only gates the single flow result."
+                )
+            resolved_producer = resolve_condition_producer(graph, node_map, condition_node)
+            if resolved_producer is None:
+                warnings.append(
+                    f"Condition node '{condition_node.data.name}' has no agent/team/workflow/tool producer upstream; "
+                    "the rule cannot be evaluated."
+                )
+                producer_node = None
+                producer_symbol = None
+            else:
+                producer_node = resolved_producer
+                producer_symbol = symbol_map.get(resolved_producer.id)
+
         if producer_node and producer_node.type in {NodeType.AGENT, NodeType.TEAM} and producer_symbol:
             lines.append(f"result = _agnolab_run_with_debug({producer_symbol}, flow_input, _agnolab_media_kwargs)")
             lines.append("flow_result_text = result.content if result is not None else ''")
@@ -3373,6 +3467,9 @@ def compile_graph(graph: CanvasGraph) -> tuple[str, list[str]]:
         else:
             warnings.append("Output node has no valid upstream producer.")
             lines.append("flow_result_text = str(flow_input_payload.get('text') or flow_input)")
+
+        if condition_expression:
+            lines.extend(render_condition_gate(condition_expression))
 
         lines.append(f"print({python_literal(RESULT_START_MARKER)})")
         lines.append("print(flow_result_text)")
