@@ -30,6 +30,10 @@ dev = [
   "pytest>=8.0,<9",
   "ruff==0.15.21",
   "mypy==1.18.2",
+  # Needed by the test that EXECUTES generated serve code: the sample graphs build an
+  # OpenAIChat model, so constructing them requires the openai SDK. Real deployments
+  # install the full requirements.txt, which already includes it.
+  "openai",
 ]
 
 [build-system]

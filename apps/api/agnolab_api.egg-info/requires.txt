@@ -14,3 +14,4 @@ cryptography>=41.0
 pytest<9,>=8.0
 ruff==0.15.21
 mypy==1.18.2
+openai
