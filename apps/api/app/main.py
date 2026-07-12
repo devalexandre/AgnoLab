@@ -54,6 +54,7 @@ from .models import (
     WhatsappSessionStatus,
     WhatsappWebhookDispatchResponse,
 )
+from .provider_catalog import known_provider_credential_env_names
 from .queue_subscriber import QueueSubscriberManager, extract_queue_subscriber_configs
 from .sample_graph import build_sample_graph, get_canvas_template, list_canvas_templates
 from .whatsapp_gateway import WhatsappGatewayClient, normalize_whatsapp_session_id
@@ -493,6 +494,7 @@ def run_code(request: CodegenRequest) -> RunResult:
         code,
         extra_env=get_graph_runtime_env(graph),
         timeout_seconds=get_graph_execution_timeout_seconds(graph),
+        forward_env_names=known_provider_credential_env_names(),
     )
     tagged_clean_stdout, stripped_stdout = extract_tagged_flow_result(stdout)
     clean_stdout = tagged_clean_stdout or extract_agent_response(stdout)

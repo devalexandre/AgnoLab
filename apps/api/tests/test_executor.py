@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import time
 
-from app.executor import _max_timeout_seconds, run_generated_code
+from app.executor import _build_subprocess_env, _max_timeout_seconds, run_generated_code
 
 
 def test_runs_simple_program() -> None:
@@ -42,3 +42,31 @@ def test_max_timeout_env_is_honored(monkeypatch) -> None:
 def test_max_timeout_falls_back_on_bad_value(monkeypatch) -> None:
     monkeypatch.setenv("AGNOLAB_MAX_EXECUTION_SECONDS", "not-a-number")
     assert _max_timeout_seconds() == 300.0
+
+
+def test_default_env_inherits_host(monkeypatch) -> None:
+    monkeypatch.delenv("AGNOLAB_ISOLATE_ENV", raising=False)
+    monkeypatch.setenv("UNRELATED_HOST_SECRET", "leak-me")
+    env = _build_subprocess_env({"FLOW_SECRET": "v"}, None, {"OPENAI_API_KEY"})
+    # Backwards-compatible default: full host env is inherited.
+    assert env.get("UNRELATED_HOST_SECRET") == "leak-me"
+    assert env.get("FLOW_SECRET") == "v"
+
+
+def test_isolated_env_drops_unrelated_secrets(monkeypatch) -> None:
+    monkeypatch.setenv("AGNOLAB_ISOLATE_ENV", "1")
+    monkeypatch.setenv("UNRELATED_HOST_SECRET", "leak-me")
+    monkeypatch.setenv("OPENAI_API_KEY", "ambient-key")
+    env = _build_subprocess_env({"FLOW_SECRET": "v"}, "ambient-key", {"OPENAI_API_KEY"})
+    assert "UNRELATED_HOST_SECRET" not in env
+    assert env.get("PATH") is not None  # system essentials survive
+    assert env.get("OPENAI_API_KEY") == "ambient-key"  # provider fallback preserved
+    assert env.get("FLOW_SECRET") == "v"  # injected flow secret present
+
+
+def test_isolated_env_honors_explicit_forward_list(monkeypatch) -> None:
+    monkeypatch.setenv("AGNOLAB_ISOLATE_ENV", "1")
+    monkeypatch.setenv("MY_CUSTOM_VAR", "keep-me")
+    monkeypatch.setenv("AGNOLAB_FORWARD_ENV", "MY_CUSTOM_VAR")
+    env = _build_subprocess_env(None, None, set())
+    assert env.get("MY_CUSTOM_VAR") == "keep-me"

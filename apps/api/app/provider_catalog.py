@@ -680,6 +680,23 @@ def _build_alias_map() -> dict[str, str]:
 
 PROVIDER_ALIAS_MAP = _build_alias_map()
 PROVIDER_DEFINITIONS_BY_ID = {definition.id: definition for definition in PROVIDER_DEFINITIONS}
+
+
+def known_provider_credential_env_names() -> set[str]:
+    """Every provider credential/config env var name known to the catalog.
+
+    Used by the executor's isolated-env mode to keep forwarding the documented
+    "leave credentials blank to fall back to the system environment" behavior even
+    while dropping unrelated host secrets.
+    """
+    names: set[str] = set()
+    for definition in PROVIDER_DEFINITIONS:
+        if definition.api_key_env:
+            names.add(definition.api_key_env)
+        if definition.base_url_env:
+            names.add(definition.base_url_env)
+        names.update(definition.extra_kwargs_env.values())
+    return names
 PROVIDER_PROFILE_OPTIONS = [{"label": f"{definition.name} ({definition.id})", "value": definition.id} for definition in PROVIDER_DEFINITIONS]
 PROVIDER_ID_OPTIONS = sorted(PROVIDER_ALIAS_MAP.keys())
 

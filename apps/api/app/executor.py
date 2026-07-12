@@ -172,11 +172,62 @@ def _terminate_process_tree(process: subprocess.Popen) -> None:
     process.kill()
 
 
+# Host env vars a generated flow legitimately needs to run: interpreter, locale,
+# TLS trust store, proxy, and temp-dir configuration. Everything else is dropped in
+# isolated mode so unrelated host secrets never reach the runner.
+SYSTEM_ESSENTIAL_ENV = (
+    "PATH", "HOME", "USER", "LOGNAME", "SHELL",
+    "LANG", "LANGUAGE", "LC_ALL", "LC_CTYPE", "TZ", "TERM",
+    "TMPDIR", "TMP", "TEMP",
+    "PYTHONPATH", "PYTHONHOME", "PYTHONUNBUFFERED", "PYTHONIOENCODING",
+    "VIRTUAL_ENV", "CONDA_PREFIX",
+    "SSL_CERT_FILE", "SSL_CERT_DIR", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE",
+    "SYSTEMROOT", "COMSPEC", "PATHEXT", "WINDIR",
+    "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY",
+    "http_proxy", "https_proxy", "no_proxy",
+)
+
+
+def _isolate_env_enabled() -> bool:
+    return os.getenv("AGNOLAB_ISOLATE_ENV", "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _extra_forward_env_names() -> set[str]:
+    raw = os.getenv("AGNOLAB_FORWARD_ENV", "")
+    return {name.strip() for name in raw.split(",") if name.strip()}
+
+
+def _build_subprocess_env(
+    extra_env: dict[str, str] | None,
+    effective_openai_key: str | None,
+    forward_env_names: set[str] | None,
+) -> dict[str, str]:
+    """Build the child process environment.
+
+    Default: inherit the full host environment (backwards compatible). When
+    AGNOLAB_ISOLATE_ENV is enabled, inherit only system essentials plus an explicit
+    allowlist (known provider credential vars + AGNOLAB_FORWARD_ENV), so unrelated
+    host secrets are not exposed to executed flow code.
+    """
+    if not _isolate_env_enabled():
+        env = os.environ.copy()
+    else:
+        allowed = set(SYSTEM_ESSENTIAL_ENV) | set(forward_env_names or set()) | _extra_forward_env_names()
+        env = {key: value for key, value in os.environ.items() if key in allowed}
+
+    if extra_env:
+        env.update(extra_env)
+    if effective_openai_key:
+        env["OPENAI_API_KEY"] = effective_openai_key
+    return env
+
+
 def run_generated_code(
     code: str,
     *,
     extra_env: dict[str, str] | None = None,
     timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
+    forward_env_names: set[str] | None = None,
 ) -> tuple[bool, str, str, int | None]:
     effective_openai_key = (extra_env or {}).get("OPENAI_API_KEY") or os.getenv("OPENAI_API_KEY")
 
@@ -199,11 +250,7 @@ def run_generated_code(
     with tempfile.TemporaryDirectory(prefix="agnolab-run-") as tmp_dir:
         script_path = Path(tmp_dir) / "main.py"
         script_path.write_text(code, encoding="utf-8")
-        env = os.environ.copy()
-        if extra_env:
-            env.update(extra_env)
-        if effective_openai_key:
-            env["OPENAI_API_KEY"] = effective_openai_key
+        env = _build_subprocess_env(extra_env, effective_openai_key, forward_env_names)
 
         # start_new_session=True puts the child in its own process group so that on
         # timeout we can kill the whole tree, not just the direct child.
