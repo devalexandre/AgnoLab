@@ -3020,6 +3020,178 @@ def render_agent_node(
     return lines, warnings
 
 
+def get_workflow_step_order(step_node: GraphNode) -> tuple[int, float, float, str]:
+    """Sort key for workflow steps: explicit step order, then canvas position, then name."""
+    extras = step_node.data.extras or {}
+    raw_order = extras.get("stepOrder")
+    try:
+        step_order = int(raw_order)
+    except (TypeError, ValueError):
+        step_order = 9999
+    return (
+        step_order,
+        step_node.position.x,
+        step_node.position.y,
+        step_node.data.name or step_node.id,
+    )
+
+
+def render_workflow_step_node(
+    node: GraphNode,
+    var_name: str,
+    graph: CanvasGraph,
+    node_map: dict[str, GraphNode],
+    symbol_map: dict[str, str],
+) -> tuple[list[str], list[str]]:
+    """Emit the definition for a single workflow-step node, resolving its executor."""
+    lines: list[str] = []
+    warnings: list[str] = []
+
+    incoming_source_ids = incoming_ids(graph, node.id)
+    connected_agent_ids = [
+        source_id
+        for source_id in incoming_source_ids
+        if source_id in symbol_map and node_map.get(source_id) and node_map[source_id].type == NodeType.AGENT
+    ]
+    connected_team_ids = [
+        source_id
+        for source_id in incoming_source_ids
+        if source_id in symbol_map and node_map.get(source_id) and node_map[source_id].type == NodeType.TEAM
+    ]
+    connected_tool_ids = [
+        source_id
+        for source_id in incoming_source_ids
+        if source_id in symbol_map and node_map.get(source_id) and node_map[source_id].type == NodeType.TOOL
+    ]
+    connected_builtin_tool_ids = [
+        source_id
+        for source_id in connected_tool_ids
+        if str((node_map[source_id].data.extras or {}).get("toolMode", "builtin")) == "builtin"
+    ]
+    connected_function_tool_ids = [
+        source_id
+        for source_id in connected_tool_ids
+        if source_id not in connected_builtin_tool_ids
+    ]
+    connected_agent_symbol = symbol_map[connected_agent_ids[0]] if connected_agent_ids else None
+    connected_team_symbol = symbol_map[connected_team_ids[0]] if connected_team_ids else None
+    connected_executor_symbol: str | None = None
+    primary_executor_label: str | None = None
+    primary_builtin_tool_id: str | None = None
+    if connected_agent_symbol:
+        primary_executor_label = "Agent"
+    elif connected_team_symbol:
+        primary_executor_label = "Team"
+    elif connected_function_tool_ids:
+        connected_executor_symbol = symbol_map[connected_function_tool_ids[0]]
+        primary_executor_label = "Function Tool"
+    elif connected_builtin_tool_ids:
+        primary_builtin_tool_id = connected_builtin_tool_ids[0]
+        primary_executor_label = "Built-in Tool"
+    additional_executor_labels: list[str] = []
+    if connected_agent_ids:
+        agent_labels = ["Agent" for _ in connected_agent_ids]
+        if primary_executor_label == "Agent":
+            additional_executor_labels.extend(agent_labels[1:])
+        else:
+            additional_executor_labels.extend(agent_labels)
+    if connected_team_ids:
+        team_labels = ["Team" for _ in connected_team_ids]
+        if primary_executor_label == "Team":
+            additional_executor_labels.extend(team_labels[1:])
+        else:
+            additional_executor_labels.extend(team_labels)
+    if connected_function_tool_ids:
+        tool_labels = ["Function Tool" for _ in connected_function_tool_ids]
+        if primary_executor_label == "Function Tool":
+            additional_executor_labels.extend(tool_labels[1:])
+        else:
+            additional_executor_labels.extend(tool_labels)
+    if connected_builtin_tool_ids:
+        tool_labels = ["Built-in Tool" for _ in connected_builtin_tool_ids]
+        if primary_executor_label == "Built-in Tool":
+            additional_executor_labels.extend(tool_labels[1:])
+        else:
+            additional_executor_labels.extend(tool_labels)
+    if primary_builtin_tool_id:
+        builtin_tool_var_name = sanitize_identifier(f"{var_name}_{primary_builtin_tool_id}_executor")
+        builtin_tool_lines, builtin_tool_warnings = build_builtin_tool_workflow_executor(
+            step_node=node,
+            tool_node=node_map[primary_builtin_tool_id],
+            tool_symbol=symbol_map[primary_builtin_tool_id],
+            executor_var_name=builtin_tool_var_name,
+        )
+        warnings.extend(builtin_tool_warnings)
+        if builtin_tool_lines:
+            lines.extend(builtin_tool_lines)
+            connected_executor_symbol = builtin_tool_var_name
+    step_kwargs, step_warnings = build_workflow_step_kwargs(
+        node,
+        agent_symbol=connected_agent_symbol,
+        team_symbol=connected_team_symbol,
+        executor_symbol=connected_executor_symbol,
+        executor_label=primary_executor_label,
+        additional_executor_labels=additional_executor_labels,
+    )
+    warnings.extend(step_warnings)
+    lines.append(
+        STEP_TEMPLATE.render(
+            var_name=var_name,
+            kwargs=step_kwargs,
+        ).rstrip()
+    )
+    lines.append("")
+    return lines, warnings
+
+
+def render_workflow_node(
+    node: GraphNode,
+    var_name: str,
+    graph: CanvasGraph,
+    node_map: dict[str, GraphNode],
+    symbol_map: dict[str, str],
+) -> tuple[list[str], list[str]]:
+    """Emit the definition for a single workflow node, wiring its ordered steps."""
+    lines: list[str] = []
+    warnings: list[str] = []
+
+    incoming_source_ids = incoming_ids(graph, node.id)
+    connected_db_symbol = next(
+        (
+            symbol_map[source_id]
+            for source_id in incoming_source_ids
+            if source_id in symbol_map and node_map.get(source_id) and node_map[source_id].type == NodeType.DATABASE
+        ),
+        None,
+    )
+    connected_step_nodes = sorted(
+        [
+            node_map[source_id]
+            for source_id in incoming_source_ids
+            if source_id in symbol_map and node_map.get(source_id) and node_map[source_id].type == NodeType.WORKFLOW_STEP
+        ],
+        key=get_workflow_step_order,
+    )
+    connected_step_symbols = [symbol_map[step_node.id] for step_node in connected_step_nodes if step_node.id in symbol_map]
+    if not connected_step_symbols:
+        warnings.append(f"Workflow '{node.data.name}' has no connected workflow steps.")
+    excluded_fields: set[str] = set()
+    if connected_db_symbol:
+        excluded_fields.add("db")
+    workflow_kwargs, workflow_warnings = build_workflow_kwargs(node, connected_step_symbols, excluded_fields)
+    warnings.extend(workflow_warnings)
+    if connected_db_symbol:
+        workflow_kwargs += f"\n    db={connected_db_symbol},"
+    lines.append(
+        WORKFLOW_TEMPLATE.render(
+            var_name=var_name,
+            kwargs=workflow_kwargs,
+        ).rstrip()
+    )
+    lines.append("")
+    return lines, warnings
+
+
 def render_team_node(
     node: GraphNode,
     var_name: str,
@@ -3403,20 +3575,6 @@ def compile_graph(graph: CanvasGraph, *, serve: bool = False) -> tuple[str, list
             }
         )
 
-    def get_workflow_step_order(step_node: GraphNode) -> tuple[int, float, float, str]:
-        extras = step_node.data.extras or {}
-        raw_order = extras.get("stepOrder")
-        try:
-            step_order = int(raw_order)
-        except (TypeError, ValueError):
-            step_order = 9999
-        return (
-            step_order,
-            step_node.position.x,
-            step_node.position.y,
-            step_node.data.name or step_node.id,
-        )
-
     for node in ordered_nodes:
         var_name = sanitize_identifier(f"{node.type.value}_{node.id}")
         symbol_map[node.id] = var_name
@@ -3471,137 +3629,15 @@ def compile_graph(graph: CanvasGraph, *, serve: bool = False) -> tuple[str, list
             continue
 
         if node.type == NodeType.WORKFLOW_STEP:
-            incoming_source_ids = incoming_ids(graph, node.id)
-            connected_agent_ids = [
-                source_id
-                for source_id in incoming_source_ids
-                if source_id in symbol_map and node_map.get(source_id) and node_map[source_id].type == NodeType.AGENT
-            ]
-            connected_team_ids = [
-                source_id
-                for source_id in incoming_source_ids
-                if source_id in symbol_map and node_map.get(source_id) and node_map[source_id].type == NodeType.TEAM
-            ]
-            connected_tool_ids = [
-                source_id
-                for source_id in incoming_source_ids
-                if source_id in symbol_map and node_map.get(source_id) and node_map[source_id].type == NodeType.TOOL
-            ]
-            connected_builtin_tool_ids = [
-                source_id
-                for source_id in connected_tool_ids
-                if str((node_map[source_id].data.extras or {}).get("toolMode", "builtin")) == "builtin"
-            ]
-            connected_function_tool_ids = [
-                source_id
-                for source_id in connected_tool_ids
-                if source_id not in connected_builtin_tool_ids
-            ]
-            connected_agent_symbol = symbol_map[connected_agent_ids[0]] if connected_agent_ids else None
-            connected_team_symbol = symbol_map[connected_team_ids[0]] if connected_team_ids else None
-            connected_executor_symbol: str | None = None
-            primary_executor_label: str | None = None
-            primary_builtin_tool_id: str | None = None
-            if connected_agent_symbol:
-                primary_executor_label = "Agent"
-            elif connected_team_symbol:
-                primary_executor_label = "Team"
-            elif connected_function_tool_ids:
-                connected_executor_symbol = symbol_map[connected_function_tool_ids[0]]
-                primary_executor_label = "Function Tool"
-            elif connected_builtin_tool_ids:
-                primary_builtin_tool_id = connected_builtin_tool_ids[0]
-                primary_executor_label = "Built-in Tool"
-            additional_executor_labels: list[str] = []
-            if connected_agent_ids:
-                agent_labels = ["Agent" for _ in connected_agent_ids]
-                if primary_executor_label == "Agent":
-                    additional_executor_labels.extend(agent_labels[1:])
-                else:
-                    additional_executor_labels.extend(agent_labels)
-            if connected_team_ids:
-                team_labels = ["Team" for _ in connected_team_ids]
-                if primary_executor_label == "Team":
-                    additional_executor_labels.extend(team_labels[1:])
-                else:
-                    additional_executor_labels.extend(team_labels)
-            if connected_function_tool_ids:
-                tool_labels = ["Function Tool" for _ in connected_function_tool_ids]
-                if primary_executor_label == "Function Tool":
-                    additional_executor_labels.extend(tool_labels[1:])
-                else:
-                    additional_executor_labels.extend(tool_labels)
-            if connected_builtin_tool_ids:
-                tool_labels = ["Built-in Tool" for _ in connected_builtin_tool_ids]
-                if primary_executor_label == "Built-in Tool":
-                    additional_executor_labels.extend(tool_labels[1:])
-                else:
-                    additional_executor_labels.extend(tool_labels)
-            if primary_builtin_tool_id:
-                builtin_tool_var_name = sanitize_identifier(f"{var_name}_{primary_builtin_tool_id}_executor")
-                builtin_tool_lines, builtin_tool_warnings = build_builtin_tool_workflow_executor(
-                    step_node=node,
-                    tool_node=node_map[primary_builtin_tool_id],
-                    tool_symbol=symbol_map[primary_builtin_tool_id],
-                    executor_var_name=builtin_tool_var_name,
-                )
-                warnings.extend(builtin_tool_warnings)
-                if builtin_tool_lines:
-                    lines.extend(builtin_tool_lines)
-                    connected_executor_symbol = builtin_tool_var_name
-            step_kwargs, step_warnings = build_workflow_step_kwargs(
-                node,
-                agent_symbol=connected_agent_symbol,
-                team_symbol=connected_team_symbol,
-                executor_symbol=connected_executor_symbol,
-                executor_label=primary_executor_label,
-                additional_executor_labels=additional_executor_labels,
-            )
+            step_lines, step_warnings = render_workflow_step_node(node, var_name, graph, node_map, symbol_map)
+            lines.extend(step_lines)
             warnings.extend(step_warnings)
-            lines.append(
-                STEP_TEMPLATE.render(
-                    var_name=var_name,
-                    kwargs=step_kwargs,
-                ).rstrip()
-            )
-            lines.append("")
             continue
 
         if node.type == NodeType.WORKFLOW:
-            incoming_source_ids = incoming_ids(graph, node.id)
-            connected_db_symbol = next(
-                (
-                    symbol_map[source_id]
-                    for source_id in incoming_source_ids
-                    if source_id in symbol_map and node_map.get(source_id) and node_map[source_id].type == NodeType.DATABASE
-                ),
-                None,
-            )
-            connected_step_nodes = sorted(
-                [
-                    node_map[source_id]
-                    for source_id in incoming_source_ids
-                    if source_id in symbol_map and node_map.get(source_id) and node_map[source_id].type == NodeType.WORKFLOW_STEP
-                ],
-                key=get_workflow_step_order,
-            )
-            connected_step_symbols = [symbol_map[step_node.id] for step_node in connected_step_nodes if step_node.id in symbol_map]
-            if not connected_step_symbols:
-                warnings.append(f"Workflow '{node.data.name}' has no connected workflow steps.")
-            excluded_fields: set[str] = set()
-            if connected_db_symbol:
-                excluded_fields.add("db")
-            workflow_kwargs, workflow_warnings = build_workflow_kwargs(node, connected_step_symbols, excluded_fields)
+            workflow_lines, workflow_warnings = render_workflow_node(node, var_name, graph, node_map, symbol_map)
+            lines.extend(workflow_lines)
             warnings.extend(workflow_warnings)
-            if connected_db_symbol:
-                workflow_kwargs += f"\n    db={connected_db_symbol},"
-            lines.append(
-                WORKFLOW_TEMPLATE.render(
-                    var_name=var_name,
-                    kwargs=workflow_kwargs,
-                ).rstrip()
-            )
-            lines.append("")
             continue
 
     import_lines.extend(
