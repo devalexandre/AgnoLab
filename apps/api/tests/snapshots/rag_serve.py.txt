@@ -1,0 +1,39 @@
+import base64
+import json
+import os
+from pathlib import Path
+
+from agno.agent import Agent
+from agno.media import Audio, File, Image, Video
+from agno.team import Team
+from agno.db.postgres import PostgresDb
+from agno.knowledge.knowledge import Knowledge
+from agno.vectordb.lancedb import LanceDb
+from agno.models.openai import OpenAIChat
+from agno.os import AgentOS
+
+vector_db_vector_db_1 = LanceDb(uri="tmp/rag_knowledge", table_name="documents")
+
+knowledge_knowledge_1 = Knowledge(name='Document Knowledge', description='Knowledge configurado para ingerir anexos e responder via RAG.', vector_db=vector_db_vector_db_1, max_results=8)
+
+os.environ['OPENAI_BASE_URL'] = 'https://api.openai.com/v1'
+agent_agent_1 = Agent(
+    name='RAG Assistant',
+    model=OpenAIChat(id='gpt-4.1-mini', api_key=os.getenv('OPENAI_API_KEY'), base_url='https://api.openai.com/v1'),
+    instructions='Responda usando primeiro o conhecimento indexado dos documentos anexados. Seja claro sobre quando a resposta veio do material enviado.\n\nRuntime input context available to this flow:\n- `flow_input`: formatted string with the user text, attached files and metadata.\n- `flow_input_payload`: dict with keys `text`, `files` and `metadata`.\n- `flow_input_files`: list of attached files with `name`, `alias`, `mime_type` and `path`.\n- `flow_input_file_path`: absolute path to the first attached file, or `None`.\n- `flow_input_metadata`: dict parsed from the input metadata JSON.\n\nWhen you use tools:\n- If a tool needs a file path, prefer `flow_input_file_path`.\n- If there are multiple files, inspect `flow_input_files`.\n- If the user attached a CSV, pass the file path explicitly to the tool.\n- Mention when you are relying on attached files versus plain text input.\n- If a tool returns `numeric_summary` or `financial_summary`, use those exact totals in the final answer.\n- Do not estimate, infer, or recompute totals from preview rows when a tool already returned aggregate values.',
+    description='Agente preparado para responder com base nos documentos recebidos no input.',
+    markdown=True,
+    add_datetime_to_context=True,
+    debug_mode=True,
+    add_knowledge_to_context=True,
+    search_knowledge=True,
+    references_format='json',
+    knowledge=knowledge_knowledge_1,
+)
+
+
+agent_os = AgentOS(name='RAG Document Assistant', agents=[agent_agent_1])
+app = agent_os.get_app()
+
+if __name__ == "__main__":
+    agent_os.serve(app="main:app", host="0.0.0.0", port=7777)

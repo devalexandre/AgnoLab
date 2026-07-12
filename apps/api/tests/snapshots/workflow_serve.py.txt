@@ -1,0 +1,112 @@
+import base64
+import json
+import os
+from pathlib import Path
+
+from agno.agent import Agent
+from agno.media import Audio, File, Image, Video
+from agno.team import Team
+from agno.tools import tool
+from agno.workflow import Step, Workflow
+from agno.models.openai import OpenAIChat
+from agno.os import AgentOS
+
+@tool
+def search_tool(value: str) -> str:
+    return f'Search stub: {value}'
+tool_tool_1 = search_tool
+
+os.environ['OPENAI_BASE_URL'] = 'https://api.openai.com/v1'
+agent_agent_1 = Agent(
+    name='Discovery Agent',
+    model=OpenAIChat(id='gpt-4.1-mini', api_key=os.getenv('OPENAI_API_KEY'), base_url='https://api.openai.com/v1'),
+    instructions='Analise a solicitação, identifique objetivos, riscos e fatos que precisam ser confirmados antes da resposta final.\n\nRuntime input context available to this flow:\n- `flow_input`: formatted string with the user text, attached files and metadata.\n- `flow_input_payload`: dict with keys `text`, `files` and `metadata`.\n- `flow_input_files`: list of attached files with `name`, `alias`, `mime_type` and `path`.\n- `flow_input_file_path`: absolute path to the first attached file, or `None`.\n- `flow_input_metadata`: dict parsed from the input metadata JSON.\n\nWhen you use tools:\n- If a tool needs a file path, prefer `flow_input_file_path`.\n- If there are multiple files, inspect `flow_input_files`.\n- If the user attached a CSV, pass the file path explicitly to the tool.\n- Mention when you are relying on attached files versus plain text input.\n- If a tool returns `numeric_summary` or `financial_summary`, use those exact totals in the final answer.\n- Do not estimate, infer, or recompute totals from preview rows when a tool already returned aggregate values.',
+    description='Faz a primeira passada e organiza os fatos principais.',
+    markdown=True,
+    add_datetime_to_context=True,
+    debug_mode=True,
+)
+
+os.environ['OPENAI_BASE_URL'] = 'https://api.openai.com/v1'
+agent_agent_2 = Agent(
+    name='Reviewer Agent',
+    model=OpenAIChat(id='gpt-4.1-mini', api_key=os.getenv('OPENAI_API_KEY'), base_url='https://api.openai.com/v1'),
+    instructions='Revise o material produzido na etapa anterior, aponte lacunas e proponha correções importantes.\n\nRuntime input context available to this flow:\n- `flow_input`: formatted string with the user text, attached files and metadata.\n- `flow_input_payload`: dict with keys `text`, `files` and `metadata`.\n- `flow_input_files`: list of attached files with `name`, `alias`, `mime_type` and `path`.\n- `flow_input_file_path`: absolute path to the first attached file, or `None`.\n- `flow_input_metadata`: dict parsed from the input metadata JSON.\n\nWhen you use tools:\n- If a tool needs a file path, prefer `flow_input_file_path`.\n- If there are multiple files, inspect `flow_input_files`.\n- If the user attached a CSV, pass the file path explicitly to the tool.\n- Mention when you are relying on attached files versus plain text input.\n- If a tool returns `numeric_summary` or `financial_summary`, use those exact totals in the final answer.\n- Do not estimate, infer, or recompute totals from preview rows when a tool already returned aggregate values.',
+    description='Questiona lacunas e melhora a qualidade da saída.',
+    markdown=True,
+    add_datetime_to_context=True,
+    debug_mode=True,
+)
+
+os.environ['OPENAI_BASE_URL'] = 'https://api.openai.com/v1'
+agent_agent_3 = Agent(
+    name='Writer Agent',
+    model=OpenAIChat(id='gpt-4.1-mini', api_key=os.getenv('OPENAI_API_KEY'), base_url='https://api.openai.com/v1'),
+    instructions='Escreva a resposta final com clareza, estrutura e foco na ação recomendada.\n\nRuntime input context available to this flow:\n- `flow_input`: formatted string with the user text, attached files and metadata.\n- `flow_input_payload`: dict with keys `text`, `files` and `metadata`.\n- `flow_input_files`: list of attached files with `name`, `alias`, `mime_type` and `path`.\n- `flow_input_file_path`: absolute path to the first attached file, or `None`.\n- `flow_input_metadata`: dict parsed from the input metadata JSON.\n\nWhen you use tools:\n- If a tool needs a file path, prefer `flow_input_file_path`.\n- If there are multiple files, inspect `flow_input_files`.\n- If the user attached a CSV, pass the file path explicitly to the tool.\n- Mention when you are relying on attached files versus plain text input.\n- If a tool returns `numeric_summary` or `financial_summary`, use those exact totals in the final answer.\n- Do not estimate, infer, or recompute totals from preview rows when a tool already returned aggregate values.',
+    description='Transforma revisão em resposta clara para o usuário.',
+    markdown=True,
+    add_datetime_to_context=True,
+    debug_mode=True,
+)
+
+workflow_step_workflow_step_1 = Step(
+    name='Discovery Step',
+    agent=agent_agent_1,
+    description='Primeira etapa do workflow com análise inicial.',
+    max_retries=3,
+    skip_on_failure=False,
+    strict_input_validation=False,
+    requires_confirmation=False,
+    on_reject='skip',
+    requires_user_input=False,
+    on_error='skip',
+)
+
+os.environ['OPENAI_BASE_URL'] = 'https://api.openai.com/v1'
+team_team_1 = Team(
+    members=[agent_agent_2, agent_agent_3],
+    name='Editorial Team',
+    model=OpenAIChat(id='gpt-4.1-mini', api_key=os.getenv('OPENAI_API_KEY'), base_url='https://api.openai.com/v1'),
+    instructions='Use a descoberta inicial como contexto, faça revisão crítica e entregue a melhor resposta final para o usuário.\n\nRuntime input context available to this flow:\n- `flow_input`: formatted string with the user text, attached files and metadata.\n- `flow_input_payload`: dict with keys `text`, `files` and `metadata`.\n- `flow_input_files`: list of attached files with `name`, `alias`, `mime_type` and `path`.\n- `flow_input_file_path`: absolute path to the first attached file, or `None`.\n- `flow_input_metadata`: dict parsed from the input metadata JSON.\n\nWhen you use tools:\n- If a tool needs a file path, prefer `flow_input_file_path`.\n- If there are multiple files, inspect `flow_input_files`.\n- If the user attached a CSV, pass the file path explicitly to the tool.\n- Mention when you are relying on attached files versus plain text input.\n- If a tool returns `numeric_summary` or `financial_summary`, use those exact totals in the final answer.\n- Do not estimate, infer, or recompute totals from preview rows when a tool already returned aggregate values.',
+    tools=[tool_tool_1],
+    description='Time que revisa a descoberta e fecha a resposta final.',
+    mode='coordinate',
+    markdown=True,
+    respond_directly=True,
+    add_datetime_to_context=True,
+    debug_mode=True,
+)
+
+workflow_step_workflow_step_2 = Step(
+    name='Editorial Step',
+    team=team_team_1,
+    description='Etapa de consolidação final com time coordenado.',
+    max_retries=3,
+    skip_on_failure=False,
+    strict_input_validation=False,
+    requires_confirmation=False,
+    on_reject='skip',
+    requires_user_input=False,
+    on_error='skip',
+)
+
+workflow_workflow_1 = Workflow(
+    name='Response Workflow',
+    steps=[workflow_step_workflow_step_1, workflow_step_workflow_step_2],
+    description='Workflow sequencial com handoff entre agente e time.',
+    debug_mode=True,
+    stream_events=True,
+    stream_executor_events=True,
+    store_executor_outputs=True,
+    telemetry=True,
+    num_history_runs=3,
+    cache_session=False,
+    add_workflow_history_to_steps=False,
+)
+
+
+agent_os = AgentOS(name='Workflow Team Handoff', agents=[agent_agent_1, agent_agent_2, agent_agent_3], teams=[team_team_1], workflows=[workflow_workflow_1])
+app = agent_os.get_app()
+
+if __name__ == "__main__":
+    agent_os.serve(app="main:app", host="0.0.0.0", port=7777)

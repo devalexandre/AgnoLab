@@ -1,12 +1,12 @@
 from __future__ import annotations
 
-from enum import Enum
+from enum import StrEnum
 from typing import Any
 
 from pydantic import BaseModel, Field
 
 
-class NodeType(str, Enum):
+class NodeType(StrEnum):
     INPUT = "input"
     RABBITMQ_INPUT = "rabbitmq_input"
     RABBITMQ_OUTPUT = "rabbitmq_output"
@@ -39,7 +39,7 @@ class NodeType(str, Enum):
     COMPRESSION_MANAGER = "compression_manager"
 
 
-class TargetRuntime(str, Enum):
+class TargetRuntime(StrEnum):
     AGNO_PYTHON = "agno-python"
     AGNOGO = "agnogo"
 
@@ -270,6 +270,8 @@ class RunSavedFlowByNameRequest(RunSavedFlowRequest):
 class CodegenRequest(BaseModel):
     graph: CanvasGraph
     response_only: bool = False
+    # When true, export/codegen targets an AgentOS server app instead of a run-once script.
+    serve: bool = False
 
 
 class CodegenResponse(BaseModel):

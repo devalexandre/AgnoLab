@@ -1,19 +1,29 @@
+# OS / editor
 .DS_Store
+
+# Python
 __pycache__/
+*.pyc
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
 .venv/
-node_modules/
-dist/
+.venv-*/
+*.egg-info/
 build/
+dist/
+
+# Node / frontend
+node_modules/
+coverage/
+*.tsbuildinfo
+
+# Environment / secrets
 .env
 .env.local
-coverage/
-*.pyc
 
-
-.*od
-apps/api/data/flows/
-.*sql
-data
+# Local runtime data (saved flows, listener state, sqlite, etc.)
+data/
+apps/api/data/
+*.sqlite
+*.db

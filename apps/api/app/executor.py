@@ -10,7 +10,6 @@ import sys
 import tempfile
 from pathlib import Path
 
-
 AGNO_TOOL_IMPORT_RE = re.compile(r"^\s*from\s+(agno\.tools\.[\w_]+)\s+import\s+([A-Za-z_][A-Za-z0-9_]*)", re.MULTILINE)
 AGNO_PROVIDER_IMPORT_RE = re.compile(
     r"^\s*from\s+(agno\.models\.[\w_.]+)\s+import\s+([A-Za-z_][A-Za-z0-9_]*)(?:\s+as\s+([A-Za-z_][A-Za-z0-9_]*))?",
@@ -115,16 +114,126 @@ def preflight_component_imports(code: str) -> str | None:
     return "Missing dependencies for selected Agno components:\n" + "\n".join(missing_messages)
 
 
+DEFAULT_TIMEOUT_SECONDS = 20.0
+
+
+def _max_timeout_seconds() -> float:
+    """Hard ceiling for any single run, regardless of per-flow settings.
+
+    Without this a saved flow can request an arbitrarily large execution timeout
+    and tie up a worker indefinitely (a trivial DoS).
+    """
+    try:
+        value = float(os.getenv("AGNOLAB_MAX_EXECUTION_SECONDS", "300"))
+    except ValueError:
+        value = 300.0
+    return value if value > 0 else 300.0
+
+
+def _build_resource_limiter(timeout_seconds: float):
+    """Return a POSIX ``preexec_fn`` that caps the child's resources, or None.
+
+    CPU time and output file size are always capped (safe for legitimate flows).
+    Address-space (memory) capping is opt-in via ``AGNOLAB_MAX_MEMORY_MB`` because
+    ML / vector-store libraries legitimately reserve large virtual address ranges.
+    """
+    if os.name != "posix":
+        return None
+
+    try:
+        import resource
+    except ImportError:
+        return None
+
+    cpu_limit = int(timeout_seconds) + 5
+    fsize_limit = int(os.getenv("AGNOLAB_MAX_OUTPUT_MB", "128")) * 1024 * 1024
+    memory_mb = os.getenv("AGNOLAB_MAX_MEMORY_MB", "").strip()
+    memory_limit = int(memory_mb) * 1024 * 1024 if memory_mb.isdigit() and int(memory_mb) > 0 else None
+
+    def _limit() -> None:
+        resource.setrlimit(resource.RLIMIT_CPU, (cpu_limit, cpu_limit))
+        resource.setrlimit(resource.RLIMIT_FSIZE, (fsize_limit, fsize_limit))
+        if memory_limit is not None:
+            resource.setrlimit(resource.RLIMIT_AS, (memory_limit, memory_limit))
+
+    return _limit
+
+
+def _terminate_process_tree(process: subprocess.Popen) -> None:
+    """Kill the child's whole process group (POSIX) or fall back to the child."""
+    if os.name == "posix":
+        import signal
+
+        try:
+            os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+            return
+        except (ProcessLookupError, PermissionError):
+            pass
+    process.kill()
+
+
+# Host env vars a generated flow legitimately needs to run: interpreter, locale,
+# TLS trust store, proxy, and temp-dir configuration. Everything else is dropped in
+# isolated mode so unrelated host secrets never reach the runner.
+SYSTEM_ESSENTIAL_ENV = (
+    "PATH", "HOME", "USER", "LOGNAME", "SHELL",
+    "LANG", "LANGUAGE", "LC_ALL", "LC_CTYPE", "TZ", "TERM",
+    "TMPDIR", "TMP", "TEMP",
+    "PYTHONPATH", "PYTHONHOME", "PYTHONUNBUFFERED", "PYTHONIOENCODING",
+    "VIRTUAL_ENV", "CONDA_PREFIX",
+    "SSL_CERT_FILE", "SSL_CERT_DIR", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE",
+    "SYSTEMROOT", "COMSPEC", "PATHEXT", "WINDIR",
+    "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY",
+    "http_proxy", "https_proxy", "no_proxy",
+)
+
+
+def _isolate_env_enabled() -> bool:
+    return os.getenv("AGNOLAB_ISOLATE_ENV", "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _extra_forward_env_names() -> set[str]:
+    raw = os.getenv("AGNOLAB_FORWARD_ENV", "")
+    return {name.strip() for name in raw.split(",") if name.strip()}
+
+
+def _build_subprocess_env(
+    extra_env: dict[str, str] | None,
+    effective_openai_key: str | None,
+    forward_env_names: set[str] | None,
+) -> dict[str, str]:
+    """Build the child process environment.
+
+    Default: inherit the full host environment (backwards compatible). When
+    AGNOLAB_ISOLATE_ENV is enabled, inherit only system essentials plus an explicit
+    allowlist (known provider credential vars + AGNOLAB_FORWARD_ENV), so unrelated
+    host secrets are not exposed to executed flow code.
+    """
+    if not _isolate_env_enabled():
+        env = os.environ.copy()
+    else:
+        allowed = set(SYSTEM_ESSENTIAL_ENV) | set(forward_env_names or set()) | _extra_forward_env_names()
+        env = {key: value for key, value in os.environ.items() if key in allowed}
+
+    if extra_env:
+        env.update(extra_env)
+    if effective_openai_key:
+        env["OPENAI_API_KEY"] = effective_openai_key
+    return env
+
+
 def run_generated_code(
     code: str,
     *,
     extra_env: dict[str, str] | None = None,
-    timeout_seconds: float = 20.0,
+    timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
+    forward_env_names: set[str] | None = None,
 ) -> tuple[bool, str, str, int | None]:
     effective_openai_key = (extra_env or {}).get("OPENAI_API_KEY") or os.getenv("OPENAI_API_KEY")
 
     if timeout_seconds <= 0:
-        timeout_seconds = 20.0
+        timeout_seconds = DEFAULT_TIMEOUT_SECONDS
+    timeout_seconds = min(timeout_seconds, _max_timeout_seconds())
 
     missing_provider_dependencies = preflight_provider_imports(code)
     if missing_provider_dependencies:
@@ -141,24 +250,27 @@ def run_generated_code(
     with tempfile.TemporaryDirectory(prefix="agnolab-run-") as tmp_dir:
         script_path = Path(tmp_dir) / "main.py"
         script_path.write_text(code, encoding="utf-8")
-        env = os.environ.copy()
-        if extra_env:
-            env.update(extra_env)
-        if effective_openai_key:
-            env["OPENAI_API_KEY"] = effective_openai_key
+        env = _build_subprocess_env(extra_env, effective_openai_key, forward_env_names)
 
+        # start_new_session=True puts the child in its own process group so that on
+        # timeout we can kill the whole tree, not just the direct child.
+        process = subprocess.Popen(
+            [sys.executable, str(script_path)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            cwd=tmp_dir,
+            env=env,
+            start_new_session=True,
+            preexec_fn=_build_resource_limiter(timeout_seconds),
+        )
         try:
-            completed = subprocess.run(
-                [sys.executable, str(script_path)],
-                capture_output=True,
-                text=True,
-                timeout=timeout_seconds,
-                cwd=tmp_dir,
-                env=env,
-            )
+            stdout, stderr = process.communicate(timeout=timeout_seconds)
         except subprocess.TimeoutExpired:
+            _terminate_process_tree(process)
+            process.communicate()
             return False, "", f"Execution timed out after {timeout_seconds:g} seconds.", None
 
-    success = completed.returncode == 0
-    formatted_stderr = format_missing_dependency(completed.stderr) or completed.stderr
-    return success, completed.stdout, formatted_stderr, completed.returncode
+    success = process.returncode == 0
+    formatted_stderr = format_missing_dependency(stderr) or stderr
+    return success, stdout, formatted_stderr, process.returncode

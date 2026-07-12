@@ -2,65 +2,155 @@ from __future__ import annotations
 
 import asyncio
 import base64
-from datetime import datetime, timezone
+import contextlib
+import hmac
 import html
 import json
+import logging
 import os
-from pathlib import Path
 import re
 import threading
 import time
+from collections import deque
+from contextlib import asynccontextmanager
+from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI
-from fastapi import HTTPException
-from fastapi import Request
+import requests
+from dotenv import load_dotenv
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
-from dotenv import load_dotenv
-import requests
 from starlette.datastructures import UploadFile as StarletteUploadFile
 
 from .builtin_tools import inspect_builtin_tool_functions
-from .compiler import compile_graph
+from .compiler import (
+    QUEUE_INPUT_NODE_TYPES,
+    QUEUE_OUTPUT_NODE_TYPES,
+    collect_graph_runtime_secrets,
+    compile_graph,
+    detect_project_root,
+)
 from .email_listener import EmailListenerManager
 from .executor import run_generated_code
 from .exporter import export_project
 from .flow_store import delete_flow_record, list_flow_summaries, load_flow_record, normalize_flow_name, save_flow_record
 from .models import (
-    CanvasGraph,
     BuiltInToolFunctionOption,
     BuiltInToolFunctionsRequest,
-    ListCanvasTemplatesResponse,
-    ListBuiltInToolFunctionsResponse,
-    ListSkillPathsResponse,
+    CanvasGraph,
     CodegenRequest,
     CodegenResponse,
+    ExportProjectResponse,
+    FlowRecord,
+    FlowRuntimeStatus,
+    GraphNode,
+    ListBuiltInToolFunctionsResponse,
+    ListCanvasTemplatesResponse,
     ListEmailListenerStatusesResponse,
     ListFlowRuntimeStatusesResponse,
-    ListQueueSubscriberStatusesResponse,
-    ExportProjectResponse,
-    FlowRuntimeStatus,
-    FlowRecord,
-    GraphNode,
     ListFlowsResponse,
+    ListQueueSubscriberStatusesResponse,
+    ListSkillPathsResponse,
+    NodeType,
+    QueueSubscriberStatus,
     RunResult,
     RunSavedFlowByNameRequest,
     SaveFlowRequest,
     SaveFlowResponse,
     SkillPathOption,
-    QueueSubscriberStatus,
     WhatsappSessionStatus,
     WhatsappWebhookDispatchResponse,
 )
-from .models import NodeType
+from .provider_catalog import known_provider_credential_env_names
 from .queue_subscriber import QueueSubscriberManager, extract_queue_subscriber_configs
 from .sample_graph import build_sample_graph, get_canvas_template, list_canvas_templates
-from .whatsapp_gateway import WhatsappGatewayClient, normalize_whatsapp_session_id
+from .whatsapp_gateway import (
+    DEFAULT_WHATSAPP_GATEWAY_SECRET_KEY,
+    WhatsappGatewayClient,
+    normalize_whatsapp_session_id,
+)
 
 load_dotenv()
 
-app = FastAPI(title="AgnoLab API", version="0.1.0")
+logger = logging.getLogger("agnolab")
+
+# Paths that never require the global API key: liveness/UI plus the external
+# trigger endpoints, which authenticate per-flow via a bearer token instead.
+_AUTH_EXEMPT_EXACT = {"/", "/health"}
+_AUTH_EXEMPT_PATTERNS = (
+    re.compile(r"^/api/flows/run/?$"),
+    re.compile(r"^/api/integrations/form/[^/]+/[^/]+/?$"),
+    re.compile(r"^/api/integrations/whatsapp/[^/]+/[^/]+/events/?$"),
+)
+
+
+def get_configured_api_key() -> str:
+    return str(os.getenv("AGNOLAB_API_KEY") or "").strip()
+
+
+def _extract_request_api_key(request: Request) -> str:
+    header_key = request.headers.get("x-api-key", "").strip()
+    if header_key:
+        return header_key
+    authorization = request.headers.get("authorization", "").strip()
+    scheme, _, token = authorization.partition(" ")
+    if scheme.lower() == "bearer":
+        return token.strip()
+    return ""
+
+
+def require_api_key(request: Request) -> None:
+    """Global gate: require ``AGNOLAB_API_KEY`` on management/build endpoints.
+
+    When the env var is unset the gate is disabled (single-user local dev). This
+    protects the otherwise-unauthenticated code generation and execution
+    endpoints, which are the arbitrary-code-execution surface.
+    """
+    configured = get_configured_api_key()
+    if not configured:
+        return
+
+    if request.method == "OPTIONS":
+        return
+
+    path = request.url.path
+    if path in _AUTH_EXEMPT_EXACT or any(pattern.match(path) for pattern in _AUTH_EXEMPT_PATTERNS):
+        return
+
+    provided = _extract_request_api_key(request)
+    if not provided or not hmac.compare_digest(provided, configured):
+        raise HTTPException(status_code=401, detail="Missing or invalid API key.")
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    if not get_configured_api_key():
+        logger.warning(
+            "AGNOLAB_API_KEY is not set: the code generation and execution endpoints "
+            "are unauthenticated. Set AGNOLAB_API_KEY before exposing this API beyond localhost."
+        )
+    if os.getenv("WHATSAPP_GATEWAY_SECRET_KEY", "").strip() in ("", DEFAULT_WHATSAPP_GATEWAY_SECRET_KEY):
+        logger.warning(
+            "WHATSAPP_GATEWAY_SECRET_KEY is unset or still the built-in default. Anyone who can "
+            "reach the WhatsApp gateway could control its sessions. Set a strong secret before deploying."
+        )
+    email_listener_manager.start()
+    queue_subscriber_manager.start()
+    try:
+        yield
+    finally:
+        email_listener_manager.stop()
+        queue_subscriber_manager.stop()
+
+
+app = FastAPI(
+    title="AgnoLab API",
+    version="0.2.0",
+    dependencies=[Depends(require_api_key)],
+    lifespan=lifespan,
+)
 
 DEFAULT_GENERATED_CODE_TIMEOUT_SECONDS = 20.0
 RESULT_START_MARKER = "__AGNO_RESULT_START__"
@@ -71,27 +161,9 @@ _recent_whatsapp_events: dict[str, float] = {}
 _flow_runtime_lock = threading.Lock()
 _flow_runtime_stats_by_name: dict[str, dict[str, object]] = {}
 
-QUEUE_INPUT_NODE_TYPES = {
-    NodeType.RABBITMQ_INPUT,
-    NodeType.KAFKA_INPUT,
-    NodeType.REDIS_INPUT,
-    NodeType.NATS_INPUT,
-    NodeType.SQS_INPUT,
-    NodeType.PUBSUB_INPUT,
-}
-
-QUEUE_OUTPUT_NODE_TYPES = {
-    NodeType.RABBITMQ_OUTPUT,
-    NodeType.KAFKA_OUTPUT,
-    NodeType.REDIS_OUTPUT,
-    NodeType.NATS_OUTPUT,
-    NodeType.SQS_OUTPUT,
-    NodeType.PUBSUB_OUTPUT,
-}
-
 
 def _runtime_timestamp_now() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(UTC).isoformat()
 
 
 def _ensure_flow_runtime_stats(flow_name: str) -> dict[str, object]:
@@ -169,30 +241,40 @@ def _list_flow_runtime_statuses(flow_name: str | None = None) -> list[FlowRuntim
     return statuses
 
 
-def _detect_project_root() -> Path:
-    current = Path(__file__).resolve()
-    markers = ("docker-compose.dev.yml", "docker-compose.yml", "README.md")
-
-    for parent in current.parents:
-        if any((parent / marker).exists() for marker in markers) or (parent / "apps").is_dir():
-            return parent
-
-    if current.parent.name == "app":
-        return current.parent.parent
-
-    return current.parent
-
-
-PROJECT_ROOT = _detect_project_root()
+PROJECT_ROOT = detect_project_root()
 SKILL_DISCOVERY_ROOTS = [
     ("repo", PROJECT_ROOT / "examples/skills"),
     ("user", Path.home() / ".agents/skills"),
 ]
 
+
+def _resolve_cors_origins() -> tuple[list[str], bool]:
+    """Resolve allowed CORS origins from ``AGNOLAB_CORS_ORIGINS``.
+
+    A wildcard combined with credentials is a browser-exploitable
+    misconfiguration, so credentials are only enabled when explicit origins are
+    configured. Defaults to the local dev servers.
+    """
+    raw = os.getenv("AGNOLAB_CORS_ORIGINS", "").strip()
+    if raw == "*":
+        return ["*"], False
+    if raw:
+        origins = [origin.strip() for origin in raw.split(",") if origin.strip()]
+        return origins, True
+    default_origins = [
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+        "http://localhost:3000",
+    ]
+    return default_origins, True
+
+
+_cors_origins, _cors_allow_credentials = _resolve_cors_origins()
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
+    allow_origins=_cors_origins,
+    allow_credentials=_cors_allow_credentials,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -252,18 +334,6 @@ def discover_skill_paths() -> list[SkillPathOption]:
             )
 
     return options
-
-
-@app.on_event("startup")
-def start_email_listener_service() -> None:
-    email_listener_manager.start()
-    queue_subscriber_manager.start()
-
-
-@app.on_event("shutdown")
-def stop_email_listener_service() -> None:
-    email_listener_manager.stop()
-    queue_subscriber_manager.stop()
 
 
 @app.get("/health")
@@ -400,7 +470,7 @@ def list_builtin_tool_functions(request: BuiltInToolFunctionsRequest) -> ListBui
 
 @app.post("/api/codegen/preview", response_model=CodegenResponse)
 def preview_code(request: CodegenRequest) -> CodegenResponse:
-    code, warnings = compile_graph(request.graph)
+    code, warnings = compile_graph(request.graph, serve=request.serve)
     return CodegenResponse(code=code, warnings=warnings)
 
 
@@ -415,6 +485,7 @@ def run_code(request: CodegenRequest) -> RunResult:
         code,
         extra_env=get_graph_runtime_env(graph),
         timeout_seconds=get_graph_execution_timeout_seconds(graph),
+        forward_env_names=known_provider_credential_env_names(),
     )
     tagged_clean_stdout, stripped_stdout = extract_tagged_flow_result(stdout)
     clean_stdout = tagged_clean_stdout or extract_agent_response(stdout)
@@ -580,9 +651,12 @@ def get_graph_execution_timeout_seconds(graph: CanvasGraph) -> float:
 
 
 def get_graph_runtime_env(graph: CanvasGraph) -> dict[str, str]:
+    # User-supplied secrets (provider keys/env, email passwords) are injected here,
+    # not inlined into generated code.
+    resolved_env: dict[str, str] = collect_graph_runtime_secrets(graph)
+
     runtime = getattr(graph.project, "runtime", None)
     env_items = getattr(runtime, "envVars", []) if runtime is not None else []
-    resolved_env: dict[str, str] = {}
 
     for item in env_items:
         key = str(getattr(item, "key", "") or "").strip()
@@ -1078,9 +1152,9 @@ def _collect_reachable_node_ids(graph: CanvasGraph, *, start_node_id: str | None
         adjacency.setdefault(edge.source, []).append(edge.target)
 
     reachable: set[str] = set()
-    queue: list[str] = [start_node_id]
+    queue: deque[str] = deque([start_node_id])
     while queue:
-        current_id = queue.pop(0)
+        current_id = queue.popleft()
         if current_id in reachable:
             continue
         reachable.add(current_id)
@@ -1115,6 +1189,86 @@ def _publish_nats_output_payload(*, nats_url: str, nats_subject: str, payload_te
     asyncio.run(_publish())
 
 
+def _publish_rabbitmq_output_payload(*, url: str, queue: str, exchange: str, routing_key: str, payload_text: str) -> None:
+    try:
+        import pika
+    except ModuleNotFoundError as error:
+        raise RuntimeError("RabbitMQ output dependency missing. Install 'pika' to publish to RabbitMQ output nodes.") from error
+
+    connection = pika.BlockingConnection(pika.URLParameters(url))
+    try:
+        channel = connection.channel()
+        if queue and not exchange:
+            channel.queue_declare(queue=queue, durable=False)
+        channel.basic_publish(
+            exchange=exchange or "",
+            routing_key=routing_key or queue,
+            body=payload_text.encode("utf-8"),
+        )
+    finally:
+        connection.close()
+
+
+def _publish_kafka_output_payload(*, bootstrap_servers: str, topic: str, payload_text: str) -> None:
+    try:
+        from confluent_kafka import Producer
+    except ModuleNotFoundError as error:
+        raise RuntimeError("Kafka output dependency missing. Install 'confluent-kafka' to publish to Kafka output nodes.") from error
+
+    producer = Producer({"bootstrap.servers": bootstrap_servers})
+    producer.produce(topic, payload_text.encode("utf-8"))
+    producer.flush(5)
+
+
+def _publish_redis_output_payload(*, url: str, channel: str, payload_text: str) -> None:
+    try:
+        import redis
+    except ModuleNotFoundError as error:
+        raise RuntimeError("Redis output dependency missing. Install 'redis' to publish to Redis output nodes.") from error
+
+    client = redis.Redis.from_url(url, decode_responses=True)
+    try:
+        # The Redis input consumes with lpop, so publish with rpush for FIFO delivery.
+        client.rpush(channel, payload_text)
+    finally:
+        with contextlib.suppress(Exception):
+            client.close()
+
+
+def _publish_sqs_output_payload(*, region: str, queue_url: str, extras: dict, payload_text: str) -> None:
+    try:
+        import boto3
+    except ModuleNotFoundError as error:
+        raise RuntimeError("SQS output dependency missing. Install 'boto3' to publish to SQS output nodes.") from error
+
+    kwargs: dict[str, str] = {"region_name": region or "us-east-1"}
+    access_key = str(extras.get("awsAccessKeyId") or "").strip()
+    secret_key = str(extras.get("awsSecretAccessKey") or "").strip()
+    endpoint_url = str(extras.get("awsEndpointUrl") or "").strip()
+    if access_key:
+        kwargs["aws_access_key_id"] = access_key
+    if secret_key:
+        kwargs["aws_secret_access_key"] = secret_key
+    if endpoint_url:
+        kwargs["endpoint_url"] = endpoint_url
+
+    client = boto3.client("sqs", **kwargs)
+    client.send_message(QueueUrl=queue_url, MessageBody=payload_text)
+
+
+def _publish_pubsub_output_payload(*, project_id: str, topic: str, emulator_host: str, payload_text: str) -> None:
+    endpoint = emulator_host.strip()
+    if endpoint and not endpoint.startswith(("http://", "https://")):
+        endpoint = f"http://{endpoint}"
+    data_b64 = base64.b64encode(payload_text.encode("utf-8")).decode("ascii")
+    response = requests.post(
+        f"{endpoint}/v1/projects/{project_id}/topics/{topic}:publish",
+        json={"messages": [{"data": data_b64}]},
+        timeout=5,
+    )
+    response.raise_for_status()
+
+
 def _dispatch_queue_output_payloads(
     graph: CanvasGraph,
     *,
@@ -1129,17 +1283,54 @@ def _dispatch_queue_output_payloads(
     output_nodes = _resolve_queue_output_nodes_for_dispatch(graph, target_input_node_id=target_input_node_id)
     for output_node in output_nodes:
         extras = output_node.data.extras if isinstance(output_node.data.extras, dict) else {}
-        if output_node.type == NodeType.NATS_OUTPUT:
-            nats_url = str(extras.get("natsUrl") or "nats://localhost:4222").strip()
-            nats_subject = str(extras.get("natsSubject") or "agnolab.output").strip()
-            if not nats_subject:
-                dispatch_errors.append(f"Queue output '{output_node.data.name}' has an empty NATS subject.")
-                continue
-            try:
-                _publish_nats_output_payload(nats_url=nats_url, nats_subject=nats_subject, payload_text=message)
-            except Exception as error:
-                dispatch_errors.append(f"NATS output '{output_node.data.name}' failed: {error}")
-            continue
+        name = output_node.data.name
+        try:
+            if output_node.type == NodeType.NATS_OUTPUT:
+                _publish_nats_output_payload(
+                    nats_url=str(extras.get("natsUrl") or "nats://localhost:4222").strip(),
+                    nats_subject=str(extras.get("natsSubject") or "agnolab.output").strip(),
+                    payload_text=message,
+                )
+            elif output_node.type == NodeType.RABBITMQ_OUTPUT:
+                _publish_rabbitmq_output_payload(
+                    url=str(extras.get("rabbitmqUrl") or "amqp://guest:guest@localhost:5672/").strip(),
+                    queue=str(extras.get("rabbitmqQueue") or "agnolab.output").strip(),
+                    exchange=str(extras.get("rabbitmqExchange") or "").strip(),
+                    routing_key=str(extras.get("rabbitmqRoutingKey") or "").strip(),
+                    payload_text=message,
+                )
+            elif output_node.type == NodeType.KAFKA_OUTPUT:
+                _publish_kafka_output_payload(
+                    bootstrap_servers=str(extras.get("kafkaBootstrapServers") or "localhost:9092").strip(),
+                    topic=str(extras.get("kafkaTopic") or "agnolab.output").strip(),
+                    payload_text=message,
+                )
+            elif output_node.type == NodeType.REDIS_OUTPUT:
+                _publish_redis_output_payload(
+                    url=str(extras.get("redisUrl") or "redis://localhost:6379/0").strip(),
+                    channel=str(extras.get("redisChannel") or "agnolab.output").strip(),
+                    payload_text=message,
+                )
+            elif output_node.type == NodeType.SQS_OUTPUT:
+                queue_url = str(extras.get("sqsQueueUrl") or "").strip()
+                if not queue_url:
+                    dispatch_errors.append(f"Queue output '{name}' has an empty SQS queue URL.")
+                    continue
+                _publish_sqs_output_payload(
+                    region=str(extras.get("awsRegion") or "us-east-1").strip(),
+                    queue_url=queue_url,
+                    extras=extras,
+                    payload_text=message,
+                )
+            elif output_node.type == NodeType.PUBSUB_OUTPUT:
+                _publish_pubsub_output_payload(
+                    project_id=str(extras.get("pubsubProjectId") or "agnolab-local").strip(),
+                    topic=str(extras.get("pubsubTopic") or "agnolab-output-topic").strip(),
+                    emulator_host=str(extras.get("pubsubEmulatorHost") or "localhost:8085").strip(),
+                    payload_text=message,
+                )
+        except Exception as error:
+            dispatch_errors.append(f"Queue output '{name}' failed: {error}")
 
     return dispatch_errors
 
@@ -1905,4 +2096,4 @@ def run_saved_flow_by_name(request: RunSavedFlowByNameRequest, http_request: Req
 
 @app.post("/api/project/export", response_model=ExportProjectResponse)
 def export_code(request: CodegenRequest) -> ExportProjectResponse:
-    return export_project(request.graph)
+    return export_project(request.graph, serve=request.serve)

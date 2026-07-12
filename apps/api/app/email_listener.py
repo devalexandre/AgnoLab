@@ -1,23 +1,23 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from datetime import datetime, timezone
-from email import message_from_bytes
-from email.header import decode_header, make_header
-from email.utils import getaddresses
+import hashlib
 import imaplib
 import json
-from pathlib import Path
 import poplib
 import re
 import ssl
 import threading
 import time
-from typing import Callable
+from collections.abc import Callable
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from email import message_from_bytes
+from email.header import decode_header, make_header
+from email.utils import getaddresses
+from pathlib import Path
 
 from .flow_store import FLOWS_DIR, list_flow_records, normalize_flow_name
 from .models import EmailListenerStatus, FlowRecord, NodeType
-
 
 EMAIL_LISTENER_STATE_PATH = FLOWS_DIR.parent / "email_listener_state.json"
 EMAIL_LISTENER_DEFAULT_INTERVAL_SECONDS = 15
@@ -26,7 +26,7 @@ EMAIL_LISTENER_MAX_RESULT_CHARS = 240
 
 
 def _timestamp_now() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(UTC).isoformat()
 
 
 def _normalize_bool(value: object, default: bool) -> bool:
@@ -431,7 +431,12 @@ class EmailListenerWorker:
         if not message_key:
             fallback_key = str(match.get("message_id") or "").strip()
             if not fallback_key:
-                fallback_key = f"{config.protocol}:{hash(json.dumps(match, sort_keys=True, ensure_ascii=False))}"
+                # Use a stable hash: the built-in hash() is per-process salted, so it
+                # would change across restarts and cause the same email to be reprocessed.
+                digest = hashlib.sha256(
+                    json.dumps(match, sort_keys=True, ensure_ascii=False).encode("utf-8")
+                ).hexdigest()
+                fallback_key = f"{config.protocol}:{digest}"
             message_key = fallback_key
             match["message_key"] = message_key
 

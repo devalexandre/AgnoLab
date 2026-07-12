@@ -1,5 +1,15 @@
 import { useRef } from "react";
-import Editor, { type Monaco } from "@monaco-editor/react";
+import Editor, { loader, type Monaco } from "@monaco-editor/react";
+import * as monaco from "monaco-editor";
+import EditorWorker from "monaco-editor/esm/vs/editor/editor.worker?worker";
+
+// Use the bundled monaco-editor instead of loading it from the jsDelivr CDN at
+// runtime, so the editor works offline and under a strict CSP. Python only needs
+// the base editor worker.
+if (typeof window !== "undefined") {
+  self.MonacoEnvironment = { getWorker: () => new EditorWorker() };
+  loader.config({ monaco });
+}
 
 const COMPLETION_PROVIDER_ID = "agnolab-python";
 const MONACO_THEME_ID = "agnolab-agno-dark";

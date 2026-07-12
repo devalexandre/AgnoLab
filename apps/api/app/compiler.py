@@ -1,16 +1,23 @@
 from __future__ import annotations
 
-from collections import defaultdict, deque
-from inspect import signature
 import json
-from pathlib import Path
 import re
+from collections import defaultdict, deque
+from collections.abc import Callable
+from inspect import signature
+from pathlib import Path
+from typing import Any
 
 from jinja2 import Template
 
 from .builtin_tools import inspect_builtin_tool_functions
 from .models import CanvasGraph, GraphNode, NodeType, TargetRuntime
-from .provider_catalog import get_provider_definition, normalize_provider_id, render_provider_model_expression
+from .provider_catalog import (
+    get_provider_definition,
+    normalize_provider_id,
+    render_provider_model_expression,
+    resolve_api_key_env_and_value,
+)
 
 AGENT_TEMPLATE = Template(
     """{{ var_name }} = Agent(
@@ -80,7 +87,7 @@ QUEUE_OUTPUT_NODE_TYPES = {
 }
 
 
-def _detect_project_root() -> Path:
+def detect_project_root() -> Path:
     current = Path(__file__).resolve()
     markers = ("docker-compose.dev.yml", "docker-compose.yml", "README.md")
 
@@ -94,7 +101,7 @@ def _detect_project_root() -> Path:
     return current.parent
 
 
-PROJECT_ROOT = _detect_project_root()
+PROJECT_ROOT = detect_project_root()
 
 DEBUG_TRACE_HELPERS = [
     "def _agnolab_build_media_kwargs(flow_input_files):",
@@ -447,6 +454,11 @@ RAW_EXPRESSION_IMPORTS = {
     "Slack": ("agno.os.interfaces.slack", "Slack"),
     "A2A": ("agno.os.interfaces.a2a", "A2A"),
     "AGUI": ("agno.os.interfaces.agui", "AGUI"),
+    # Guardrails — usable via an agent/team pre_hooks / post_hooks expression.
+    "PIIDetectionGuardrail": ("agno.guardrails", "PIIDetectionGuardrail"),
+    "PromptInjectionGuardrail": ("agno.guardrails", "PromptInjectionGuardrail"),
+    "OpenAIModerationGuardrail": ("agno.guardrails", "OpenAIModerationGuardrail"),
+    "BaseGuardrail": ("agno.guardrails", "BaseGuardrail"),
 }
 
 INTERFACE_IMPORTS: dict[str, tuple[str, str]] = {
@@ -496,6 +508,53 @@ def topological_nodes(graph: CanvasGraph) -> list[GraphNode]:
 
 def incoming_ids(graph: CanvasGraph, node_id: str) -> list[str]:
     return [edge.source for edge in graph.edges if edge.target == node_id]
+
+
+def outgoing_ids(graph: CanvasGraph, node_id: str) -> list[str]:
+    return [edge.target for edge in graph.edges if edge.source == node_id]
+
+
+CONDITION_PRODUCER_TYPES = {NodeType.AGENT, NodeType.TEAM, NodeType.WORKFLOW, NodeType.TOOL}
+
+
+def resolve_condition_producer(
+    graph: CanvasGraph,
+    node_map: dict[str, GraphNode],
+    condition_node: GraphNode,
+) -> GraphNode | None:
+    """Return the real producer (agent/team/workflow/tool) feeding a condition node.
+
+    A condition node routes an upstream result, so the executable producer sits
+    behind it. Returns None when no compilable producer is connected.
+    """
+    for source_id in incoming_ids(graph, condition_node.id):
+        source = node_map.get(source_id)
+        if source and source.type in CONDITION_PRODUCER_TYPES:
+            return source
+    return None
+
+
+def get_condition_expression(condition_node: GraphNode) -> str:
+    return str(getattr(condition_node.data, "condition", "") or "").strip()
+
+
+def render_condition_gate(expression: str) -> list[str]:
+    """Emit code that gates the flow result on a condition rule.
+
+    The rule is evaluated with ``resultado`` (the upstream result text) in scope.
+    A false rule blanks the result; an invalid rule is reported and treated as
+    not met rather than crashing the run.
+    """
+    return [
+        "resultado = flow_result_text",
+        "try:",
+        f"    _agnolab_condition_met = bool({expression})",
+        "except Exception as _agnolab_condition_error:",
+        "    print(f'[condition] rule evaluation failed: {_agnolab_condition_error}')",
+        "    _agnolab_condition_met = False",
+        "if not _agnolab_condition_met:",
+        "    flow_result_text = ''",
+    ]
 
 
 def python_literal(value):
@@ -576,29 +635,75 @@ def get_node_provider_id(node: GraphNode) -> str:
     return normalize_provider_id(str(provider_value))
 
 
-def build_provider_env_setup(node: GraphNode) -> list[str]:
-    provider_config = get_node_provider_config(node)
-    definition = get_provider_definition(get_node_provider_id(node))
-
-    api_key_env_var = str(provider_config.get("provider_api_key_env") or (definition.api_key_env if definition else "") or "").strip()
-    api_key_value = str(provider_config.get("provider_api_key") or "").strip()
-    base_url_env_var = str(provider_config.get("provider_base_url_env") or (definition.base_url_env if definition else "") or "").strip()
-    base_url_value = str(provider_config.get("provider_base_url") or "").strip()
-    extra_env_raw = provider_config.get("provider_env_json")
-
-    lines: list[str] = []
-    if api_key_env_var and api_key_value:
-        lines.append(f"os.environ[{python_literal(api_key_env_var)}] = {python_literal(api_key_value)}")
-    if base_url_env_var and base_url_value:
-        lines.append(f"os.environ[{python_literal(base_url_env_var)}] = {python_literal(base_url_value)}")
-
-    if isinstance(extra_env_raw, str) and extra_env_raw.strip():
-        parsed = parse_json_if_needed(extra_env_raw)
+def _provider_extra_env_items(provider_config: dict[str, object]) -> list[tuple[str, str]]:
+    raw = provider_config.get("provider_env_json")
+    items: list[tuple[str, str]] = []
+    if isinstance(raw, str) and raw.strip():
+        parsed = parse_json_if_needed(raw)
         if isinstance(parsed, dict):
             for key, value in parsed.items():
                 if value in (None, ""):
                     continue
-                lines.append(f"os.environ[{python_literal(str(key))}] = {python_literal(str(value))}")
+                items.append((str(key), str(value)))
+    return items
+
+
+def email_password_env_name(node_id: str) -> str:
+    return f"AGNOLAB_EMAIL_PASSWORD_{sanitize_identifier(node_id)}"
+
+
+def collect_provider_runtime_env(graph: CanvasGraph) -> dict[str, str]:
+    """Collect provider secrets (API keys + extra env values) keyed by env var name.
+
+    These are injected into the code runner's environment at execution time so the
+    generated source (which reads them via os.getenv) never contains the secrets.
+    """
+    runtime_env: dict[str, str] = {}
+    for node in graph.nodes:
+        provider_config = get_node_provider_config(node)
+        if not provider_config:
+            continue
+        env_name, value = resolve_api_key_env_and_value(get_node_provider_id(node), provider_config)
+        if env_name and value:
+            runtime_env[env_name] = value
+        for key, extra_value in _provider_extra_env_items(provider_config):
+            runtime_env[key] = extra_value
+    return runtime_env
+
+
+def collect_email_password_env(graph: CanvasGraph) -> dict[str, str]:
+    """Collect email passwords, keyed by a deterministic per-node env var name."""
+    runtime_env: dict[str, str] = {}
+    for node in graph.nodes:
+        extras = node.data.extras if isinstance(node.data.extras, dict) else {}
+        password = str(extras.get("emailPassword") or "")
+        if password:
+            runtime_env[email_password_env_name(node.id)] = password
+    return runtime_env
+
+
+def collect_graph_runtime_secrets(graph: CanvasGraph) -> dict[str, str]:
+    """Aggregate every user-supplied secret routed through the runner environment."""
+    runtime_env: dict[str, str] = {}
+    runtime_env.update(collect_provider_runtime_env(graph))
+    runtime_env.update(collect_email_password_env(graph))
+    return runtime_env
+
+
+def build_provider_env_setup(node: GraphNode) -> list[str]:
+    provider_config = get_node_provider_config(node)
+    definition = get_provider_definition(get_node_provider_id(node))
+
+    base_url_env_var = str(provider_config.get("provider_base_url_env") or (definition.base_url_env if definition else "") or "").strip()
+    base_url_value = str(provider_config.get("provider_base_url") or "").strip()
+
+    lines: list[str] = []
+    # Secrets are intentionally NOT written here. The API key is read via os.getenv()
+    # in the model constructor, and extra provider env values (provider_env_json) are
+    # injected into the runner env at execution time — neither lands in generated or
+    # exported source. See collect_provider_runtime_env. base_url is not a secret.
+    if base_url_env_var and base_url_value:
+        lines.append(f"os.environ[{python_literal(base_url_env_var)}] = {python_literal(base_url_value)}")
 
     return lines
 
@@ -1741,7 +1846,8 @@ def render_input_payload(node: GraphNode) -> list[str]:
             "port": email_port,
             "mailbox": str(extras.get("emailMailbox") or "INBOX").strip() or "INBOX",
             "username": str(extras.get("emailUsername") or "").strip(),
-            "password": str(extras.get("emailPassword") or ""),
+            # Password is injected via the runner environment, never inlined here.
+            "password": "",
             "max_messages": email_max_messages,
             "unread_only": normalize_bool(extras.get("emailUnreadOnly"), True if email_protocol == "imap" else False),
             "subject_filter": str(extras.get("emailSubjectFilter") or "").strip(),
@@ -1762,6 +1868,7 @@ def render_input_payload(node: GraphNode) -> list[str]:
             "flow_input_files = []",
             f"flow_input_metadata = {python_literal(metadata_payload)}",
             f"_agnolab_email_config = {python_literal(email_config)}",
+            f"_agnolab_email_config['password'] = os.getenv({python_literal(email_password_env_name(node.id))}, '')",
             "",
             "def _agnolab_decode_email_header(value):",
             "    if not value:",
@@ -2365,7 +2472,7 @@ def render_output_api_dispatch(node: GraphNode, *, project_name: str) -> tuple[l
                 f"_agnolab_email_port = {email_port}",
                 f"_agnolab_email_security = {python_literal(email_security)}",
                 f"_agnolab_email_username = {python_literal(str(extras.get('emailUsername') or '').strip())}",
-                f"_agnolab_email_password = {python_literal(str(extras.get('emailPassword') or ''))}",
+                f"_agnolab_email_password = os.getenv({python_literal(email_password_env_name(node.id))}, '')",
                 f"_agnolab_email_from = {python_literal(email_from)}",
                 f"_agnolab_email_to = {python_literal(email_to)}",
                 f"_agnolab_email_cc = {python_literal(str(extras.get('emailCc') or '').strip())}",
@@ -2756,7 +2863,666 @@ def render_knowledge_file_ingestion(knowledge_targets: list[dict[str, object]]) 
     return lines
 
 
-def compile_graph(graph: CanvasGraph) -> tuple[str, list[str]]:
+def render_agent_os_serve(
+    ordered_nodes: list[GraphNode],
+    symbol_map: dict[str, str],
+    graph: CanvasGraph,
+) -> tuple[list[str], list[str]]:
+    """Emit an AgentOS app that serves the graph's agents/teams/workflows.
+
+    Returns (code_lines, warnings). This is the 'serve' export target: instead of a
+    run-once script, the generated main.py exposes a FastAPI app runnable with uvicorn.
+    """
+    warnings: list[str] = []
+    agents = [symbol_map[n.id] for n in ordered_nodes if n.type == NodeType.AGENT and n.id in symbol_map]
+    teams = [symbol_map[n.id] for n in ordered_nodes if n.type == NodeType.TEAM and n.id in symbol_map]
+    workflows = [symbol_map[n.id] for n in ordered_nodes if n.type == NodeType.WORKFLOW and n.id in symbol_map]
+
+    if not (agents or teams or workflows):
+        warnings.append("AgentOS serve target has no agent, team, or workflow to serve.")
+
+    args: list[str] = []
+    if graph.project.name:
+        args.append(f"name={python_literal(graph.project.name)}")
+    if agents:
+        args.append(f"agents=[{', '.join(agents)}]")
+    if teams:
+        args.append(f"teams=[{', '.join(teams)}]")
+    if workflows:
+        args.append(f"workflows=[{', '.join(workflows)}]")
+
+    lines = [
+        "",
+        f"agent_os = AgentOS({', '.join(args)})",
+        "app = agent_os.get_app()",
+        "",
+        'if __name__ == "__main__":',
+        '    agent_os.serve(app="main:app", host="0.0.0.0", port=7777)',
+    ]
+    return lines, warnings
+
+
+def render_agent_node(
+    node: GraphNode,
+    var_name: str,
+    graph: CanvasGraph,
+    node_map: dict[str, GraphNode],
+    symbol_map: dict[str, str],
+    provider_class_refs: dict[str, str],
+    register_knowledge_target: Callable[..., None],
+) -> tuple[list[str], list[str]]:
+    """Emit the definition for a single agent node, wiring its connected resources."""
+    lines: list[str] = []
+    warnings: list[str] = []
+
+    provider_id = get_node_provider_id(node)
+    incoming_source_ids = incoming_ids(graph, node.id)
+
+    def _connected_symbol(node_type: NodeType) -> str | None:
+        return next(
+            (
+                symbol_map[source_id]
+                for source_id in incoming_source_ids
+                if source_id in symbol_map and node_map.get(source_id) and node_map[source_id].type == node_type
+            ),
+            None,
+        )
+
+    def _connected_node(node_type: NodeType) -> GraphNode | None:
+        return next(
+            (
+                node_map[source_id]
+                for source_id in incoming_source_ids
+                if source_id in symbol_map and node_map.get(source_id) and node_map[source_id].type == node_type
+            ),
+            None,
+        )
+
+    tool_symbols = [
+        symbol_map[source_id]
+        for source_id in incoming_source_ids
+        if source_id in symbol_map and node_map.get(source_id) and node_map[source_id].type == NodeType.TOOL
+    ]
+    connected_db_symbol = _connected_symbol(NodeType.DATABASE)
+    connected_knowledge_symbol = _connected_symbol(NodeType.KNOWLEDGE)
+    connected_knowledge_node = _connected_node(NodeType.KNOWLEDGE)
+    connected_skills_symbol = _connected_symbol(NodeType.SKILLS)
+    connected_skills_node = _connected_node(NodeType.SKILLS)
+    connected_vector_symbol = _connected_symbol(NodeType.VECTOR_DB)
+    connected_memory_manager_symbol = _connected_symbol(NodeType.MEMORY_MANAGER)
+    connected_session_summary_manager_symbol = _connected_symbol(NodeType.SESSION_SUMMARY_MANAGER)
+    connected_compression_manager_symbol = _connected_symbol(NodeType.COMPRESSION_MANAGER)
+    connected_learning_machine_symbol = _connected_symbol(NodeType.LEARNING_MACHINE)
+
+    env_setup_lines = build_provider_env_setup(node)
+    if env_setup_lines:
+        lines.extend(env_setup_lines)
+    provider_class_ref = provider_class_refs.get(provider_id)
+    excluded_fields: set[str] = set()
+    if connected_db_symbol:
+        excluded_fields.add("db")
+    if connected_knowledge_symbol or connected_vector_symbol:
+        excluded_fields.add("knowledge")
+    if connected_skills_symbol:
+        excluded_fields.add("skills")
+    if connected_memory_manager_symbol:
+        excluded_fields.add("memory_manager")
+    if connected_session_summary_manager_symbol:
+        excluded_fields.add("session_summary_manager")
+    if connected_compression_manager_symbol:
+        excluded_fields.add("compression_manager")
+    if connected_learning_machine_symbol:
+        excluded_fields.add("learning")
+    extras = node.data.extras or {}
+    agent_config = extras.get("agentConfig") or {}
+    has_manual_skills = isinstance(agent_config, dict) and agent_config.get("skills") not in (None, "", [], {})
+    extra_instruction_blocks: list[str] = []
+    if connected_skills_symbol:
+        extra_instruction_blocks.append(build_skills_usage_guidance(connected_skills_node))
+    elif has_manual_skills:
+        extra_instruction_blocks.append(build_skills_usage_guidance())
+    agent_kwargs, agent_warnings = build_agent_kwargs(
+        node,
+        tool_symbols,
+        provider_class_ref,
+        excluded_fields,
+        extra_instruction_blocks,
+    )
+    warnings.extend(agent_warnings)
+    if connected_db_symbol:
+        agent_kwargs += f"\n    db={connected_db_symbol},"
+    if connected_knowledge_symbol:
+        agent_kwargs += f"\n    knowledge={connected_knowledge_symbol},"
+    elif connected_vector_symbol:
+        agent_kwargs += f"\n    knowledge=Knowledge(vector_db={connected_vector_symbol}),"
+    if connected_skills_symbol:
+        agent_kwargs += f"\n    skills={connected_skills_symbol},"
+    if connected_memory_manager_symbol:
+        agent_kwargs += f"\n    memory_manager={connected_memory_manager_symbol},"
+    if connected_session_summary_manager_symbol:
+        agent_kwargs += f"\n    session_summary_manager={connected_session_summary_manager_symbol},"
+    if connected_compression_manager_symbol:
+        agent_kwargs += f"\n    compression_manager={connected_compression_manager_symbol},"
+    if connected_learning_machine_symbol:
+        agent_kwargs += f"\n    learning={connected_learning_machine_symbol},"
+    has_manual_knowledge = isinstance(agent_config, dict) and agent_config.get("knowledge") not in (None, "", [], {})
+    if connected_knowledge_symbol and connected_knowledge_node:
+        register_knowledge_target(var_name, connected_knowledge_node)
+    elif connected_vector_symbol or has_manual_knowledge:
+        register_knowledge_target(var_name)
+    lines.append(
+        AGENT_TEMPLATE.render(
+            var_name=var_name,
+            kwargs=agent_kwargs,
+        ).rstrip()
+    )
+    lines.append("")
+    return lines, warnings
+
+
+def get_workflow_step_order(step_node: GraphNode) -> tuple[int, float, float, str]:
+    """Sort key for workflow steps: explicit step order, then canvas position, then name."""
+    extras = step_node.data.extras or {}
+    raw_order = extras.get("stepOrder")
+    try:
+        step_order = int(raw_order)
+    except (TypeError, ValueError):
+        step_order = 9999
+    return (
+        step_order,
+        step_node.position.x,
+        step_node.position.y,
+        step_node.data.name or step_node.id,
+    )
+
+
+def render_workflow_step_node(
+    node: GraphNode,
+    var_name: str,
+    graph: CanvasGraph,
+    node_map: dict[str, GraphNode],
+    symbol_map: dict[str, str],
+) -> tuple[list[str], list[str]]:
+    """Emit the definition for a single workflow-step node, resolving its executor."""
+    lines: list[str] = []
+    warnings: list[str] = []
+
+    incoming_source_ids = incoming_ids(graph, node.id)
+    connected_agent_ids = [
+        source_id
+        for source_id in incoming_source_ids
+        if source_id in symbol_map and node_map.get(source_id) and node_map[source_id].type == NodeType.AGENT
+    ]
+    connected_team_ids = [
+        source_id
+        for source_id in incoming_source_ids
+        if source_id in symbol_map and node_map.get(source_id) and node_map[source_id].type == NodeType.TEAM
+    ]
+    connected_tool_ids = [
+        source_id
+        for source_id in incoming_source_ids
+        if source_id in symbol_map and node_map.get(source_id) and node_map[source_id].type == NodeType.TOOL
+    ]
+    connected_builtin_tool_ids = [
+        source_id
+        for source_id in connected_tool_ids
+        if str((node_map[source_id].data.extras or {}).get("toolMode", "builtin")) == "builtin"
+    ]
+    connected_function_tool_ids = [
+        source_id
+        for source_id in connected_tool_ids
+        if source_id not in connected_builtin_tool_ids
+    ]
+    connected_agent_symbol = symbol_map[connected_agent_ids[0]] if connected_agent_ids else None
+    connected_team_symbol = symbol_map[connected_team_ids[0]] if connected_team_ids else None
+    connected_executor_symbol: str | None = None
+    primary_executor_label: str | None = None
+    primary_builtin_tool_id: str | None = None
+    if connected_agent_symbol:
+        primary_executor_label = "Agent"
+    elif connected_team_symbol:
+        primary_executor_label = "Team"
+    elif connected_function_tool_ids:
+        connected_executor_symbol = symbol_map[connected_function_tool_ids[0]]
+        primary_executor_label = "Function Tool"
+    elif connected_builtin_tool_ids:
+        primary_builtin_tool_id = connected_builtin_tool_ids[0]
+        primary_executor_label = "Built-in Tool"
+    additional_executor_labels: list[str] = []
+    if connected_agent_ids:
+        agent_labels = ["Agent" for _ in connected_agent_ids]
+        if primary_executor_label == "Agent":
+            additional_executor_labels.extend(agent_labels[1:])
+        else:
+            additional_executor_labels.extend(agent_labels)
+    if connected_team_ids:
+        team_labels = ["Team" for _ in connected_team_ids]
+        if primary_executor_label == "Team":
+            additional_executor_labels.extend(team_labels[1:])
+        else:
+            additional_executor_labels.extend(team_labels)
+    if connected_function_tool_ids:
+        tool_labels = ["Function Tool" for _ in connected_function_tool_ids]
+        if primary_executor_label == "Function Tool":
+            additional_executor_labels.extend(tool_labels[1:])
+        else:
+            additional_executor_labels.extend(tool_labels)
+    if connected_builtin_tool_ids:
+        tool_labels = ["Built-in Tool" for _ in connected_builtin_tool_ids]
+        if primary_executor_label == "Built-in Tool":
+            additional_executor_labels.extend(tool_labels[1:])
+        else:
+            additional_executor_labels.extend(tool_labels)
+    if primary_builtin_tool_id:
+        builtin_tool_var_name = sanitize_identifier(f"{var_name}_{primary_builtin_tool_id}_executor")
+        builtin_tool_lines, builtin_tool_warnings = build_builtin_tool_workflow_executor(
+            step_node=node,
+            tool_node=node_map[primary_builtin_tool_id],
+            tool_symbol=symbol_map[primary_builtin_tool_id],
+            executor_var_name=builtin_tool_var_name,
+        )
+        warnings.extend(builtin_tool_warnings)
+        if builtin_tool_lines:
+            lines.extend(builtin_tool_lines)
+            connected_executor_symbol = builtin_tool_var_name
+    step_kwargs, step_warnings = build_workflow_step_kwargs(
+        node,
+        agent_symbol=connected_agent_symbol,
+        team_symbol=connected_team_symbol,
+        executor_symbol=connected_executor_symbol,
+        executor_label=primary_executor_label,
+        additional_executor_labels=additional_executor_labels,
+    )
+    warnings.extend(step_warnings)
+    lines.append(
+        STEP_TEMPLATE.render(
+            var_name=var_name,
+            kwargs=step_kwargs,
+        ).rstrip()
+    )
+    lines.append("")
+    return lines, warnings
+
+
+def render_workflow_node(
+    node: GraphNode,
+    var_name: str,
+    graph: CanvasGraph,
+    node_map: dict[str, GraphNode],
+    symbol_map: dict[str, str],
+) -> tuple[list[str], list[str]]:
+    """Emit the definition for a single workflow node, wiring its ordered steps."""
+    lines: list[str] = []
+    warnings: list[str] = []
+
+    incoming_source_ids = incoming_ids(graph, node.id)
+    connected_db_symbol = next(
+        (
+            symbol_map[source_id]
+            for source_id in incoming_source_ids
+            if source_id in symbol_map and node_map.get(source_id) and node_map[source_id].type == NodeType.DATABASE
+        ),
+        None,
+    )
+    connected_step_nodes = sorted(
+        [
+            node_map[source_id]
+            for source_id in incoming_source_ids
+            if source_id in symbol_map and node_map.get(source_id) and node_map[source_id].type == NodeType.WORKFLOW_STEP
+        ],
+        key=get_workflow_step_order,
+    )
+    connected_step_symbols = [symbol_map[step_node.id] for step_node in connected_step_nodes if step_node.id in symbol_map]
+    if not connected_step_symbols:
+        warnings.append(f"Workflow '{node.data.name}' has no connected workflow steps.")
+    excluded_fields: set[str] = set()
+    if connected_db_symbol:
+        excluded_fields.add("db")
+    workflow_kwargs, workflow_warnings = build_workflow_kwargs(node, connected_step_symbols, excluded_fields)
+    warnings.extend(workflow_warnings)
+    if connected_db_symbol:
+        workflow_kwargs += f"\n    db={connected_db_symbol},"
+    lines.append(
+        WORKFLOW_TEMPLATE.render(
+            var_name=var_name,
+            kwargs=workflow_kwargs,
+        ).rstrip()
+    )
+    lines.append("")
+    return lines, warnings
+
+
+def render_team_node(
+    node: GraphNode,
+    var_name: str,
+    graph: CanvasGraph,
+    node_map: dict[str, GraphNode],
+    symbol_map: dict[str, str],
+    provider_class_refs: dict[str, str],
+    register_knowledge_target: Callable[..., None],
+) -> tuple[list[str], list[str]]:
+    """Emit the definition for a single team node, wiring members and connected resources."""
+    lines: list[str] = []
+    warnings: list[str] = []
+
+    provider_id = get_node_provider_id(node)
+    incoming_source_ids = incoming_ids(graph, node.id)
+
+    def _connected_symbol(node_type: NodeType) -> str | None:
+        return next(
+            (
+                symbol_map[source_id]
+                for source_id in incoming_source_ids
+                if source_id in symbol_map and node_map.get(source_id) and node_map[source_id].type == node_type
+            ),
+            None,
+        )
+
+    def _connected_node(node_type: NodeType) -> GraphNode | None:
+        return next(
+            (
+                node_map[source_id]
+                for source_id in incoming_source_ids
+                if source_id in symbol_map and node_map.get(source_id) and node_map[source_id].type == node_type
+            ),
+            None,
+        )
+
+    member_symbols = [
+        symbol_map[source_id]
+        for source_id in incoming_source_ids
+        if source_id in symbol_map
+        and node_map.get(source_id)
+        and node_map[source_id].type in {NodeType.AGENT, NodeType.TEAM}
+    ]
+    tool_symbols = [
+        symbol_map[source_id]
+        for source_id in incoming_source_ids
+        if source_id in symbol_map and node_map.get(source_id) and node_map[source_id].type == NodeType.TOOL
+    ]
+    connected_db_symbol = _connected_symbol(NodeType.DATABASE)
+    connected_knowledge_symbol = _connected_symbol(NodeType.KNOWLEDGE)
+    connected_knowledge_node = _connected_node(NodeType.KNOWLEDGE)
+    connected_vector_symbol = _connected_symbol(NodeType.VECTOR_DB)
+    connected_memory_manager_symbol = _connected_symbol(NodeType.MEMORY_MANAGER)
+    connected_session_summary_manager_symbol = _connected_symbol(NodeType.SESSION_SUMMARY_MANAGER)
+    connected_compression_manager_symbol = _connected_symbol(NodeType.COMPRESSION_MANAGER)
+    connected_learning_machine_symbol = _connected_symbol(NodeType.LEARNING_MACHINE)
+
+    env_setup_lines = build_provider_env_setup(node)
+    if env_setup_lines:
+        lines.extend(env_setup_lines)
+    provider_class_ref = provider_class_refs.get(provider_id)
+    excluded_fields: set[str] = set()
+    if connected_db_symbol:
+        excluded_fields.add("db")
+    if connected_knowledge_symbol or connected_vector_symbol:
+        excluded_fields.add("knowledge")
+    if connected_memory_manager_symbol:
+        excluded_fields.add("memory_manager")
+    if connected_session_summary_manager_symbol:
+        excluded_fields.add("session_summary_manager")
+    if connected_compression_manager_symbol:
+        excluded_fields.add("compression_manager")
+    if connected_learning_machine_symbol:
+        excluded_fields.add("learning")
+    team_kwargs, team_warnings = build_team_kwargs(node, member_symbols, tool_symbols, provider_class_ref, excluded_fields)
+    warnings.extend(team_warnings)
+    if connected_db_symbol:
+        team_kwargs += f"\n    db={connected_db_symbol},"
+    if connected_knowledge_symbol:
+        team_kwargs += f"\n    knowledge={connected_knowledge_symbol},"
+    elif connected_vector_symbol:
+        team_kwargs += f"\n    knowledge=Knowledge(vector_db={connected_vector_symbol}),"
+    if connected_memory_manager_symbol:
+        team_kwargs += f"\n    memory_manager={connected_memory_manager_symbol},"
+    if connected_session_summary_manager_symbol:
+        team_kwargs += f"\n    session_summary_manager={connected_session_summary_manager_symbol},"
+    if connected_compression_manager_symbol:
+        team_kwargs += f"\n    compression_manager={connected_compression_manager_symbol},"
+    if connected_learning_machine_symbol:
+        team_kwargs += f"\n    learning={connected_learning_machine_symbol},"
+    extras = node.data.extras or {}
+    team_config = extras.get("teamConfig") or {}
+    has_manual_knowledge = isinstance(team_config, dict) and team_config.get("knowledge") not in (None, "", [], {})
+    if connected_knowledge_symbol and connected_knowledge_node:
+        register_knowledge_target(var_name, connected_knowledge_node)
+    elif connected_vector_symbol or has_manual_knowledge:
+        register_knowledge_target(var_name)
+    lines.append(
+        TEAM_TEMPLATE.render(
+            var_name=var_name,
+            kwargs=team_kwargs,
+        ).rstrip()
+    )
+    lines.append("")
+    return lines, warnings
+
+
+def render_input_setup(
+    input_nodes: list[GraphNode],
+    knowledge_target_specs: list[dict[str, object]],
+) -> tuple[list[str], list[str]]:
+    """Emit the flow input payload, media kwargs, and knowledge ingestion setup."""
+    lines: list[str] = []
+    warnings: list[str] = []
+
+    if not input_nodes:
+        warnings.append("No input node found; preview uses a default prompt string.")
+        lines.append('flow_input = "Explain what this flow does."')
+        lines.append("flow_input_payload = {'text': flow_input, 'files': [], 'metadata': {}}")
+        lines.append("flow_input_files = []")
+        lines.append("flow_input_file_path = None")
+    else:
+        lines.extend(render_input_payload(input_nodes[0]))
+
+    lines.append("")
+    lines.append("_agnolab_media_kwargs = _agnolab_build_media_kwargs(flow_input_files)")
+    lines.append("_agnolab_media_kwargs['__flow_input_metadata__'] = flow_input_metadata")
+    lines.append("")
+    lines.extend(render_knowledge_file_ingestion(knowledge_target_specs))
+    return lines, warnings
+
+
+def render_import_tail(
+    *,
+    needs_tool_decorator: bool,
+    has_workflow_nodes: bool,
+    has_direct_vector_db_runner_link: bool,
+    knowledge_reader_imports: set[tuple[str, str]],
+    interface_imports: set[tuple[str, str]],
+    raw_expression_import_lines: list[str],
+    provider_import_lines: list[str],
+    tool_imports: set[tuple[str, str]],
+    has_output_api: bool,
+) -> list[str]:
+    """Build the import lines that follow the header, from the collected node state."""
+    lines: list[str] = []
+    if needs_tool_decorator:
+        lines.append("from agno.tools import tool")
+    if has_workflow_nodes:
+        lines.append("from agno.workflow import Step, Workflow")
+    if has_direct_vector_db_runner_link:
+        lines.append("from agno.knowledge.knowledge import Knowledge")
+    for module, class_name in sorted(knowledge_reader_imports):
+        lines.append(f"from {module} import {class_name}")
+    for module, class_name in sorted(interface_imports):
+        lines.append(f"from {module} import {class_name}")
+    lines.extend(raw_expression_import_lines)
+    lines.extend(provider_import_lines)
+    for import_path, class_name in sorted(tool_imports):
+        lines.append(f"from {import_path} import {class_name}")
+    if has_output_api:
+        lines.append("from datetime import datetime, timezone")
+        lines.append("import requests")
+    return lines
+
+
+def render_flow_run_block(
+    graph: CanvasGraph,
+    node_map: dict[str, GraphNode],
+    symbol_map: dict[str, str],
+    ordered_nodes: list[GraphNode],
+    terminal_nodes: list[GraphNode],
+) -> tuple[list[str], list[str]]:
+    """Emit the run-once execution block: pick a producer, run it, print the result.
+
+    Returns (code_lines, warnings). Handles the output-node path (with condition
+    gating and output-API/queue dispatch) and the no-output-node inference path.
+    """
+    lines: list[str] = []
+    warnings: list[str] = []
+
+    if terminal_nodes:
+        output_node = terminal_nodes[0]
+        if len(terminal_nodes) > 1:
+            warnings.append("Multiple output nodes found; using the first connected output in topological order.")
+
+        upstream = [
+            source_id
+            for source_id in incoming_ids(graph, output_node.id)
+            if node_map.get(source_id)
+            and node_map[source_id].type in {
+                NodeType.INPUT,
+                *QUEUE_INPUT_NODE_TYPES,
+                NodeType.AGENT,
+                NodeType.TEAM,
+                NodeType.WORKFLOW,
+                NodeType.TOOL,
+                NodeType.CONDITION,
+            }
+        ]
+
+        if len(upstream) > 1:
+            node_type_priority = {
+                NodeType.CONDITION: 0,
+                NodeType.AGENT: 0,
+                NodeType.TEAM: 1,
+                NodeType.WORKFLOW: 2,
+                NodeType.TOOL: 3,
+                NodeType.INPUT: 4,
+                NodeType.RABBITMQ_INPUT: 4,
+                NodeType.KAFKA_INPUT: 4,
+                NodeType.REDIS_INPUT: 4,
+                NodeType.NATS_INPUT: 4,
+                NodeType.SQS_INPUT: 4,
+                NodeType.PUBSUB_INPUT: 4,
+            }
+            upstream = sorted(
+                upstream,
+                key=lambda source_id: (
+                    node_type_priority.get(node_map[source_id].type, 99),
+                    incoming_ids(graph, output_node.id).index(source_id),
+                ),
+            )
+
+        producer_node = node_map.get(upstream[0]) if upstream else None
+        producer_symbol = symbol_map.get(upstream[0]) if upstream else None
+
+        # A condition node gates an upstream producer's result. Resolve the real
+        # producer behind it and apply the rule as a runtime gate on the result.
+        condition_expression = ""
+        if producer_node and producer_node.type == NodeType.CONDITION:
+            condition_node = producer_node
+            condition_expression = get_condition_expression(condition_node)
+            if len(outgoing_ids(graph, condition_node.id)) > 1:
+                warnings.append(
+                    f"Condition node '{condition_node.data.name}' has multiple downstream targets; "
+                    "branching to different targets is not supported yet, so the rule only gates the single flow result."
+                )
+            resolved_producer = resolve_condition_producer(graph, node_map, condition_node)
+            if resolved_producer is None:
+                warnings.append(
+                    f"Condition node '{condition_node.data.name}' has no agent/team/workflow/tool producer upstream; "
+                    "the rule cannot be evaluated."
+                )
+                producer_node = None
+                producer_symbol = None
+            else:
+                producer_node = resolved_producer
+                producer_symbol = symbol_map.get(resolved_producer.id)
+
+        if producer_node and producer_node.type in {NodeType.AGENT, NodeType.TEAM} and producer_symbol:
+            lines.append(f"result = _agnolab_run_with_debug({producer_symbol}, flow_input, _agnolab_media_kwargs)")
+            lines.append("flow_result_text = result.content if result is not None else ''")
+        elif producer_node and producer_node.type == NodeType.WORKFLOW and producer_symbol:
+            lines.append(f"result = _agnolab_run_workflow_with_debug({producer_symbol}, flow_input, _agnolab_media_kwargs)")
+            lines.append("flow_result_text = _agnolab_workflow_result_text(result)")
+        elif producer_node and producer_node.type == NodeType.TOOL and producer_symbol:
+            lines.append(f"result = {producer_symbol}(flow_input)")
+            lines.append("flow_result_text = str(result) if result is not None else ''")
+        elif producer_node and producer_node.type in {NodeType.INPUT, *QUEUE_INPUT_NODE_TYPES}:
+            lines.append("flow_result_text = str(flow_input_payload.get('text') or flow_input)")
+        else:
+            warnings.append("Output node has no valid upstream producer.")
+            lines.append("flow_result_text = str(flow_input_payload.get('text') or flow_input)")
+
+        if condition_expression:
+            lines.extend(render_condition_gate(condition_expression))
+
+        lines.append(f"print({python_literal(RESULT_START_MARKER)})")
+        lines.append("print(flow_result_text)")
+        lines.append(f"print({python_literal(RESULT_END_MARKER)})")
+
+        if output_node.type == NodeType.OUTPUT_API:
+            output_lines, output_warnings = render_output_api_dispatch(output_node, project_name=graph.project.name)
+            lines.extend(output_lines)
+            warnings.extend(output_warnings)
+        elif output_node.type in QUEUE_OUTPUT_NODE_TYPES:
+            warnings.append(
+                f"Queue output node '{output_node.data.name}' is dispatched when the flow runs through AgnoLab, "
+                "but the exported standalone script does not publish to it yet."
+            )
+    else:
+        executable_types = {NodeType.AGENT, NodeType.TEAM, NodeType.WORKFLOW, NodeType.TOOL}
+        executable_nodes = [node for node in ordered_nodes if node.type in executable_types]
+
+        inferred_producer_node: GraphNode | None = None
+        for candidate in reversed(executable_nodes):
+            has_executable_downstream = any(
+                edge.source == candidate.id
+                and node_map.get(edge.target)
+                and node_map[edge.target].type in executable_types
+                for edge in graph.edges
+            )
+            if not has_executable_downstream:
+                inferred_producer_node = candidate
+                break
+
+        if inferred_producer_node is None and executable_nodes:
+            inferred_producer_node = executable_nodes[-1]
+
+        inferred_symbol = symbol_map.get(inferred_producer_node.id) if inferred_producer_node else None
+        if inferred_producer_node and inferred_producer_node.type in {NodeType.AGENT, NodeType.TEAM} and inferred_symbol:
+            warnings.append(
+                f"No output node found; inferring flow result from '{inferred_producer_node.data.name}' to support runtime integrations."
+            )
+            lines.append(f"result = _agnolab_run_with_debug({inferred_symbol}, flow_input, _agnolab_media_kwargs)")
+            lines.append("flow_result_text = result.content if result is not None else ''")
+        elif inferred_producer_node and inferred_producer_node.type == NodeType.WORKFLOW and inferred_symbol:
+            warnings.append(
+                f"No output node found; inferring flow result from workflow '{inferred_producer_node.data.name}' to support runtime integrations."
+            )
+            lines.append(f"result = _agnolab_run_workflow_with_debug({inferred_symbol}, flow_input, _agnolab_media_kwargs)")
+            lines.append("flow_result_text = _agnolab_workflow_result_text(result)")
+        elif inferred_producer_node and inferred_producer_node.type == NodeType.TOOL and inferred_symbol:
+            warnings.append(
+                f"No output node found; inferring flow result from Tool '{inferred_producer_node.data.name}' to support runtime integrations."
+            )
+            lines.append(f"result = {inferred_symbol}(flow_input)")
+            lines.append("flow_result_text = str(result) if result is not None else ''")
+        else:
+            warnings.append("No output node found; preview uses the raw flow input.")
+            lines.append("flow_result_text = str(flow_input_payload.get('text') or flow_input)")
+
+        lines.append(f"print({python_literal(RESULT_START_MARKER)})")
+        lines.append("print(flow_result_text)")
+        lines.append(f"print({python_literal(RESULT_END_MARKER)})")
+
+    return lines, warnings
+
+
+def compile_graph(graph: CanvasGraph, *, serve: bool = False) -> tuple[str, list[str]]:
     warnings: list[str] = []
 
     if graph.project.target != TargetRuntime.AGNO_PYTHON:
@@ -2809,20 +3575,6 @@ def compile_graph(graph: CanvasGraph) -> tuple[str, list[str]]:
             }
         )
 
-    def get_workflow_step_order(step_node: GraphNode) -> tuple[int, float, float, str]:
-        extras = step_node.data.extras or {}
-        raw_order = extras.get("stepOrder")
-        try:
-            step_order = int(raw_order)
-        except (TypeError, ValueError):
-            step_order = 9999
-        return (
-            step_order,
-            step_node.position.x,
-            step_node.position.y,
-            step_node.data.name or step_node.id,
-        )
-
     for node in ordered_nodes:
         var_name = sanitize_identifier(f"{node.type.value}_{node.id}")
         symbol_map[node.id] = var_name
@@ -2861,437 +3613,58 @@ def compile_graph(graph: CanvasGraph) -> tuple[str, list[str]]:
             continue
 
         if node.type == NodeType.AGENT:
-            provider_id = get_node_provider_id(node)
-            incoming_source_ids = incoming_ids(graph, node.id)
-            tool_symbols = [
-                symbol_map[source_id]
-                for source_id in incoming_source_ids
-                if source_id in symbol_map and node_map.get(source_id) and node_map[source_id].type == NodeType.TOOL
-            ]
-            connected_db_symbol = next(
-                (
-                    symbol_map[source_id]
-                    for source_id in incoming_source_ids
-                    if source_id in symbol_map and node_map.get(source_id) and node_map[source_id].type == NodeType.DATABASE
-                ),
-                None,
+            agent_lines, agent_warnings = render_agent_node(
+                node, var_name, graph, node_map, symbol_map, provider_class_refs, register_knowledge_target
             )
-            connected_knowledge_symbol = next(
-                (
-                    symbol_map[source_id]
-                    for source_id in incoming_source_ids
-                    if source_id in symbol_map and node_map.get(source_id) and node_map[source_id].type == NodeType.KNOWLEDGE
-                ),
-                None,
-            )
-            connected_knowledge_node = next(
-                (
-                    node_map[source_id]
-                    for source_id in incoming_source_ids
-                    if source_id in symbol_map and node_map.get(source_id) and node_map[source_id].type == NodeType.KNOWLEDGE
-                ),
-                None,
-            )
-            connected_skills_symbol = next(
-                (
-                    symbol_map[source_id]
-                    for source_id in incoming_source_ids
-                    if source_id in symbol_map and node_map.get(source_id) and node_map[source_id].type == NodeType.SKILLS
-                ),
-                None,
-            )
-            connected_skills_node = next(
-                (
-                    node_map[source_id]
-                    for source_id in incoming_source_ids
-                    if source_id in symbol_map and node_map.get(source_id) and node_map[source_id].type == NodeType.SKILLS
-                ),
-                None,
-            )
-            connected_vector_symbol = next(
-                (
-                    symbol_map[source_id]
-                    for source_id in incoming_source_ids
-                    if source_id in symbol_map and node_map.get(source_id) and node_map[source_id].type == NodeType.VECTOR_DB
-                ),
-                None,
-            )
-            connected_memory_manager_symbol = next(
-                (
-                    symbol_map[source_id]
-                    for source_id in incoming_source_ids
-                    if source_id in symbol_map and node_map.get(source_id) and node_map[source_id].type == NodeType.MEMORY_MANAGER
-                ),
-                None,
-            )
-            connected_session_summary_manager_symbol = next(
-                (
-                    symbol_map[source_id]
-                    for source_id in incoming_source_ids
-                    if source_id in symbol_map and node_map.get(source_id) and node_map[source_id].type == NodeType.SESSION_SUMMARY_MANAGER
-                ),
-                None,
-            )
-            connected_compression_manager_symbol = next(
-                (
-                    symbol_map[source_id]
-                    for source_id in incoming_source_ids
-                    if source_id in symbol_map and node_map.get(source_id) and node_map[source_id].type == NodeType.COMPRESSION_MANAGER
-                ),
-                None,
-            )
-            connected_learning_machine_symbol = next(
-                (
-                    symbol_map[source_id]
-                    for source_id in incoming_source_ids
-                    if source_id in symbol_map and node_map.get(source_id) and node_map[source_id].type == NodeType.LEARNING_MACHINE
-                ),
-                None,
-            )
-            env_setup_lines = build_provider_env_setup(node)
-            if env_setup_lines:
-                lines.extend(env_setup_lines)
-            provider_class_ref = provider_class_refs.get(provider_id)
-            excluded_fields: set[str] = set()
-            if connected_db_symbol:
-                excluded_fields.add("db")
-            if connected_knowledge_symbol or connected_vector_symbol:
-                excluded_fields.add("knowledge")
-            if connected_skills_symbol:
-                excluded_fields.add("skills")
-            if connected_memory_manager_symbol:
-                excluded_fields.add("memory_manager")
-            if connected_session_summary_manager_symbol:
-                excluded_fields.add("session_summary_manager")
-            if connected_compression_manager_symbol:
-                excluded_fields.add("compression_manager")
-            if connected_learning_machine_symbol:
-                excluded_fields.add("learning")
-            extras = node.data.extras or {}
-            agent_config = extras.get("agentConfig") or {}
-            has_manual_skills = isinstance(agent_config, dict) and agent_config.get("skills") not in (None, "", [], {})
-            extra_instruction_blocks: list[str] = []
-            if connected_skills_symbol:
-                extra_instruction_blocks.append(build_skills_usage_guidance(connected_skills_node))
-            elif has_manual_skills:
-                extra_instruction_blocks.append(build_skills_usage_guidance())
-            agent_kwargs, agent_warnings = build_agent_kwargs(
-                node,
-                tool_symbols,
-                provider_class_ref,
-                excluded_fields,
-                extra_instruction_blocks,
-            )
+            lines.extend(agent_lines)
             warnings.extend(agent_warnings)
-            if connected_db_symbol:
-                agent_kwargs += f"\n    db={connected_db_symbol},"
-            if connected_knowledge_symbol:
-                agent_kwargs += f"\n    knowledge={connected_knowledge_symbol},"
-            elif connected_vector_symbol:
-                agent_kwargs += f"\n    knowledge=Knowledge(vector_db={connected_vector_symbol}),"
-            if connected_skills_symbol:
-                agent_kwargs += f"\n    skills={connected_skills_symbol},"
-            if connected_memory_manager_symbol:
-                agent_kwargs += f"\n    memory_manager={connected_memory_manager_symbol},"
-            if connected_session_summary_manager_symbol:
-                agent_kwargs += f"\n    session_summary_manager={connected_session_summary_manager_symbol},"
-            if connected_compression_manager_symbol:
-                agent_kwargs += f"\n    compression_manager={connected_compression_manager_symbol},"
-            if connected_learning_machine_symbol:
-                agent_kwargs += f"\n    learning={connected_learning_machine_symbol},"
-            has_manual_knowledge = isinstance(agent_config, dict) and agent_config.get("knowledge") not in (None, "", [], {})
-            if connected_knowledge_symbol and connected_knowledge_node:
-                register_knowledge_target(var_name, connected_knowledge_node)
-            elif connected_vector_symbol or has_manual_knowledge:
-                register_knowledge_target(var_name)
-            lines.append(
-                AGENT_TEMPLATE.render(
-                    var_name=var_name,
-                    kwargs=agent_kwargs,
-                ).rstrip()
-            )
-            lines.append("")
             continue
 
         if node.type == NodeType.TEAM:
-            provider_id = get_node_provider_id(node)
-            incoming_source_ids = incoming_ids(graph, node.id)
-            member_symbols = [
-                symbol_map[source_id]
-                for source_id in incoming_source_ids
-                if source_id in symbol_map
-                and node_map.get(source_id)
-                and node_map[source_id].type in {NodeType.AGENT, NodeType.TEAM}
-            ]
-            tool_symbols = [
-                symbol_map[source_id]
-                for source_id in incoming_source_ids
-                if source_id in symbol_map and node_map.get(source_id) and node_map[source_id].type == NodeType.TOOL
-            ]
-            connected_db_symbol = next(
-                (
-                    symbol_map[source_id]
-                    for source_id in incoming_source_ids
-                    if source_id in symbol_map and node_map.get(source_id) and node_map[source_id].type == NodeType.DATABASE
-                ),
-                None,
+            team_lines, team_warnings = render_team_node(
+                node, var_name, graph, node_map, symbol_map, provider_class_refs, register_knowledge_target
             )
-            connected_knowledge_symbol = next(
-                (
-                    symbol_map[source_id]
-                    for source_id in incoming_source_ids
-                    if source_id in symbol_map and node_map.get(source_id) and node_map[source_id].type == NodeType.KNOWLEDGE
-                ),
-                None,
-            )
-            connected_knowledge_node = next(
-                (
-                    node_map[source_id]
-                    for source_id in incoming_source_ids
-                    if source_id in symbol_map and node_map.get(source_id) and node_map[source_id].type == NodeType.KNOWLEDGE
-                ),
-                None,
-            )
-            connected_vector_symbol = next(
-                (
-                    symbol_map[source_id]
-                    for source_id in incoming_source_ids
-                    if source_id in symbol_map and node_map.get(source_id) and node_map[source_id].type == NodeType.VECTOR_DB
-                ),
-                None,
-            )
-            connected_memory_manager_symbol = next(
-                (
-                    symbol_map[source_id]
-                    for source_id in incoming_source_ids
-                    if source_id in symbol_map and node_map.get(source_id) and node_map[source_id].type == NodeType.MEMORY_MANAGER
-                ),
-                None,
-            )
-            connected_session_summary_manager_symbol = next(
-                (
-                    symbol_map[source_id]
-                    for source_id in incoming_source_ids
-                    if source_id in symbol_map and node_map.get(source_id) and node_map[source_id].type == NodeType.SESSION_SUMMARY_MANAGER
-                ),
-                None,
-            )
-            connected_compression_manager_symbol = next(
-                (
-                    symbol_map[source_id]
-                    for source_id in incoming_source_ids
-                    if source_id in symbol_map and node_map.get(source_id) and node_map[source_id].type == NodeType.COMPRESSION_MANAGER
-                ),
-                None,
-            )
-            connected_learning_machine_symbol = next(
-                (
-                    symbol_map[source_id]
-                    for source_id in incoming_source_ids
-                    if source_id in symbol_map and node_map.get(source_id) and node_map[source_id].type == NodeType.LEARNING_MACHINE
-                ),
-                None,
-            )
-            env_setup_lines = build_provider_env_setup(node)
-            if env_setup_lines:
-                lines.extend(env_setup_lines)
-            provider_class_ref = provider_class_refs.get(provider_id)
-            excluded_fields: set[str] = set()
-            if connected_db_symbol:
-                excluded_fields.add("db")
-            if connected_knowledge_symbol or connected_vector_symbol:
-                excluded_fields.add("knowledge")
-            if connected_memory_manager_symbol:
-                excluded_fields.add("memory_manager")
-            if connected_session_summary_manager_symbol:
-                excluded_fields.add("session_summary_manager")
-            if connected_compression_manager_symbol:
-                excluded_fields.add("compression_manager")
-            if connected_learning_machine_symbol:
-                excluded_fields.add("learning")
-            team_kwargs, team_warnings = build_team_kwargs(node, member_symbols, tool_symbols, provider_class_ref, excluded_fields)
+            lines.extend(team_lines)
             warnings.extend(team_warnings)
-            if connected_db_symbol:
-                team_kwargs += f"\n    db={connected_db_symbol},"
-            if connected_knowledge_symbol:
-                team_kwargs += f"\n    knowledge={connected_knowledge_symbol},"
-            elif connected_vector_symbol:
-                team_kwargs += f"\n    knowledge=Knowledge(vector_db={connected_vector_symbol}),"
-            if connected_memory_manager_symbol:
-                team_kwargs += f"\n    memory_manager={connected_memory_manager_symbol},"
-            if connected_session_summary_manager_symbol:
-                team_kwargs += f"\n    session_summary_manager={connected_session_summary_manager_symbol},"
-            if connected_compression_manager_symbol:
-                team_kwargs += f"\n    compression_manager={connected_compression_manager_symbol},"
-            if connected_learning_machine_symbol:
-                team_kwargs += f"\n    learning={connected_learning_machine_symbol},"
-            extras = node.data.extras or {}
-            team_config = extras.get("teamConfig") or {}
-            has_manual_knowledge = isinstance(team_config, dict) and team_config.get("knowledge") not in (None, "", [], {})
-            if connected_knowledge_symbol and connected_knowledge_node:
-                register_knowledge_target(var_name, connected_knowledge_node)
-            elif connected_vector_symbol or has_manual_knowledge:
-                register_knowledge_target(var_name)
-            lines.append(
-                TEAM_TEMPLATE.render(
-                    var_name=var_name,
-                    kwargs=team_kwargs,
-                ).rstrip()
-            )
-            lines.append("")
             continue
 
         if node.type == NodeType.WORKFLOW_STEP:
-            incoming_source_ids = incoming_ids(graph, node.id)
-            connected_agent_ids = [
-                source_id
-                for source_id in incoming_source_ids
-                if source_id in symbol_map and node_map.get(source_id) and node_map[source_id].type == NodeType.AGENT
-            ]
-            connected_team_ids = [
-                source_id
-                for source_id in incoming_source_ids
-                if source_id in symbol_map and node_map.get(source_id) and node_map[source_id].type == NodeType.TEAM
-            ]
-            connected_tool_ids = [
-                source_id
-                for source_id in incoming_source_ids
-                if source_id in symbol_map and node_map.get(source_id) and node_map[source_id].type == NodeType.TOOL
-            ]
-            connected_builtin_tool_ids = [
-                source_id
-                for source_id in connected_tool_ids
-                if str((node_map[source_id].data.extras or {}).get("toolMode", "builtin")) == "builtin"
-            ]
-            connected_function_tool_ids = [
-                source_id
-                for source_id in connected_tool_ids
-                if source_id not in connected_builtin_tool_ids
-            ]
-            connected_agent_symbol = symbol_map[connected_agent_ids[0]] if connected_agent_ids else None
-            connected_team_symbol = symbol_map[connected_team_ids[0]] if connected_team_ids else None
-            connected_executor_symbol: str | None = None
-            primary_executor_label: str | None = None
-            primary_builtin_tool_id: str | None = None
-            if connected_agent_symbol:
-                primary_executor_label = "Agent"
-            elif connected_team_symbol:
-                primary_executor_label = "Team"
-            elif connected_function_tool_ids:
-                connected_executor_symbol = symbol_map[connected_function_tool_ids[0]]
-                primary_executor_label = "Function Tool"
-            elif connected_builtin_tool_ids:
-                primary_builtin_tool_id = connected_builtin_tool_ids[0]
-                primary_executor_label = "Built-in Tool"
-            additional_executor_labels: list[str] = []
-            if connected_agent_ids:
-                agent_labels = ["Agent" for _ in connected_agent_ids]
-                if primary_executor_label == "Agent":
-                    additional_executor_labels.extend(agent_labels[1:])
-                else:
-                    additional_executor_labels.extend(agent_labels)
-            if connected_team_ids:
-                team_labels = ["Team" for _ in connected_team_ids]
-                if primary_executor_label == "Team":
-                    additional_executor_labels.extend(team_labels[1:])
-                else:
-                    additional_executor_labels.extend(team_labels)
-            if connected_function_tool_ids:
-                tool_labels = ["Function Tool" for _ in connected_function_tool_ids]
-                if primary_executor_label == "Function Tool":
-                    additional_executor_labels.extend(tool_labels[1:])
-                else:
-                    additional_executor_labels.extend(tool_labels)
-            if connected_builtin_tool_ids:
-                tool_labels = ["Built-in Tool" for _ in connected_builtin_tool_ids]
-                if primary_executor_label == "Built-in Tool":
-                    additional_executor_labels.extend(tool_labels[1:])
-                else:
-                    additional_executor_labels.extend(tool_labels)
-            if primary_builtin_tool_id:
-                builtin_tool_var_name = sanitize_identifier(f"{var_name}_{primary_builtin_tool_id}_executor")
-                builtin_tool_lines, builtin_tool_warnings = build_builtin_tool_workflow_executor(
-                    step_node=node,
-                    tool_node=node_map[primary_builtin_tool_id],
-                    tool_symbol=symbol_map[primary_builtin_tool_id],
-                    executor_var_name=builtin_tool_var_name,
-                )
-                warnings.extend(builtin_tool_warnings)
-                if builtin_tool_lines:
-                    lines.extend(builtin_tool_lines)
-                    connected_executor_symbol = builtin_tool_var_name
-            step_kwargs, step_warnings = build_workflow_step_kwargs(
-                node,
-                agent_symbol=connected_agent_symbol,
-                team_symbol=connected_team_symbol,
-                executor_symbol=connected_executor_symbol,
-                executor_label=primary_executor_label,
-                additional_executor_labels=additional_executor_labels,
-            )
+            step_lines, step_warnings = render_workflow_step_node(node, var_name, graph, node_map, symbol_map)
+            lines.extend(step_lines)
             warnings.extend(step_warnings)
-            lines.append(
-                STEP_TEMPLATE.render(
-                    var_name=var_name,
-                    kwargs=step_kwargs,
-                ).rstrip()
-            )
-            lines.append("")
             continue
 
         if node.type == NodeType.WORKFLOW:
-            incoming_source_ids = incoming_ids(graph, node.id)
-            connected_db_symbol = next(
-                (
-                    symbol_map[source_id]
-                    for source_id in incoming_source_ids
-                    if source_id in symbol_map and node_map.get(source_id) and node_map[source_id].type == NodeType.DATABASE
-                ),
-                None,
-            )
-            connected_step_nodes = sorted(
-                [
-                    node_map[source_id]
-                    for source_id in incoming_source_ids
-                    if source_id in symbol_map and node_map.get(source_id) and node_map[source_id].type == NodeType.WORKFLOW_STEP
-                ],
-                key=get_workflow_step_order,
-            )
-            connected_step_symbols = [symbol_map[step_node.id] for step_node in connected_step_nodes if step_node.id in symbol_map]
-            if not connected_step_symbols:
-                warnings.append(f"Workflow '{node.data.name}' has no connected workflow steps.")
-            excluded_fields: set[str] = set()
-            if connected_db_symbol:
-                excluded_fields.add("db")
-            workflow_kwargs, workflow_warnings = build_workflow_kwargs(node, connected_step_symbols, excluded_fields)
+            workflow_lines, workflow_warnings = render_workflow_node(node, var_name, graph, node_map, symbol_map)
+            lines.extend(workflow_lines)
             warnings.extend(workflow_warnings)
-            if connected_db_symbol:
-                workflow_kwargs += f"\n    db={connected_db_symbol},"
-            lines.append(
-                WORKFLOW_TEMPLATE.render(
-                    var_name=var_name,
-                    kwargs=workflow_kwargs,
-                ).rstrip()
-            )
-            lines.append("")
             continue
 
-    if needs_tool_decorator:
-        import_lines.append("from agno.tools import tool")
-    if has_workflow_nodes:
-        import_lines.append("from agno.workflow import Step, Workflow")
-    if has_direct_vector_db_runner_link:
-        import_lines.append("from agno.knowledge.knowledge import Knowledge")
-    for module, class_name in sorted(knowledge_reader_imports):
-        import_lines.append(f"from {module} import {class_name}")
-    for module, class_name in sorted(interface_imports):
-        import_lines.append(f"from {module} import {class_name}")
-    import_lines.extend(raw_expression_import_lines)
-    import_lines.extend(provider_import_lines)
-    for import_path, class_name in sorted(tool_imports):
-        import_lines.append(f"from {import_path} import {class_name}")
-    if has_output_api:
-        import_lines.append("from datetime import datetime, timezone")
-        import_lines.append("import requests")
+    import_lines.extend(
+        render_import_tail(
+            needs_tool_decorator=needs_tool_decorator,
+            has_workflow_nodes=has_workflow_nodes,
+            has_direct_vector_db_runner_link=has_direct_vector_db_runner_link,
+            knowledge_reader_imports=knowledge_reader_imports,
+            interface_imports=interface_imports,
+            raw_expression_import_lines=raw_expression_import_lines,
+            provider_import_lines=provider_import_lines,
+            tool_imports=tool_imports,
+            has_output_api=has_output_api,
+        )
+    )
+
+    if serve:
+        # Serve target: expose the graph's agents/teams/workflows as an AgentOS app
+        # instead of a run-once script. Skips the input/run/output machinery entirely.
+        import_lines.append("from agno.os import AgentOS")
+        import_lines.append("")
+        serve_lines, serve_warnings = render_agent_os_serve(ordered_nodes, symbol_map, graph)
+        warnings.extend(serve_warnings)
+        lines.extend(serve_lines)
+        full_code = "\n".join(import_lines + lines).strip() + "\n"
+        return full_code, warnings
+
     import_lines.append("")
     lines.extend(DEBUG_TRACE_HELPERS)
 
@@ -3300,136 +3673,13 @@ def compile_graph(graph: CanvasGraph) -> tuple[str, list[str]]:
         node for node in ordered_nodes if node.type in {NodeType.OUTPUT, NodeType.OUTPUT_API, *QUEUE_OUTPUT_NODE_TYPES}
     ]
 
-    if not input_nodes:
-        warnings.append("No input node found; preview uses a default prompt string.")
-        lines.append('flow_input = "Explain what this flow does."')
-        lines.append("flow_input_payload = {'text': flow_input, 'files': [], 'metadata': {}}")
-        lines.append("flow_input_files = []")
-        lines.append("flow_input_file_path = None")
-    else:
-        lines.extend(render_input_payload(input_nodes[0]))
+    input_lines, input_warnings = render_input_setup(input_nodes, knowledge_target_specs)
+    lines.extend(input_lines)
+    warnings.extend(input_warnings)
 
-    lines.append("")
-    lines.append("_agnolab_media_kwargs = _agnolab_build_media_kwargs(flow_input_files)")
-    lines.append("_agnolab_media_kwargs['__flow_input_metadata__'] = flow_input_metadata")
-    lines.append("")
-    lines.extend(render_knowledge_file_ingestion(knowledge_target_specs))
-
-    if terminal_nodes:
-        output_node = terminal_nodes[0]
-        if len(terminal_nodes) > 1:
-            warnings.append("Multiple output nodes found; using the first connected output in topological order.")
-
-        upstream = [
-            source_id
-            for source_id in incoming_ids(graph, output_node.id)
-            if node_map.get(source_id)
-            and node_map[source_id].type in {
-                NodeType.INPUT,
-                *QUEUE_INPUT_NODE_TYPES,
-                NodeType.AGENT,
-                NodeType.TEAM,
-                NodeType.WORKFLOW,
-                NodeType.TOOL,
-            }
-        ]
-
-        if len(upstream) > 1:
-            node_type_priority = {
-                NodeType.AGENT: 0,
-                NodeType.TEAM: 1,
-                NodeType.WORKFLOW: 2,
-                NodeType.TOOL: 3,
-                NodeType.INPUT: 4,
-                NodeType.RABBITMQ_INPUT: 4,
-                NodeType.KAFKA_INPUT: 4,
-                NodeType.REDIS_INPUT: 4,
-                NodeType.NATS_INPUT: 4,
-                NodeType.SQS_INPUT: 4,
-                NodeType.PUBSUB_INPUT: 4,
-            }
-            upstream = sorted(
-                upstream,
-                key=lambda source_id: (
-                    node_type_priority.get(node_map[source_id].type, 99),
-                    incoming_ids(graph, output_node.id).index(source_id),
-                ),
-            )
-
-        producer_node = node_map.get(upstream[0]) if upstream else None
-        producer_symbol = symbol_map.get(upstream[0]) if upstream else None
-        if producer_node and producer_node.type in {NodeType.AGENT, NodeType.TEAM} and producer_symbol:
-            lines.append(f"result = _agnolab_run_with_debug({producer_symbol}, flow_input, _agnolab_media_kwargs)")
-            lines.append("flow_result_text = result.content if result is not None else ''")
-        elif producer_node and producer_node.type == NodeType.WORKFLOW and producer_symbol:
-            lines.append(f"result = _agnolab_run_workflow_with_debug({producer_symbol}, flow_input, _agnolab_media_kwargs)")
-            lines.append("flow_result_text = _agnolab_workflow_result_text(result)")
-        elif producer_node and producer_node.type == NodeType.TOOL and producer_symbol:
-            lines.append(f"result = {producer_symbol}(flow_input)")
-            lines.append("flow_result_text = str(result) if result is not None else ''")
-        elif producer_node and producer_node.type in {NodeType.INPUT, *QUEUE_INPUT_NODE_TYPES}:
-            lines.append("flow_result_text = str(flow_input_payload.get('text') or flow_input)")
-        else:
-            warnings.append("Output node has no valid upstream producer.")
-            lines.append("flow_result_text = str(flow_input_payload.get('text') or flow_input)")
-
-        lines.append(f"print({python_literal(RESULT_START_MARKER)})")
-        lines.append("print(flow_result_text)")
-        lines.append(f"print({python_literal(RESULT_END_MARKER)})")
-
-        if output_node.type == NodeType.OUTPUT_API:
-            output_lines, output_warnings = render_output_api_dispatch(output_node, project_name=graph.project.name)
-            lines.extend(output_lines)
-            warnings.extend(output_warnings)
-        elif output_node.type in QUEUE_OUTPUT_NODE_TYPES:
-            warnings.append(
-                f"Queue output node '{output_node.data.name}' is configured in the canvas, but runtime dispatch is not implemented yet in generated code."
-            )
-    else:
-        executable_types = {NodeType.AGENT, NodeType.TEAM, NodeType.WORKFLOW, NodeType.TOOL}
-        executable_nodes = [node for node in ordered_nodes if node.type in executable_types]
-
-        inferred_producer_node: GraphNode | None = None
-        for candidate in reversed(executable_nodes):
-            has_executable_downstream = any(
-                edge.source == candidate.id
-                and node_map.get(edge.target)
-                and node_map[edge.target].type in executable_types
-                for edge in graph.edges
-            )
-            if not has_executable_downstream:
-                inferred_producer_node = candidate
-                break
-
-        if inferred_producer_node is None and executable_nodes:
-            inferred_producer_node = executable_nodes[-1]
-
-        inferred_symbol = symbol_map.get(inferred_producer_node.id) if inferred_producer_node else None
-        if inferred_producer_node and inferred_producer_node.type in {NodeType.AGENT, NodeType.TEAM} and inferred_symbol:
-            warnings.append(
-                f"No output node found; inferring flow result from '{inferred_producer_node.data.name}' to support runtime integrations."
-            )
-            lines.append(f"result = _agnolab_run_with_debug({inferred_symbol}, flow_input, _agnolab_media_kwargs)")
-            lines.append("flow_result_text = result.content if result is not None else ''")
-        elif inferred_producer_node and inferred_producer_node.type == NodeType.WORKFLOW and inferred_symbol:
-            warnings.append(
-                f"No output node found; inferring flow result from workflow '{inferred_producer_node.data.name}' to support runtime integrations."
-            )
-            lines.append(f"result = _agnolab_run_workflow_with_debug({inferred_symbol}, flow_input, _agnolab_media_kwargs)")
-            lines.append("flow_result_text = _agnolab_workflow_result_text(result)")
-        elif inferred_producer_node and inferred_producer_node.type == NodeType.TOOL and inferred_symbol:
-            warnings.append(
-                f"No output node found; inferring flow result from Tool '{inferred_producer_node.data.name}' to support runtime integrations."
-            )
-            lines.append(f"result = {inferred_symbol}(flow_input)")
-            lines.append("flow_result_text = str(result) if result is not None else ''")
-        else:
-            warnings.append("No output node found; preview uses the raw flow input.")
-            lines.append("flow_result_text = str(flow_input_payload.get('text') or flow_input)")
-
-        lines.append(f"print({python_literal(RESULT_START_MARKER)})")
-        lines.append("print(flow_result_text)")
-        lines.append(f"print({python_literal(RESULT_END_MARKER)})")
+    run_lines, run_warnings = render_flow_run_block(graph, node_map, symbol_map, ordered_nodes, terminal_nodes)
+    lines.extend(run_lines)
+    warnings.extend(run_warnings)
 
     full_code = "\n".join(import_lines + lines).strip() + "\n"
     return full_code, warnings

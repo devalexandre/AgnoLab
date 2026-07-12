@@ -1,16 +1,14 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from dataclasses import replace
-from datetime import datetime, timezone
 import asyncio
 import json
-from json import JSONDecodeError
 import threading
 import time
-from typing import Callable
+from collections.abc import Callable
+from dataclasses import dataclass, replace
+from datetime import UTC, datetime
+from json import JSONDecodeError
 
-import boto3
 import requests
 
 from .flow_store import list_flow_records, normalize_flow_name
@@ -31,7 +29,7 @@ QUEUE_LISTENER_MAX_RESULT_CHARS = 240
 
 
 def _timestamp_now() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(UTC).isoformat()
 
 
 def _normalize_bool(value: object, default: bool) -> bool:
@@ -359,6 +357,11 @@ class QueueSubscriberWorker:
         if not self.config.sqs_queue_url:
             return None
         if self._sqs_client is None:
+            try:
+                import boto3
+            except ModuleNotFoundError as error:
+                raise RuntimeError("SQS subscriber dependency missing. Install 'boto3' to use SQS queues.") from error
+
             kwargs = {
                 "region_name": self.config.aws_region,
                 "aws_access_key_id": self.config.aws_access_key_id,

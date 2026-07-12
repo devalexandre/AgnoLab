@@ -1,13 +1,39 @@
 from __future__ import annotations
 
 from .compiler import compile_graph
-from .models import CanvasGraph, ExportProjectResponse, ExportedFile
+from .models import CanvasGraph, ExportedFile, ExportProjectResponse
 from .runtime_dependencies import graph_runtime_requirements
 
 
-def export_project(graph: CanvasGraph) -> ExportProjectResponse:
-    code, warnings = compile_graph(graph)
-    requirements = "\n".join(graph_runtime_requirements(graph)) + "\n"
+def export_project(graph: CanvasGraph, *, serve: bool = False) -> ExportProjectResponse:
+    code, warnings = compile_graph(graph, serve=serve)
+    requirements_list = graph_runtime_requirements(graph)
+    if serve:
+        # The AgentOS app is served with uvicorn/fastapi.
+        for dependency in ("fastapi", "uvicorn"):
+            if not any(line.split("==")[0].split(">=")[0].strip() == dependency for line in requirements_list):
+                requirements_list.append(dependency)
+    requirements = "\n".join(requirements_list) + "\n"
+
+    if serve:
+        run_section = [
+            "## Run",
+            "",
+            "```bash",
+            "pip install -r requirements.txt",
+            "python main.py  # serves the AgentOS app on http://localhost:7777",
+            "```",
+        ]
+    else:
+        run_section = [
+            "## Run",
+            "",
+            "```bash",
+            "pip install -r requirements.txt",
+            "python main.py",
+            "```",
+        ]
+
     readme = "\n".join(
         [
             f"# {graph.project.name}",
@@ -16,8 +42,10 @@ def export_project(graph: CanvasGraph) -> ExportProjectResponse:
             "",
             "## Files",
             "",
-            "- `main.py`: generated Agno flow",
+            "- `main.py`: " + ("AgentOS server app" if serve else "generated Agno flow"),
             "- `requirements.txt`: runtime dependencies",
+            "",
+            *run_section,
         ]
     ) + "\n"
     return ExportProjectResponse(

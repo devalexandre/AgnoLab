@@ -1,45 +1,63 @@
 [project]
 name = "agnolab-api"
-version = "0.1.0"
+version = "0.2.0"
 description = "API for the AgnoLab visual builder"
 requires-python = ">=3.11"
+# Core dependencies required to import and serve the API itself.
+# The full runtime — including all optional Agno tool / vector-db / model-provider
+# integrations a generated flow may need — lives in requirements.txt. Keep `agno`
+# pinned here in lockstep with requirements.txt.
 dependencies = [
-  "agno",
+  "agno==2.5.11",
+  "fastapi>=0.115.0",
+  "uvicorn>=0.30.0",
+  "pydantic>=2.8.0",
+  "jinja2>=3.1.0",
+  "python-dotenv",
   "aiohttp",
   "aiofiles",
-  "anthropic",
-  "beautifulsoup4",
-  "cerebras-cloud-sdk",
-  "cohere",
-  "fastapi>=0.115.0",
-  "azure-ai-inference",
-  "google-genai",
-  "jinja2>=3.1.0",
-  "groq",
-  "ibm-watsonx-ai",
-  "llama-api-client",
-  "litellm",
-  "mistralai",
-  "ollama",
+  "httpx",
+  "requests",
+  "cryptography>=41.0",
+]
+
+[project.optional-dependencies]
+# Dev / CI tooling. Install with: pip install -e ".[dev]"
+# Linters are pinned: an unpinned range lets CI install a newer Ruff than the one
+# used locally, so a new rule fails the build on code that passed on the machine
+# that wrote it. Bump these deliberately.
+dev = [
+  "pytest>=8.0,<9",
+  "ruff==0.15.21",
+  "mypy==1.18.2",
+  # Needed by the test that EXECUTES generated serve code: the sample graphs build an
+  # OpenAIChat model, so constructing them requires the openai SDK. Real deployments
+  # install the full requirements.txt, which already includes it.
   "openai",
-  "portkey-ai",
-  "pydantic>=2.8.0",
-  "pgvector",
-  "pymongo",
-  "pypdf",
-  "python-docx",
-  "python-pptx",
-  "python-dotenv",
-  "openpyxl",
-  "xlrd",
-  "qdrant-client",
-  "chromadb",
-  "pinecone<6",
-  "weaviate-client",
-  "lancedb",
-  "uvicorn>=0.30.0",
 ]
 
 [build-system]
 requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["app*"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+# The compiler emits strings that legitimately contain long literals; don't fight it.
+ignore = ["E501"]
+
+[tool.mypy]
+python_version = "3.11"
+ignore_missing_imports = true
+warn_unused_ignores = true
+warn_redundant_casts = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

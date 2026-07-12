@@ -1,7 +1,78 @@
-import { type ChangeEvent, type MouseEvent as ReactMouseEvent, type WheelEvent as ReactWheelEvent, useEffect, useMemo, useRef, useState } from "react";
+import { type ChangeEvent, type MouseEvent as ReactMouseEvent, type WheelEvent as ReactWheelEvent, Suspense, lazy, useEffect, useMemo, useRef, useState } from "react";
 import { API_BASE, deleteFlowByName, fetchCanvasTemplate, fetchDefaultGraph, fetchFlowByName, fetchQueueSubscriberStatus, fetchWhatsappSessionStatus, listBuiltInToolFunctions, listCanvasTemplates, listFlowRuntimeStatuses, listFlows, listOllamaModels, listSkillPaths, previewCode, runFlowByName, runGraph, saveFlow, startQueueSubscriber, startWhatsappSession, stopQueueSubscriber, stopWhatsappSession } from "./api";
 import { AGENT_FIELDS, AGENT_FIELD_GROUPS, AGNO_MODEL_PROVIDER_OPTIONS, type AgentFieldDefinition } from "./agentConfig";
-import MonacoToolEditor from "./MonacoToolEditor";
+import {
+  buildFlowDraftRouteKey,
+  clearFlowDraftFromStorage,
+  type FlowDraftStorageRecord,
+  loadFlowDraftFromStorage,
+  saveFlowDraftToStorage,
+} from "./flowDraftStorage";
+import {
+  buildIntegrationSnippet,
+  buildWebhookCurlCommand,
+  getIntegrationEditorLanguage,
+  type IntegrationLanguage,
+} from "./integrationSnippets";
+import {
+  NODE_MIN_HEIGHT,
+  NODE_WIDTH,
+  centerGraphInCanvas,
+  cloneGraph,
+  createNodeId,
+  createNodePosition,
+  organizeGraphNodes,
+  updateNodeData,
+} from "./graph";
+import {
+  type HitlAutoApproveSelection,
+  buildInputMetadataFromExtras,
+  graphHasHitlConfirmationGate,
+  normalizeHitlAutoApproveSelection,
+  parseJsonObject,
+  prepareGraphWithResolvedInputMetadata,
+  shouldPromptHitlConfirmation,
+  shouldPromptHitlConfirmationFromRunResult,
+  stringifyJsonObject,
+} from "./hitl";
+import {
+  getAgentGroupNote,
+  getTeamGroupNote,
+  shouldShowAgentField,
+  shouldShowTeamField,
+} from "./agentFieldVisibility";
+import { deriveNodeRunBadges, parseDebugObservation } from "./debug";
+import {
+  buildBlankGraph,
+  createClientSecret,
+  createDefaultProjectRuntime,
+  getGraphAuthToken,
+  getGraphProjectRuntime,
+  normalizeImportedFlowPayload,
+} from "./flowNormalize";
+import { MAX_CANVAS_ZOOM, MIN_CANVAS_ZOOM, clampCanvasZoom, isCanvasBackgroundTarget } from "./canvas";
+import { MarkdownRenderer } from "./markdown";
+import type { MonacoToolEditorProps } from "./MonacoToolEditor";
+import {
+  buildFlowPath,
+  buildPersistedFlowSnapshot,
+  getFlowNameFromPath,
+  getTemplateIdFromSearch,
+} from "./routing";
+import { extractAgentResponse, sanitizeGeneratedCode } from "./runOutput";
+import { downloadAsFile, fieldValueAsString, isObjectRecord, slugifyFlowName } from "./utils";
+
+// Lazy-load the Monaco editor so its (large, bundled) chunk is only fetched when an
+// editor is actually opened, keeping the initial app bundle small.
+const LazyMonacoEditor = lazy(() => import("./MonacoToolEditor"));
+
+function MonacoToolEditor(props: MonacoToolEditorProps) {
+  return (
+    <Suspense fallback={<div className="monaco-editor-loading">Loading editor…</div>}>
+      <LazyMonacoEditor {...props} />
+    </Suspense>
+  );
+}
 import { NODE_CATALOG, NODE_CATEGORIES, canConnect, listNodeTypes } from "./nodeCatalog";
 import { buildProviderConfig, getProviderDefinition, normalizeProviderId } from "./providerCatalog";
 import { TEAM_FIELDS, TEAM_FIELD_GROUPS } from "./teamConfig";
@@ -11,14 +82,9 @@ import { ToolIcon, toolIconColor } from "./toolIcons";
 import { BuiltInToolFunctionOption, CanvasGraph, CanvasTemplateSummary, FlowRuntimeStatus, FlowSummary, GraphEdge, GraphNode, NodeData, NodeType, Position, ProjectRuntimeConfig, ProjectRuntimeEnvVar, QueueSubscriberStatus, RunResult, SaveFlowResponse, SavedUserTool, SkillPathOption, StarterToolTemplate, WhatsappSessionStatus } from "./types";
 
 const MY_TOOLS_STORAGE_KEY = "agnolab.my_tools";
-const FLOW_DRAFT_STORAGE_KEY_PREFIX = "agnolab.flow_draft.v1:";
 const FLOW_AUTOSAVE_DELAY_MS = 1200;
-const NODE_WIDTH = 180;
-const NODE_MIN_HEIGHT = 80;
 const CANVAS_WORLD_MIN = -4000;
 const CANVAS_WORLD_MAX = 8000;
-const MIN_CANVAS_ZOOM = 0.5;
-const MAX_CANVAS_ZOOM = 2.5;
 const CANVAS_ZOOM_STEP = 0.1;
 const HISTORY_MAX_ENTRIES = 80;
 const MINIMAP_WIDTH = 220;
@@ -90,18 +156,6 @@ interface PointerPosition {
   y: number;
 }
 
-interface DebugObservation {
-  agentStatuses: Map<string, "running" | "completed">;
-  toolStatuses: Map<string, "running" | "completed">;
-  hasDebugLogs: boolean;
-}
-
-interface NodeRunBadge {
-  text: string;
-  variant: "running" | "completed" | "tool-completed";
-  title: string;
-}
-
 interface ChatDraft {
   text: string;
   metadata: string;
@@ -117,282 +171,6 @@ interface ChatMessage {
   role: "user" | "assistant";
   text: string;
   attachmentName?: string;
-}
-
-interface FlowDraftStorageRecord {
-  flowName: string;
-  graph: CanvasGraph;
-  updatedAt: string;
-}
-
-function buildFlowDraftRouteKey(routeFlowName: string | null, routeTemplateId: string | null): string | null {
-  if (!routeFlowName) {
-    return null;
-  }
-  if (routeFlowName === "new" && routeTemplateId) {
-    return `new::template:${routeTemplateId}`;
-  }
-  return routeFlowName;
-}
-
-function buildFlowDraftStorageKey(routeKey: string): string {
-  return `${FLOW_DRAFT_STORAGE_KEY_PREFIX}${routeKey}`;
-}
-
-function isCanvasGraph(value: unknown): value is CanvasGraph {
-  if (!value || typeof value !== "object") {
-    return false;
-  }
-  const candidate = value as Partial<CanvasGraph>;
-  return Boolean(candidate.project) && Array.isArray(candidate.nodes) && Array.isArray(candidate.edges);
-}
-
-function loadFlowDraftFromStorage(routeKey: string | null): FlowDraftStorageRecord | null {
-  if (!routeKey) {
-    return null;
-  }
-  try {
-    const rawValue = window.localStorage.getItem(buildFlowDraftStorageKey(routeKey));
-    if (!rawValue) {
-      return null;
-    }
-    const parsed = JSON.parse(rawValue) as Partial<FlowDraftStorageRecord>;
-    if (!parsed || typeof parsed.flowName !== "string" || !isCanvasGraph(parsed.graph)) {
-      return null;
-    }
-    return {
-      flowName: parsed.flowName,
-      graph: parsed.graph,
-      updatedAt: typeof parsed.updatedAt === "string" ? parsed.updatedAt : "",
-    };
-  } catch (error) {
-    console.error(error);
-    return null;
-  }
-}
-
-function saveFlowDraftToStorage(routeKey: string | null, draft: FlowDraftStorageRecord) {
-  if (!routeKey) {
-    return;
-  }
-  try {
-    window.localStorage.setItem(buildFlowDraftStorageKey(routeKey), JSON.stringify(draft));
-  } catch (error) {
-    console.error(error);
-  }
-}
-
-function clearFlowDraftFromStorage(routeKey: string | null) {
-  if (!routeKey) {
-    return;
-  }
-  try {
-    window.localStorage.removeItem(buildFlowDraftStorageKey(routeKey));
-  } catch (error) {
-    console.error(error);
-  }
-}
-
-function escapeHtml(value: string): string {
-  return value
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;")
-    .replace(/'/g, "&#39;");
-}
-
-function renderInlineMarkdown(value: string): string {
-  return escapeHtml(value)
-    .replace(/`([^`]+)`/g, "<code>$1</code>")
-    .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
-    .replace(/\*([^*]+)\*/g, "<em>$1</em>")
-    .replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, '<a href="$2" target="_blank" rel="noreferrer">$1</a>');
-}
-
-function parseMarkdownTableCells(line: string): string[] {
-  const trimmed = line.trim();
-  if (!trimmed.includes("|")) {
-    return [];
-  }
-
-  const normalized = trimmed.replace(/^\|/, "").replace(/\|$/, "");
-  return normalized.split("|").map((cell) => cell.trim());
-}
-
-function isMarkdownTableSeparator(line: string): boolean {
-  const cells = parseMarkdownTableCells(line);
-  return cells.length > 0 && cells.every((cell) => /^:?-{3,}:?$/.test(cell.replace(/\s+/g, "")));
-}
-
-function getMarkdownTableAlignment(cell: string): "left" | "center" | "right" {
-  const normalized = cell.replace(/\s+/g, "");
-  const startsWithColon = normalized.startsWith(":");
-  const endsWithColon = normalized.endsWith(":");
-
-  if (startsWithColon && endsWithColon) {
-    return "center";
-  }
-  if (endsWithColon) {
-    return "right";
-  }
-  return "left";
-}
-
-function markdownToHtml(markdown: string): string {
-  const lines = markdown.replace(/\r\n/g, "\n").split("\n");
-  const blocks: string[] = [];
-  let paragraphLines: string[] = [];
-  let listItems: string[] = [];
-  let listType: "ul" | "ol" | null = null;
-  let codeLines: string[] = [];
-  let inCodeBlock = false;
-
-  const flushParagraph = () => {
-    if (!paragraphLines.length) {
-      return;
-    }
-    blocks.push(`<p>${renderInlineMarkdown(paragraphLines.join(" "))}</p>`);
-    paragraphLines = [];
-  };
-
-  const flushList = () => {
-    if (!listItems.length || !listType) {
-      return;
-    }
-    blocks.push(`<${listType}>${listItems.join("")}</${listType}>`);
-    listItems = [];
-    listType = null;
-  };
-
-  const flushCode = () => {
-    if (!codeLines.length) {
-      return;
-    }
-    blocks.push(`<pre><code>${escapeHtml(codeLines.join("\n"))}</code></pre>`);
-    codeLines = [];
-  };
-
-  for (let index = 0; index < lines.length; index += 1) {
-    const line = lines[index];
-    if (line.trim().startsWith("```")) {
-      flushParagraph();
-      flushList();
-      if (inCodeBlock) {
-        flushCode();
-        inCodeBlock = false;
-      } else {
-        inCodeBlock = true;
-      }
-      continue;
-    }
-
-    if (inCodeBlock) {
-      codeLines.push(line);
-      continue;
-    }
-
-    if (!line.trim()) {
-      flushParagraph();
-      flushList();
-      continue;
-    }
-
-    const nextLine = lines[index + 1] ?? "";
-    const headerCells = parseMarkdownTableCells(line);
-    if (
-      headerCells.length > 0 &&
-      headerCells.every(Boolean) &&
-      isMarkdownTableSeparator(nextLine) &&
-      parseMarkdownTableCells(nextLine).length === headerCells.length
-    ) {
-      flushParagraph();
-      flushList();
-
-      const alignments = parseMarkdownTableCells(nextLine).map(getMarkdownTableAlignment);
-      const bodyRows: string[] = [];
-      let bodyIndex = index + 2;
-
-      while (bodyIndex < lines.length) {
-        const bodyLine = lines[bodyIndex];
-        if (!bodyLine.trim()) {
-          break;
-        }
-
-        const bodyCells = parseMarkdownTableCells(bodyLine);
-        if (bodyCells.length !== headerCells.length) {
-          break;
-        }
-
-        bodyRows.push(
-          `<tr>${bodyCells
-            .map(
-              (cell, cellIndex) =>
-                `<td style="text-align:${alignments[cellIndex] ?? "left"}">${renderInlineMarkdown(cell)}</td>`,
-            )
-            .join("")}</tr>`,
-        );
-        bodyIndex += 1;
-      }
-      index = bodyIndex - 1;
-
-      blocks.push(
-        `<div class="markdown-table-wrap"><table><thead><tr>${headerCells
-          .map(
-            (cell, cellIndex) =>
-              `<th style="text-align:${alignments[cellIndex] ?? "left"}">${renderInlineMarkdown(cell)}</th>`,
-          )
-          .join("")}</tr></thead>${bodyRows.length ? `<tbody>${bodyRows.join("")}</tbody>` : ""}</table></div>`,
-      );
-      continue;
-    }
-
-    const headingMatch = line.match(/^(#{1,6})\s+(.*)$/);
-    if (headingMatch) {
-      flushParagraph();
-      flushList();
-      const level = headingMatch[1].length;
-      blocks.push(`<h${level}>${renderInlineMarkdown(headingMatch[2])}</h${level}>`);
-      continue;
-    }
-
-    const unorderedMatch = line.match(/^[-*]\s+(.*)$/);
-    if (unorderedMatch) {
-      flushParagraph();
-      if (listType && listType !== "ul") {
-        flushList();
-      }
-      listType = "ul";
-      listItems.push(`<li>${renderInlineMarkdown(unorderedMatch[1])}</li>`);
-      continue;
-    }
-
-    const orderedMatch = line.match(/^\d+\.\s+(.*)$/);
-    if (orderedMatch) {
-      flushParagraph();
-      if (listType && listType !== "ol") {
-        flushList();
-      }
-      listType = "ol";
-      listItems.push(`<li>${renderInlineMarkdown(orderedMatch[1])}</li>`);
-      continue;
-    }
-
-    if (listType) {
-      flushList();
-    }
-
-    paragraphLines.push(line.trim());
-  }
-
-  flushParagraph();
-  flushList();
-  flushCode();
-  return blocks.join("");
-}
-
-function MarkdownRenderer({ text, className }: { text: string; className?: string }) {
-  return <div className={className} dangerouslySetInnerHTML={{ __html: markdownToHtml(text) }} />;
 }
 
 interface LibraryFeatureCard {
@@ -874,1200 +652,6 @@ const KNOWLEDGE_READER_OPTIONS: Array<{ key: KnowledgeReaderKey; label: string; 
   { key: "markdown", label: "Markdown Reader", description: "For `.md` and `.markdown` files." },
   { key: "text", label: "Text Reader", description: "For plain text ingestion or forcing text mode." },
 ];
-
-function hasConfiguredValue(value: unknown): boolean {
-  if (value === null || value === undefined) {
-    return false;
-  }
-  if (typeof value === "string") {
-    return value.trim().length > 0;
-  }
-  if (Array.isArray(value)) {
-    return value.length > 0;
-  }
-  if (typeof value === "object") {
-    return Object.keys(value as Record<string, unknown>).length > 0;
-  }
-  return Boolean(value);
-}
-
-function shouldShowAgentField(
-  field: AgentFieldDefinition,
-  agentConfig: Record<string, unknown>,
-  hasConnectedTools: boolean,
-  hasConnectedLearningMachine: boolean,
-): boolean {
-  switch (field.key) {
-    case "add_session_state_to_context":
-      return (
-        hasConfiguredValue(agentConfig.session_state) ||
-        Boolean(agentConfig.enable_agentic_state) ||
-        Boolean(agentConfig.add_session_state_to_context)
-      );
-    case "overwrite_db_session_state":
-      return Boolean(agentConfig.enable_agentic_state) || Boolean(agentConfig.overwrite_db_session_state);
-    case "num_history_sessions":
-      return Boolean(agentConfig.search_session_history) || hasConfiguredValue(agentConfig.num_history_sessions);
-    case "num_history_runs":
-    case "num_history_messages":
-      return Boolean(agentConfig.add_history_to_context) || hasConfiguredValue(agentConfig[field.key]);
-    case "read_tool_call_history":
-      return Boolean(agentConfig.read_chat_history) || hasConfiguredValue(agentConfig.read_tool_call_history);
-    case "add_dependencies_to_context":
-      return hasConfiguredValue(agentConfig.dependencies) || Boolean(agentConfig.add_dependencies_to_context);
-    case "update_memory_on_run":
-    case "add_memories_to_context":
-      return Boolean(agentConfig.enable_agentic_memory) || hasConfiguredValue(agentConfig[field.key]);
-    case "add_session_summary_to_context":
-      return Boolean(agentConfig.enable_session_summaries) || hasConfiguredValue(agentConfig.add_session_summary_to_context);
-    case "add_learnings_to_context":
-      return Boolean(agentConfig.learning) || hasConnectedLearningMachine || hasConfiguredValue(agentConfig.add_learnings_to_context);
-    case "enable_agentic_knowledge_filters":
-      return hasConfiguredValue(agentConfig.knowledge_filters) || Boolean(agentConfig.enable_agentic_knowledge_filters);
-    case "references_format":
-      return Boolean(agentConfig.add_knowledge_to_context) || hasConfiguredValue(agentConfig.references_format);
-    case "tool_hooks":
-    case "pre_hooks":
-    case "post_hooks":
-      return hasConnectedTools || hasConfiguredValue(agentConfig[field.key]);
-    case "reasoning_model":
-    case "reasoning_agent":
-    case "reasoning_min_steps":
-    case "reasoning_max_steps":
-      return Boolean(agentConfig.reasoning) || hasConfiguredValue(agentConfig[field.key]);
-    case "store_media":
-      return Boolean(agentConfig.send_media_to_model) || hasConfiguredValue(agentConfig.store_media);
-    case "parser_model_prompt":
-      return hasConfiguredValue(agentConfig.parser_model) || hasConfiguredValue(agentConfig.parser_model_prompt);
-    case "output_model_prompt":
-      return hasConfiguredValue(agentConfig.output_model) || hasConfiguredValue(agentConfig.output_model_prompt);
-    default:
-      return true;
-  }
-}
-
-function shouldShowTeamField(
-  field: AgentFieldDefinition,
-  teamConfig: Record<string, unknown>,
-  hasConnectedTools: boolean,
-  hasConnectedLearningMachine: boolean,
-): boolean {
-  switch (field.key) {
-    case "add_session_state_to_context":
-      return (
-        hasConfiguredValue(teamConfig.session_state) ||
-        Boolean(teamConfig.enable_agentic_state) ||
-        Boolean(teamConfig.add_session_state_to_context)
-      );
-    case "overwrite_db_session_state":
-      return Boolean(teamConfig.enable_agentic_state) || Boolean(teamConfig.overwrite_db_session_state);
-    case "num_past_sessions_to_search":
-    case "num_past_session_runs_in_search":
-      return Boolean(teamConfig.search_past_sessions) || hasConfiguredValue(teamConfig[field.key]);
-    case "num_history_sessions":
-      return Boolean(teamConfig.search_session_history) || hasConfiguredValue(teamConfig.num_history_sessions);
-    case "num_team_history_runs":
-      return Boolean(teamConfig.add_team_history_to_members) || hasConfiguredValue(teamConfig.num_team_history_runs);
-    case "num_history_runs":
-    case "num_history_messages":
-      return Boolean(teamConfig.add_history_to_context) || hasConfiguredValue(teamConfig[field.key]);
-    case "add_dependencies_to_context":
-      return hasConfiguredValue(teamConfig.dependencies) || Boolean(teamConfig.add_dependencies_to_context);
-    case "update_memory_on_run":
-    case "add_memories_to_context":
-      return Boolean(teamConfig.enable_agentic_memory) || hasConfiguredValue(teamConfig[field.key]);
-    case "add_session_summary_to_context":
-      return Boolean(teamConfig.enable_session_summaries) || hasConfiguredValue(teamConfig.add_session_summary_to_context);
-    case "add_learnings_to_context":
-      return Boolean(teamConfig.learning) || hasConnectedLearningMachine || hasConfiguredValue(teamConfig.add_learnings_to_context);
-    case "enable_agentic_knowledge_filters":
-      return hasConfiguredValue(teamConfig.knowledge_filters) || Boolean(teamConfig.enable_agentic_knowledge_filters);
-    case "references_format":
-      return Boolean(teamConfig.add_knowledge_to_context) || hasConfiguredValue(teamConfig.references_format);
-    case "tool_hooks":
-    case "pre_hooks":
-    case "post_hooks":
-      return hasConnectedTools || hasConfiguredValue(teamConfig[field.key]);
-    case "reasoning_model":
-    case "reasoning_agent":
-    case "reasoning_min_steps":
-    case "reasoning_max_steps":
-      return Boolean(teamConfig.reasoning) || hasConfiguredValue(teamConfig[field.key]);
-    case "store_media":
-      return Boolean(teamConfig.send_media_to_model) || hasConfiguredValue(teamConfig.store_media);
-    case "num_followups":
-      return Boolean(teamConfig.followups) || hasConfiguredValue(teamConfig.num_followups);
-    default:
-      return true;
-  }
-}
-
-function getAgentGroupNote(group: AgentFieldDefinition["group"]): string | null {
-  switch (group) {
-    case "Session":
-      return "State and history controls expand as you enable them, so the session setup stays easier to scan.";
-    case "Memory":
-      return "Dependencies, memory, summaries, compression, and learning live here. Connect Database, manager, and Learning Machine nodes to unlock the managed pieces.";
-    case "Knowledge":
-      return "Connect a Knowledge or Vector DB node to drive retrieval visually. Advanced retrieval fields appear when filters or references are in use.";
-    case "Tools":
-      return "Tool policy, local Skills, and lifecycle hooks live here. Hook inputs stay hidden until tools are connected or a saved config already uses them.";
-    case "Input/Output":
-      return "Reasoning, multimodal delivery, retries, and structured outputs are grouped here. Reasoning details expand only when enabled.";
-    default:
-      return null;
-  }
-}
-
-function getTeamGroupNote(group: AgentFieldDefinition["group"]): string | null {
-  switch (group) {
-    case "Session":
-      return "Team session memory, past-session search, and shared history expand as you enable each capability.";
-    case "Memory":
-      return "This section controls shared dependencies, memory managers, summaries, compression, and learning for the whole team, including connected Learning Machines.";
-    case "Knowledge":
-      return "Teams can use the same connected Knowledge and Vector DB resources as agents, including retrieval controls and references.";
-    case "Tools":
-      return "Leader tool policy, member tool exposure, and hook lifecycle controls are grouped here.";
-    case "Input/Output":
-      return "Team mode, reasoning, multimodal input, direct-response behavior, and followups are configured in one place.";
-    default:
-      return null;
-  }
-}
-
-function extractAgentResponse(stdout: string): string {
-  const filteredLines = stdout
-    .split(/\r?\n/)
-    .filter((line) => !line.startsWith("[debug]") && !line.startsWith("DEBUG"));
-
-  const compacted: string[] = [];
-  for (const line of filteredLines) {
-    const isBlank = line.trim() === "";
-    const previousIsBlank = compacted.length > 0 && compacted[compacted.length - 1].trim() === "";
-    if (isBlank && previousIsBlank) {
-      continue;
-    }
-    compacted.push(line);
-  }
-
-  let cleaned = compacted.join("\n").trim();
-  cleaned = cleaned.replace(/<additional_information>[\s\S]*?<\/additional_information>/gi, "").trim();
-  cleaned = cleaned.replace(
-    /Runtime input context available to this flow:[\s\S]*?(?=(You have the capability to retain memories|$))/i,
-    "",
-  ).trim();
-  cleaned = cleaned.replace(/You have the capability to retain memories[\s\S]*$/i, "").trim();
-  cleaned = cleaned.replace(/\n{3,}/g, "\n\n");
-  return cleaned.trim();
-}
-
-function sanitizeGeneratedCode(code: string): string {
-  return code
-    .replace(
-      /(_input_file_base64\s*=\s*)'[^']*'/g,
-      "$1'<omitted from code preview; injected only at runtime>'",
-    )
-    .replace(
-      /('password'\s*:\s*)'[^']*'/g,
-      "$1'<omitted from code preview>'",
-    )
-    .replace(
-      /(_agnolab_[a-z_]*password\s*=\s*)'[^']*'/g,
-      "$1'<omitted from code preview>'",
-    )
-    .replace(
-      /(_agnolab_[a-z_]*secret\s*=\s*)'[^']*'/g,
-      "$1'<omitted from code preview>'",
-    )
-    .replace(
-      /(_agnolab_[a-z_]*token\s*=\s*)'[^']*'/g,
-      "$1'<omitted from code preview>'",
-    );
-}
-
-function slugifyFlowName(value: string): string {
-  return value
-    .trim()
-    .toLowerCase()
-    .replace(/[^a-z0-9_-]+/g, "_")
-    .replace(/^_+|_+$/g, "");
-}
-
-function parseJsonObject(raw: string): Record<string, unknown> | null {
-  const trimmed = raw.trim();
-  if (!trimmed) {
-    return null;
-  }
-
-  try {
-    const parsed = JSON.parse(trimmed) as unknown;
-    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-      return null;
-    }
-    return parsed as Record<string, unknown>;
-  } catch {
-    return null;
-  }
-}
-
-type HitlAutoApproveSelection = "" | "true" | "false";
-
-function normalizeHitlAutoApproveSelection(rawValue: unknown): HitlAutoApproveSelection {
-  if (rawValue === true) {
-    return "true";
-  }
-  if (rawValue === false) {
-    return "false";
-  }
-  const normalized = fieldValueAsString(rawValue).trim().toLowerCase();
-  if (["true", "1", "yes", "on"].includes(normalized)) {
-    return "true";
-  }
-  if (["false", "0", "no", "off"].includes(normalized)) {
-    return "false";
-  }
-  return "";
-}
-
-function parseHitlUserInput(rawValue: unknown): Record<string, unknown> | null {
-  if (!rawValue) {
-    return null;
-  }
-
-  if (typeof rawValue === "object" && !Array.isArray(rawValue)) {
-    return rawValue as Record<string, unknown>;
-  }
-
-  const text = fieldValueAsString(rawValue).trim();
-  if (!text) {
-    return null;
-  }
-
-  try {
-    const parsed = JSON.parse(text) as unknown;
-    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-      return parsed as Record<string, unknown>;
-    }
-    return null;
-  } catch {
-    return null;
-  }
-}
-
-function buildInputMetadataFromExtras(extras: Record<string, unknown> | undefined): Record<string, unknown> {
-  const normalizedExtras = extras ?? {};
-  const metadata = parseJsonObject(fieldValueAsString(normalizedExtras.payloadJson)) ?? {};
-
-  if (Object.prototype.hasOwnProperty.call(normalizedExtras, "hitlAutoApprove")) {
-    const hitlAutoApprove = normalizeHitlAutoApproveSelection(normalizedExtras.hitlAutoApprove);
-    if (hitlAutoApprove !== "") {
-      metadata.hitl_auto_approve = hitlAutoApprove === "true";
-    }
-  }
-
-  if (Object.prototype.hasOwnProperty.call(normalizedExtras, "hitlUserInputJson")) {
-    const rawHitlUserInput = normalizedExtras.hitlUserInputJson;
-    const hitlUserInput = parseHitlUserInput(rawHitlUserInput);
-    if (hitlUserInput) {
-      metadata.hitl_user_input = hitlUserInput;
-    }
-  }
-
-  return metadata;
-}
-
-function stringifyJsonObject(value: Record<string, unknown>): string {
-  return `${JSON.stringify(value, null, 2)}\n`;
-}
-
-function graphHasHitlConfirmationGate(graph: CanvasGraph): boolean {
-  return graph.nodes.some((node) => node.type === "workflow_step" && Boolean(node.data.extras?.requiresConfirmation));
-}
-
-function getHitlConfirmationStepNames(graph: CanvasGraph): Set<string> {
-  return new Set(
-    graph.nodes
-      .filter((node) => node.type === "workflow_step" && Boolean(node.data.extras?.requiresConfirmation))
-      .map((node) => fieldValueAsString(node.data.name).trim())
-      .filter(Boolean),
-  );
-}
-
-function extractPausedWorkflowStepName(text: string): string | null {
-  const match = text.match(/Workflow paused at '([^']+)'/);
-  return match?.[1] ?? null;
-}
-
-function shouldPromptHitlConfirmationFromRunResult(graph: CanvasGraph, result: RunResult | null): boolean {
-  if (!result) {
-    return false;
-  }
-  const pausedStepName = extractPausedWorkflowStepName(result.clean_stdout || result.stdout || "");
-  if (!pausedStepName) {
-    return false;
-  }
-  return getHitlConfirmationStepNames(graph).has(pausedStepName);
-}
-
-function shouldPromptHitlConfirmation(graph: CanvasGraph): boolean {
-  if (!graphHasHitlConfirmationGate(graph)) {
-    return false;
-  }
-  const inputNode = graph.nodes.find((node) => node.type === "input");
-  if (!inputNode) {
-    return false;
-  }
-  const metadata = buildInputMetadataFromExtras(inputNode.data.extras);
-  return metadata.hitl_auto_approve !== true;
-}
-
-function prepareGraphWithResolvedInputMetadata(
-  graph: CanvasGraph,
-  options?: {
-    forceHitlAutoApprove?: boolean;
-  },
-): CanvasGraph {
-  const inputNode = graph.nodes.find((node) => node.type === "input");
-  if (!inputNode) {
-    return graph;
-  }
-
-  const currentExtras = inputNode.data.extras ?? {};
-  const metadata = buildInputMetadataFromExtras(currentExtras);
-  if (options?.forceHitlAutoApprove) {
-    metadata.hitl_auto_approve = true;
-  }
-
-  const nextExtras = {
-    ...currentExtras,
-    payloadJson: stringifyJsonObject(metadata),
-    hitlAutoApprove:
-      typeof metadata.hitl_auto_approve === "boolean"
-        ? metadata.hitl_auto_approve
-          ? "true"
-          : "false"
-        : "",
-    hitlUserInputJson:
-      metadata.hitl_user_input && typeof metadata.hitl_user_input === "object" && !Array.isArray(metadata.hitl_user_input)
-        ? stringifyJsonObject(metadata.hitl_user_input as Record<string, unknown>)
-        : "",
-  };
-
-  return {
-    ...graph,
-    nodes: graph.nodes.map((node) =>
-      node.id === inputNode.id
-        ? {
-            ...node,
-            data: {
-              ...node.data,
-              extras: nextExtras,
-            },
-          }
-        : node,
-    ),
-  };
-}
-
-function downloadAsFile(content: string, fileName: string, mimeType: string) {
-  const blob = new Blob([content], { type: mimeType });
-  const url = window.URL.createObjectURL(blob);
-  const anchor = document.createElement("a");
-  anchor.href = url;
-  anchor.download = fileName;
-  document.body.appendChild(anchor);
-  anchor.click();
-  document.body.removeChild(anchor);
-  window.URL.revokeObjectURL(url);
-}
-
-type IntegrationLanguage = "curl" | "go" | "python" | "javascript";
-
-function escapeDoubleQuotedShell(value: string): string {
-  return value.replace(/(["\\$`])/g, "\\$1");
-}
-
-function buildJsonCurlPayload(payload: Record<string, unknown>): string[] {
-  const jsonLines = JSON.stringify(payload, null, 2).split("\n");
-  return jsonLines.map((line, index) => {
-    if (index === 0) {
-      return `  -d '${line}`;
-    }
-    if (index === jsonLines.length - 1) {
-      return `${line}'`;
-    }
-    return line;
-  });
-}
-
-function buildRunFlowCurlCommand(flowName: string, authToken?: string | null): string {
-  const lines = [
-    `curl -X POST "${API_BASE}/api/flows/run" \\`,
-    "  -H \"Content-Type: application/json\" \\",
-  ];
-
-  if (authToken?.trim()) {
-    lines.push(`  -H "Authorization: Bearer ${escapeDoubleQuotedShell(authToken.trim())}" \\`);
-  }
-
-  return [
-    ...lines,
-    ...buildJsonCurlPayload({
-      name: flowName,
-      debug: false,
-      input_text: "Hello from POST",
-      input_metadata: {
-        tenant: "acme",
-      },
-    }),
-  ].join("\n");
-}
-
-function buildRunFlowGoExample(flowName: string, authToken?: string | null): string {
-  const authLine = authToken?.trim()
-    ? `    req.Header.Set("Authorization", "Bearer ${authToken.trim().replace(/"/g, '\\"')}")`
-    : "";
-  return [
-    "package main",
-    "",
-    "import (",
-    '    "bytes"',
-    '    "fmt"',
-    '    "io"',
-    '    "net/http"',
-    ")",
-    "",
-    "func main() {",
-    `    payload := []byte(\`{"name":"${flowName}","debug":false,"input_text":"Hello from POST","input_metadata":{"tenant":"acme"}}\`)`,
-    `    req, err := http.NewRequest("POST", "${API_BASE}/api/flows/run", bytes.NewBuffer(payload))`,
-    "    if err != nil {",
-    "        panic(err)",
-    "    }",
-    '    req.Header.Set("Content-Type", "application/json")',
-    authLine,
-    "",
-    "    resp, err := http.DefaultClient.Do(req)",
-    "    if err != nil {",
-    "        panic(err)",
-    "    }",
-    "    defer resp.Body.Close()",
-    "",
-    "    body, err := io.ReadAll(resp.Body)",
-    "    if err != nil {",
-    "        panic(err)",
-    "    }",
-    "",
-    '    fmt.Println(string(body))',
-    "}",
-  ].join("\n");
-}
-
-function buildRunFlowPythonExample(flowName: string, authToken?: string | null): string {
-  const headerLines = ['headers = {"Content-Type": "application/json"}'];
-  if (authToken?.trim()) {
-    headerLines.push(`headers["Authorization"] = "Bearer ${authToken.trim().replace(/"/g, '\\"')}"`);
-  }
-  return [
-    "import requests",
-    "",
-    ...headerLines,
-    "",
-    `response = requests.post("${API_BASE}/api/flows/run", json={`,
-    `    "name": "${flowName}",`,
-    '    "debug": False,',
-    '    "input_text": "Hello from POST",',
-    '    "input_metadata": {',
-    '        "tenant": "acme",',
-    "    },",
-    "}, headers=headers)",
-    "",
-    "print(response.status_code)",
-    "print(response.text)",
-  ].join("\n");
-}
-
-function buildRunFlowJavaScriptExample(flowName: string, authToken?: string | null): string {
-  const authLine = authToken?.trim()
-    ? `    Authorization: "Bearer ${authToken.trim().replace(/"/g, '\\"')}",`
-    : "";
-  return [
-    `const response = await fetch("${API_BASE}/api/flows/run", {`,
-    '  method: "POST",',
-    "  headers: {",
-    '    "Content-Type": "application/json",',
-    authLine,
-    "  },",
-    "  body: JSON.stringify({",
-    `    name: "${flowName}",`,
-    "    debug: false,",
-    '    input_text: "Hello from POST",',
-    "    input_metadata: {",
-    '      tenant: "acme",',
-    "    },",
-    "  }),",
-    "});",
-    "",
-    "const data = await response.json();",
-    "console.log(data);",
-  ].join("\n");
-}
-
-function buildIntegrationSnippet(flowName: string, language: IntegrationLanguage, authToken?: string | null): string {
-  if (language === "go") {
-    return buildRunFlowGoExample(flowName, authToken);
-  }
-  if (language === "python") {
-    return buildRunFlowPythonExample(flowName, authToken);
-  }
-  if (language === "javascript") {
-    return buildRunFlowJavaScriptExample(flowName, authToken);
-  }
-  return buildRunFlowCurlCommand(flowName, authToken);
-}
-
-function buildWebhookCurlCommand(
-  endpoint: string,
-  options: {
-    textField?: unknown;
-    secretHeader?: unknown;
-    secretValue?: unknown;
-    authToken?: unknown;
-  },
-): string {
-  const resolvedTextField = fieldValueAsString(options.textField).trim() || "message";
-  const secretHeader = fieldValueAsString(options.secretHeader).trim() || "X-AgnoLab-Secret";
-  const secretValue = fieldValueAsString(options.secretValue);
-  const authToken = fieldValueAsString(options.authToken).trim();
-  const lines = [
-    `curl -X POST "${endpoint}" \\`,
-    "  -H \"Content-Type: application/json\" \\",
-  ];
-
-  if (authToken) {
-    lines.push(`  -H "Authorization: Bearer ${escapeDoubleQuotedShell(authToken)}" \\`);
-  }
-  if (secretValue.trim()) {
-    lines.push(`  -H "${escapeDoubleQuotedShell(secretHeader)}: ${escapeDoubleQuotedShell(secretValue.trim())}" \\`);
-  }
-
-  return [
-    ...lines,
-    ...buildJsonCurlPayload({
-      [resolvedTextField]: "Hello from webhook",
-      tenant: "acme",
-      source: "curl",
-    }),
-  ].join("\n");
-}
-
-function getIntegrationEditorLanguage(language: IntegrationLanguage): string {
-  if (language === "go") {
-    return "go";
-  }
-  if (language === "python") {
-    return "python";
-  }
-  if (language === "javascript") {
-    return "javascript";
-  }
-  return "shell";
-}
-
-function getFlowNameFromPath(pathname: string): string | null {
-  const prefix = "/flow/";
-  if (!pathname.startsWith(prefix)) {
-    return null;
-  }
-  const raw = pathname.slice(prefix.length).trim();
-  if (!raw) {
-    return null;
-  }
-  return decodeURIComponent(raw);
-}
-
-function buildFlowPath(flowName: string): string {
-  return `/flow/${encodeURIComponent(flowName)}`;
-}
-
-function buildPersistedFlowSnapshot(flowName: string, graph: CanvasGraph | null): string {
-  if (!graph) {
-    return "";
-  }
-  const normalizedName = slugifyFlowName(flowName) || flowName.trim();
-  return JSON.stringify({
-    flowName: normalizedName,
-    graph,
-  });
-}
-
-function clampCanvasZoom(value: number): number {
-  return Math.max(MIN_CANVAS_ZOOM, Math.min(MAX_CANVAS_ZOOM, Number(value.toFixed(2))));
-}
-
-function isCanvasBackgroundTarget(target: EventTarget | null, currentTarget: EventTarget | null): boolean {
-  if (!(target instanceof Element)) {
-    return false;
-  }
-
-  if (target.closest(".canvas-node, .canvas-brand, .run-cta, .flow-actions, .canvas-hint, .edge-hit-area")) {
-    return false;
-  }
-
-  if (currentTarget instanceof Element && target === currentTarget) {
-    return true;
-  }
-
-  return target.classList.contains("canvas-viewport") || target.classList.contains("edges");
-}
-
-function getTemplateIdFromSearch(search: string): string | null {
-  const templateId = new URLSearchParams(search).get("template")?.trim();
-  return templateId ? templateId : null;
-}
-
-function buildBlankGraph(): CanvasGraph {
-  return {
-    project: {
-      name: "Blank Flow",
-      target: "agno-python",
-      runtime: {
-        envVars: [],
-        authEnabled: false,
-        authToken: null,
-      },
-    },
-    nodes: [],
-    edges: [],
-  };
-}
-
-function isObjectRecord(value: unknown): value is Record<string, unknown> {
-  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
-}
-
-function createDefaultProjectRuntime(): ProjectRuntimeConfig {
-  return {
-    envVars: [],
-    authEnabled: false,
-    authToken: null,
-  };
-}
-
-function normalizeProjectRuntime(value: unknown): ProjectRuntimeConfig {
-  const runtime = isObjectRecord(value) ? value : {};
-  const rawEnvVars = Array.isArray(runtime.envVars) ? runtime.envVars : [];
-
-  return {
-    envVars: rawEnvVars.map((item) => ({
-      key: isObjectRecord(item) ? fieldValueAsString(item.key) : "",
-      value: isObjectRecord(item) ? fieldValueAsString(item.value) : "",
-    })),
-    authEnabled: Boolean(runtime.authEnabled),
-    authToken: runtime.authToken == null ? null : fieldValueAsString(runtime.authToken),
-  };
-}
-
-function getGraphProjectRuntime(graph: CanvasGraph | null): ProjectRuntimeConfig {
-  return normalizeProjectRuntime(graph?.project?.runtime);
-}
-
-function getGraphAuthToken(graph: CanvasGraph | null): string {
-  const runtime = getGraphProjectRuntime(graph);
-  return runtime.authEnabled ? fieldValueAsString(runtime.authToken).trim() : "";
-}
-
-function createClientSecret(prefix: string): string {
-  const rawToken =
-    typeof crypto !== "undefined" && typeof crypto.randomUUID === "function"
-      ? crypto.randomUUID().replace(/-/g, "")
-      : `${Date.now()}${Math.random().toString(16).slice(2)}`;
-  return `${prefix}_${rawToken.slice(0, 24)}`;
-}
-
-function normalizeImportedNodeData(value: unknown, fallbackName: string): NodeData {
-  const rawData = isObjectRecord(value) ? value : {};
-  const temperatureValue =
-    typeof rawData.temperature === "number"
-      ? rawData.temperature
-      : typeof rawData.temperature === "string"
-        ? Number(rawData.temperature)
-        : null;
-
-  return {
-    name: fieldValueAsString(rawData.name) || fallbackName,
-    description: rawData.description == null ? null : fieldValueAsString(rawData.description),
-    instructions: rawData.instructions == null ? null : fieldValueAsString(rawData.instructions),
-    provider: rawData.provider == null ? null : fieldValueAsString(rawData.provider),
-    model: rawData.model == null ? null : fieldValueAsString(rawData.model),
-    temperature: Number.isFinite(temperatureValue) ? temperatureValue : null,
-    tools: Array.isArray(rawData.tools) ? rawData.tools.map((item) => fieldValueAsString(item)).filter(Boolean) : [],
-    prompt: rawData.prompt == null ? null : fieldValueAsString(rawData.prompt),
-    condition: rawData.condition == null ? null : fieldValueAsString(rawData.condition),
-    output_format: rawData.output_format == null ? null : fieldValueAsString(rawData.output_format),
-    extras: isObjectRecord(rawData.extras) ? rawData.extras : {},
-  };
-}
-
-function normalizeImportedFlowPayload(rawValue: unknown): { graph: CanvasGraph; flowName: string } | null {
-  const root = isObjectRecord(rawValue) ? rawValue : null;
-  const graphCandidate = root && isObjectRecord(root.graph) ? root.graph : root;
-  if (!graphCandidate || !isObjectRecord(graphCandidate)) {
-    return null;
-  }
-
-  const rawNodes = Array.isArray(graphCandidate.nodes) ? graphCandidate.nodes : null;
-  const rawEdges = Array.isArray(graphCandidate.edges) ? graphCandidate.edges : null;
-  if (!rawNodes || !rawEdges) {
-    return null;
-  }
-
-  const nodes: GraphNode[] = rawNodes.map((rawNode, index) => {
-    if (!isObjectRecord(rawNode)) {
-      throw new Error("Invalid node entry in imported flow.");
-    }
-
-    const type = fieldValueAsString(rawNode.type) as NodeType;
-    if (!type || !(type in NODE_CATALOG)) {
-      throw new Error(`Unsupported node type in imported flow: ${fieldValueAsString(rawNode.type) || "(empty)"}`);
-    }
-
-    const rawPosition = isObjectRecord(rawNode.position) ? rawNode.position : {};
-    const positionX = typeof rawPosition.x === "number" ? rawPosition.x : Number(rawPosition.x ?? 0);
-    const positionY = typeof rawPosition.y === "number" ? rawPosition.y : Number(rawPosition.y ?? 0);
-
-    return {
-      id: fieldValueAsString(rawNode.id) || `${type}_${index + 1}`,
-      type,
-      position: {
-        x: Number.isFinite(positionX) ? positionX : 0,
-        y: Number.isFinite(positionY) ? positionY : 0,
-      },
-      data: normalizeImportedNodeData(rawNode.data, `${NODE_CATALOG[type].label} ${index + 1}`),
-    };
-  });
-
-  const nodeIds = new Set(nodes.map((node) => node.id));
-  const edges: GraphEdge[] = rawEdges.map((rawEdge, index) => {
-    if (!isObjectRecord(rawEdge)) {
-      throw new Error("Invalid edge entry in imported flow.");
-    }
-
-    const source = fieldValueAsString(rawEdge.source);
-    const target = fieldValueAsString(rawEdge.target);
-    if (!source || !target || !nodeIds.has(source) || !nodeIds.has(target)) {
-      throw new Error("Imported flow contains an edge with missing source or target nodes.");
-    }
-
-    return {
-      id: fieldValueAsString(rawEdge.id) || `edge_${index + 1}`,
-      source,
-      target,
-      source_handle: rawEdge.source_handle == null ? null : fieldValueAsString(rawEdge.source_handle),
-      target_handle: rawEdge.target_handle == null ? null : fieldValueAsString(rawEdge.target_handle),
-    };
-  });
-
-  const rawProject = isObjectRecord(graphCandidate.project) ? graphCandidate.project : {};
-  const projectName =
-    fieldValueAsString(rawProject.name) ||
-    fieldValueAsString(root?.project_name) ||
-    fieldValueAsString(root?.name) ||
-    "Imported Flow";
-  const targetValue = fieldValueAsString(rawProject.target);
-  const graph: CanvasGraph = {
-    project: {
-      name: projectName,
-      target: targetValue === "agnogo" ? "agnogo" : "agno-python",
-      runtime: normalizeProjectRuntime(rawProject.runtime),
-    },
-    nodes,
-    edges,
-  };
-
-  const flowName =
-    slugifyFlowName(fieldValueAsString(root?.flow_name) || fieldValueAsString(root?.name) || projectName) ||
-    "imported_flow";
-
-  return { graph, flowName };
-}
-
-function normalizeDebugToken(value: unknown): string {
-  return fieldValueAsString(value).trim().toLowerCase();
-}
-
-function toSnakeCase(value: unknown): string {
-  return fieldValueAsString(value)
-    .trim()
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, "_")
-    .replace(/^_+|_+$/g, "");
-}
-
-function extractFunctionNameFromCode(code: unknown): string {
-  const text = fieldValueAsString(code);
-  const match = text.match(/def\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*\(/);
-  return match?.[1]?.toLowerCase() ?? "";
-}
-
-function parseDebugObservation(runResult: RunResult | null): DebugObservation {
-  const agentStatuses = new Map<string, "running" | "completed">();
-  const toolStatuses = new Map<string, "running" | "completed">();
-  const stdout = runResult?.stdout ?? "";
-  let hasDebugLogs = false;
-  let insideToolCallsSection = false;
-  let currentRunnerToken = "";
-
-  for (const line of stdout.split(/\r?\n/)) {
-    if (line.startsWith("[debug]")) {
-      hasDebugLogs = true;
-
-      const genericAgentMatch = line.match(/^\[debug\]\[(.+?)\]/);
-      if (genericAgentMatch) {
-        const agentName = normalizeDebugToken(genericAgentMatch[1]);
-        if (!agentStatuses.has(agentName)) {
-          agentStatuses.set(agentName, "running");
-        }
-      }
-
-      const runStartedMatch = line.match(/^\[debug\]\[(.+?)\]\s+RunStarted\b/);
-      if (runStartedMatch) {
-        agentStatuses.set(normalizeDebugToken(runStartedMatch[1]), "running");
-      }
-
-      const runCompletedMatch = line.match(/^\[debug\]\[(.+?)\]\s+RunCompleted\b/);
-      if (runCompletedMatch) {
-        agentStatuses.set(normalizeDebugToken(runCompletedMatch[1]), "completed");
-      }
-
-      const agentMatch = line.match(/^\[debug\]\[(.+?)\]\s+ToolCall(?:Started|Completed|Error)\b/);
-      if (agentMatch) {
-        const agentName = normalizeDebugToken(agentMatch[1]);
-        if (!agentStatuses.has(agentName)) {
-          agentStatuses.set(agentName, "running");
-        }
-      }
-
-      const toolStartedMatch = line.match(/ToolCallStarted\b.*\btool=([^\s]+)/);
-      if (toolStartedMatch) {
-        toolStatuses.set(normalizeDebugToken(toolStartedMatch[1]), "running");
-      }
-
-      const toolCompletedMatch = line.match(/ToolCall(?:Completed|Error)\b.*\btool=([^\s]+)/);
-      if (toolCompletedMatch) {
-        toolStatuses.set(normalizeDebugToken(toolCompletedMatch[1]), "completed");
-      }
-
-      continue;
-    }
-
-    if (!line.startsWith("DEBUG")) {
-      if (insideToolCallsSection && line.trim() === "") {
-        insideToolCallsSection = false;
-      }
-      continue;
-    }
-
-    hasDebugLogs = true;
-
-    const agnoRunnerIdMatch = line.match(/^DEBUG\s+\*+\s+(Agent|Team) ID:\s+(.+?)\s+\*+/);
-    if (agnoRunnerIdMatch) {
-      currentRunnerToken = toSnakeCase(agnoRunnerIdMatch[2]);
-      if (currentRunnerToken) {
-        agentStatuses.set(currentRunnerToken, "running");
-      }
-      continue;
-    }
-
-    if (/^DEBUG Tool Calls:/.test(line)) {
-      insideToolCallsSection = true;
-      continue;
-    }
-
-    if (/^DEBUG ======================== assistant =========================/.test(line)) {
-      insideToolCallsSection = false;
-    }
-
-    const agnoRunStartMatch = line.match(/(?:Agent|Team) Run Start:/);
-    if (agnoRunStartMatch && currentRunnerToken) {
-      agentStatuses.set(currentRunnerToken, "running");
-      continue;
-    }
-
-    const agnoRunEndMatch = line.match(/(?:Agent|Team) Run End:/);
-    if (agnoRunEndMatch && currentRunnerToken) {
-      agentStatuses.set(currentRunnerToken, "completed");
-      continue;
-    }
-
-    const agnoAssistantMatch = line.match(/^DEBUG O total|^DEBUG [^\s].+/);
-    if (agnoAssistantMatch && currentRunnerToken && !agentStatuses.has(currentRunnerToken)) {
-      agentStatuses.set(currentRunnerToken, "running");
-    }
-
-    const agnoToolAddedMatch = line.match(/^DEBUG Added tool\s+([a-zA-Z_][a-zA-Z0-9_]*)/);
-    if (agnoToolAddedMatch) {
-      const toolName = normalizeDebugToken(agnoToolAddedMatch[1]);
-      if (!toolStatuses.has(toolName)) {
-        toolStatuses.set(toolName, "running");
-      }
-    }
-
-    const agnoToolRunningMatch = line.match(/^DEBUG Running:\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*\(/);
-    if (agnoToolRunningMatch) {
-      toolStatuses.set(normalizeDebugToken(agnoToolRunningMatch[1]), "completed");
-      continue;
-    }
-
-    if (insideToolCallsSection) {
-      const toolNameMatch = line.match(/^\s*Name:\s+'([^']+)'/);
-      if (toolNameMatch) {
-        toolStatuses.set(normalizeDebugToken(toolNameMatch[1]), "completed");
-        continue;
-      }
-    }
-  }
-
-  return {
-    agentStatuses,
-    toolStatuses,
-    hasDebugLogs,
-  };
-}
-
-function deriveNodeRunBadges(graph: CanvasGraph | null, observation: DebugObservation): Record<string, NodeRunBadge> {
-  if (!graph || !observation.hasDebugLogs) {
-    return {};
-  }
-
-  const badges: Record<string, NodeRunBadge> = {};
-  const propagatedStatuses = new Map<string, "running" | "completed">();
-  const incomingByNode = new Map<string, string[]>();
-  const outgoingByNode = new Map<string, string[]>();
-
-  for (const node of graph.nodes) {
-    incomingByNode.set(node.id, []);
-    outgoingByNode.set(node.id, []);
-  }
-
-  for (const edge of graph.edges) {
-    incomingByNode.get(edge.target)?.push(edge.source);
-    outgoingByNode.get(edge.source)?.push(edge.target);
-  }
-
-  for (const node of graph.nodes) {
-    if (node.type === "agent" || node.type === "team") {
-      const agentConfig = (node.data.extras?.agentConfig as Record<string, unknown> | undefined) ?? {};
-      const candidates = [
-        normalizeDebugToken(node.data.name),
-        toSnakeCase(node.data.name),
-        normalizeDebugToken(agentConfig.id),
-        toSnakeCase(agentConfig.id),
-      ].filter(Boolean);
-      const status = candidates
-        .map((candidate) => observation.agentStatuses.get(candidate))
-        .find(Boolean);
-      if (status) {
-        propagatedStatuses.set(node.id, status);
-        badges[node.id] = {
-          text: status === "completed" ? "Completed" : "Running",
-          variant: status === "completed" ? "completed" : "running",
-          title: `${node.data.name} appeared in the latest run logs.`,
-        };
-      }
-      continue;
-    }
-
-    if (node.type === "tool") {
-      const candidates = [
-        normalizeDebugToken(node.data.extras?.functionName),
-        toSnakeCase(node.data.extras?.functionName),
-        extractFunctionNameFromCode(node.data.extras?.functionCode),
-        normalizeDebugToken(node.data.extras?.builtinClassName),
-        toSnakeCase(node.data.extras?.builtinClassName),
-        normalizeDebugToken(node.data.extras?.builtinToolKey),
-        toSnakeCase(node.data.extras?.builtinToolKey),
-        normalizeDebugToken(node.data.name),
-        toSnakeCase(node.data.name),
-      ].filter(Boolean);
-
-      const matchedStatus = candidates
-        .map((candidate) => observation.toolStatuses.get(candidate))
-        .find(Boolean);
-
-      if (matchedStatus) {
-        badges[node.id] = {
-          text: matchedStatus === "completed" ? "Completed" : "Running",
-          variant: matchedStatus === "completed" ? "tool-completed" : "running",
-          title: `${node.data.name} appeared in the latest tool logs.`,
-        };
-      }
-    }
-  }
-
-  if (propagatedStatuses.size === 0) {
-    return badges;
-  }
-
-  const queue = [...propagatedStatuses.entries()];
-
-  while (queue.length > 0) {
-    const next = queue.shift();
-    if (!next) {
-      continue;
-    }
-
-    const [nodeId, status] = next;
-    const neighbors = [...(incomingByNode.get(nodeId) ?? []), ...(outgoingByNode.get(nodeId) ?? [])];
-    for (const neighborId of neighbors) {
-      const neighborNode = graph.nodes.find((node) => node.id === neighborId);
-      if (!neighborNode || neighborNode.type === "tool") {
-        continue;
-      }
-
-      const currentStatus = propagatedStatuses.get(neighborId);
-      if (currentStatus === "completed" || currentStatus === status) {
-        continue;
-      }
-
-      propagatedStatuses.set(neighborId, status);
-      queue.push([neighborId, status]);
-    }
-  }
-
-  for (const node of graph.nodes) {
-    const propagatedStatus = propagatedStatuses.get(node.id);
-    if (badges[node.id] || !propagatedStatus) {
-      continue;
-    }
-
-    badges[node.id] = {
-      text: propagatedStatus === "completed" ? "Completed" : "Running",
-      variant: propagatedStatus === "completed" ? "completed" : "running",
-      title: `${node.data.name} is part of the connected path from the latest run.`,
-    };
-  }
-
-  return badges;
-}
-
-function updateNodeData(graph: CanvasGraph | null, nodeId: string, patch: Partial<NodeData>): CanvasGraph | null {
-  if (!graph) {
-    return graph;
-  }
-  return {
-    ...graph,
-    nodes: graph.nodes.map((node) =>
-      node.id === nodeId
-        ? {
-            ...node,
-            data: {
-              ...node.data,
-              ...patch,
-            },
-          }
-        : node,
-    ),
-  };
-}
-
-function createNodeId(graph: CanvasGraph, type: keyof typeof NODE_CATALOG): string {
-  const randomPart =
-    typeof crypto !== "undefined" && typeof crypto.randomUUID === "function"
-      ? crypto.randomUUID().slice(0, 8)
-      : `${Date.now()}_${graph.nodes.length + 1}`;
-
-  return `${type}_${randomPart}`;
-}
-
-function createNodePosition(graph: CanvasGraph): { x: number; y: number } {
-  const baseX = 280;
-  const baseY = 240;
-  const perRow = 3;
-  const index = graph.nodes.length;
-  return {
-    x: baseX + (index % perRow) * 230,
-    y: baseY + Math.floor(index / perRow) * 170,
-  };
-}
-
-function centerGraphInCanvas(graph: CanvasGraph, canvasWidth: number, canvasHeight: number): CanvasGraph {
-  if (graph.nodes.length === 0) {
-    return graph;
-  }
-
-  const minX = Math.min(...graph.nodes.map((node) => node.position.x));
-  const minY = Math.min(...graph.nodes.map((node) => node.position.y));
-  const maxX = Math.max(...graph.nodes.map((node) => node.position.x + NODE_WIDTH));
-  const maxY = Math.max(...graph.nodes.map((node) => node.position.y + NODE_MIN_HEIGHT));
-
-  const graphWidth = maxX - minX;
-  const graphHeight = maxY - minY;
-
-  const usableLeft = 60;
-  const usableRight = 60;
-  const usableTop = 210;
-  const usableBottom = 60;
-  const usableWidth = Math.max(320, canvasWidth - usableLeft - usableRight);
-  const usableHeight = Math.max(240, canvasHeight - usableTop - usableBottom);
-
-  const targetMinX = usableLeft + Math.max(0, (usableWidth - graphWidth) / 2);
-  const targetMinY = usableTop + Math.max(0, (usableHeight - graphHeight) / 2);
-  const offsetX = targetMinX - minX;
-  const offsetY = targetMinY - minY;
-
-  return {
-    ...graph,
-    nodes: graph.nodes.map((node) => ({
-      ...node,
-      position: {
-        x: Math.max(24, node.position.x + offsetX),
-        y: Math.max(24, node.position.y + offsetY),
-      },
-    })),
-  };
-}
-
-function cloneGraph(graph: CanvasGraph): CanvasGraph {
-  return JSON.parse(JSON.stringify(graph)) as CanvasGraph;
-}
-
-function organizeGraphNodes(graph: CanvasGraph): CanvasGraph {
-  if (graph.nodes.length <= 1) {
-    return graph;
-  }
-
-  const sortedNodes = [...graph.nodes].sort((left, right) => {
-    if (left.position.y === right.position.y) {
-      return left.position.x - right.position.x;
-    }
-    return left.position.y - right.position.y;
-  });
-
-  const columns = Math.max(1, Math.ceil(Math.sqrt(sortedNodes.length)));
-  const startX = 180;
-  const startY = 240;
-  const xGap = 260;
-  const yGap = 180;
-
-  const nextPositionById = new Map<string, Position>();
-  sortedNodes.forEach((node, index) => {
-    const row = Math.floor(index / columns);
-    const column = index % columns;
-    nextPositionById.set(node.id, {
-      x: startX + column * xGap,
-      y: startY + row * yGap,
-    });
-  });
-
-  return {
-    ...graph,
-    nodes: graph.nodes.map((node) => ({
-      ...node,
-      position: nextPositionById.get(node.id) ?? node.position,
-    })),
-  };
-}
 
 function getAgentConfig(data: NodeData): Record<string, unknown> {
   return (data.extras?.agentConfig as Record<string, unknown> | undefined) ?? {};
@@ -3082,15 +1666,6 @@ function getDefaultEmailPort(protocol: "imap" | "pop", security: "ssl" | "startt
   return security === "ssl" ? "993" : "143";
 }
 
-function fieldValueAsString(value: unknown): string {
-  if (typeof value === "string") {
-    return value;
-  }
-  if (value === undefined || value === null) {
-    return "";
-  }
-  return String(value);
-}
 
 function arrayBufferToBase64(buffer: ArrayBuffer): string {
   let binary = "";
@@ -4268,12 +2843,25 @@ export default function App() {
     if (!graph) {
       return;
     }
-    previewCode(graph)
-      .then((response) => {
-        setCode(response.code);
-        setWarnings(response.warnings);
-      })
-      .catch(console.error);
+    // Debounce: coalesce rapid graph changes (e.g. dragging a node) into a single
+    // codegen request instead of firing one POST per mousemove frame.
+    let cancelled = false;
+    const timeoutId = window.setTimeout(() => {
+      previewCode(graph)
+        .then((response) => {
+          if (cancelled) {
+            return;
+          }
+          setCode(response.code);
+          setWarnings(response.warnings);
+        })
+        .catch(console.error);
+    }, 300);
+
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timeoutId);
+    };
   }, [graph]);
 
   useEffect(() => {
@@ -5857,6 +4445,20 @@ export default function App() {
     const normalizedName = slugifyFlowName(flowName) || "agnolab_flow";
     downloadAsFile(code, `${normalizedName}.py`, "text/x-python;charset=utf-8");
     setConnectionMessage(`Generated code exported as ${normalizedName}.py`);
+  }
+
+  async function handleExportServeApp() {
+    if (!graph) {
+      return;
+    }
+    try {
+      const response = await previewCode(graph, { serve: true });
+      downloadAsFile(response.code, "main.py", "text/x-python;charset=utf-8");
+      setConnectionMessage("Exported AgentOS server app as main.py (run with: python main.py).");
+    } catch (error) {
+      console.error(error);
+      setConnectionMessage("Failed to export the AgentOS server app.");
+    }
   }
 
   function handleExportFlow() {
@@ -11952,6 +10554,9 @@ export default function App() {
                 </button>
                 <button type="button" className="secondary-button" onClick={handleExportPython}>
                   Export .py
+                </button>
+                <button type="button" className="secondary-button" onClick={handleExportServeApp} title="Export an AgentOS server app (FastAPI) that serves this flow's agents/teams/workflows as an API.">
+                  Export Server App
                 </button>
                 <button type="button" className="secondary-button" onClick={handleUndo} disabled={historyPast.length === 0} title="Undo (Ctrl/Cmd+Z)">
                   Undo
