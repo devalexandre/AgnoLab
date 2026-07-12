@@ -60,6 +60,8 @@ def _normalize_status(value: object) -> str:
 
 def _is_connected_status(value: object) -> bool:
     normalized = _normalize_status(value).lower()
+    # Note: "openingsession" (still connecting) and "desconnectedmobile" (phone
+    # offline) are NOT connected states and must be excluded.
     return normalized in {
         "connected",
         "authenticated",
@@ -67,8 +69,6 @@ def _is_connected_status(value: object) -> bool:
         "islogged",
         "qrreadsuccess",
         "chatsavailable",
-        "openingsession",
-        "desconnectedmobile",
     }
 
 

@@ -10,6 +10,8 @@ import os
 import re
 import threading
 import time
+from collections import deque
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -111,7 +113,28 @@ def require_api_key(request: Request) -> None:
         raise HTTPException(status_code=401, detail="Missing or invalid API key.")
 
 
-app = FastAPI(title="AgnoLab API", version="0.1.0", dependencies=[Depends(require_api_key)])
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    if not get_configured_api_key():
+        logger.warning(
+            "AGNOLAB_API_KEY is not set: the code generation and execution endpoints "
+            "are unauthenticated. Set AGNOLAB_API_KEY before exposing this API beyond localhost."
+        )
+    email_listener_manager.start()
+    queue_subscriber_manager.start()
+    try:
+        yield
+    finally:
+        email_listener_manager.stop()
+        queue_subscriber_manager.stop()
+
+
+app = FastAPI(
+    title="AgnoLab API",
+    version="0.1.0",
+    dependencies=[Depends(require_api_key)],
+    lifespan=lifespan,
+)
 
 DEFAULT_GENERATED_CODE_TIMEOUT_SECONDS = 20.0
 RESULT_START_MARKER = "__AGNO_RESULT_START__"
@@ -326,23 +349,6 @@ def discover_skill_paths() -> list[SkillPathOption]:
             )
 
     return options
-
-
-@app.on_event("startup")
-def start_email_listener_service() -> None:
-    if not get_configured_api_key():
-        logger.warning(
-            "AGNOLAB_API_KEY is not set: the code generation and execution endpoints "
-            "are unauthenticated. Set AGNOLAB_API_KEY before exposing this API beyond localhost."
-        )
-    email_listener_manager.start()
-    queue_subscriber_manager.start()
-
-
-@app.on_event("shutdown")
-def stop_email_listener_service() -> None:
-    email_listener_manager.stop()
-    queue_subscriber_manager.stop()
 
 
 @app.get("/health")
@@ -1161,9 +1167,9 @@ def _collect_reachable_node_ids(graph: CanvasGraph, *, start_node_id: str | None
         adjacency.setdefault(edge.source, []).append(edge.target)
 
     reachable: set[str] = set()
-    queue: list[str] = [start_node_id]
+    queue: deque[str] = deque([start_node_id])
     while queue:
-        current_id = queue.pop(0)
+        current_id = queue.popleft()
         if current_id in reachable:
             continue
         reachable.add(current_id)

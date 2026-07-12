@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import imaplib
 import json
 import poplib
@@ -430,7 +431,12 @@ class EmailListenerWorker:
         if not message_key:
             fallback_key = str(match.get("message_id") or "").strip()
             if not fallback_key:
-                fallback_key = f"{config.protocol}:{hash(json.dumps(match, sort_keys=True, ensure_ascii=False))}"
+                # Use a stable hash: the built-in hash() is per-process salted, so it
+                # would change across restarts and cause the same email to be reprocessed.
+                digest = hashlib.sha256(
+                    json.dumps(match, sort_keys=True, ensure_ascii=False).encode("utf-8")
+                ).hexdigest()
+                fallback_key = f"{config.protocol}:{digest}"
             message_key = fallback_key
             match["message_key"] = message_key
 
