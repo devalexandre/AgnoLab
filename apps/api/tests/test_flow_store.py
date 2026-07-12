@@ -65,3 +65,31 @@ def test_delete_flow_record() -> None:
     assert flow_store.delete_flow_record("temp") is True
     assert flow_store.load_flow_record("temp") is None
     assert flow_store.delete_flow_record("temp") is False
+
+
+def test_save_leaves_no_temp_files() -> None:
+    flow_store.save_flow_record("clean", CanvasGraph())
+    leftovers = [p.name for p in flow_store.FLOWS_DIR.iterdir() if p.suffix == ".tmp"]
+    assert leftovers == [], f"atomic write left temp files behind: {leftovers}"
+
+
+def test_concurrent_saves_do_not_corrupt_files() -> None:
+    import threading
+
+    names = [f"flow_{i}" for i in range(12)]
+
+    def _save(flow_name: str) -> None:
+        for _ in range(5):
+            flow_store.save_flow_record(flow_name, CanvasGraph())
+
+    threads = [threading.Thread(target=_save, args=(n,)) for n in names]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    # Every file must still be valid JSON that round-trips, and no temp file remains.
+    for name in names:
+        record = flow_store.load_flow_record(name)
+        assert record is not None and record.name == name
+    assert not any(p.suffix == ".tmp" for p in flow_store.FLOWS_DIR.iterdir())
