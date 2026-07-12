@@ -2901,6 +2901,65 @@ def render_agent_os_serve(
     return lines, warnings
 
 
+def render_input_setup(
+    input_nodes: list[GraphNode],
+    knowledge_target_specs: list[dict[str, object]],
+) -> tuple[list[str], list[str]]:
+    """Emit the flow input payload, media kwargs, and knowledge ingestion setup."""
+    lines: list[str] = []
+    warnings: list[str] = []
+
+    if not input_nodes:
+        warnings.append("No input node found; preview uses a default prompt string.")
+        lines.append('flow_input = "Explain what this flow does."')
+        lines.append("flow_input_payload = {'text': flow_input, 'files': [], 'metadata': {}}")
+        lines.append("flow_input_files = []")
+        lines.append("flow_input_file_path = None")
+    else:
+        lines.extend(render_input_payload(input_nodes[0]))
+
+    lines.append("")
+    lines.append("_agnolab_media_kwargs = _agnolab_build_media_kwargs(flow_input_files)")
+    lines.append("_agnolab_media_kwargs['__flow_input_metadata__'] = flow_input_metadata")
+    lines.append("")
+    lines.extend(render_knowledge_file_ingestion(knowledge_target_specs))
+    return lines, warnings
+
+
+def render_import_tail(
+    *,
+    needs_tool_decorator: bool,
+    has_workflow_nodes: bool,
+    has_direct_vector_db_runner_link: bool,
+    knowledge_reader_imports: set[tuple[str, str]],
+    interface_imports: set[tuple[str, str]],
+    raw_expression_import_lines: list[str],
+    provider_import_lines: list[str],
+    tool_imports: set[tuple[str, str]],
+    has_output_api: bool,
+) -> list[str]:
+    """Build the import lines that follow the header, from the collected node state."""
+    lines: list[str] = []
+    if needs_tool_decorator:
+        lines.append("from agno.tools import tool")
+    if has_workflow_nodes:
+        lines.append("from agno.workflow import Step, Workflow")
+    if has_direct_vector_db_runner_link:
+        lines.append("from agno.knowledge.knowledge import Knowledge")
+    for module, class_name in sorted(knowledge_reader_imports):
+        lines.append(f"from {module} import {class_name}")
+    for module, class_name in sorted(interface_imports):
+        lines.append(f"from {module} import {class_name}")
+    lines.extend(raw_expression_import_lines)
+    lines.extend(provider_import_lines)
+    for import_path, class_name in sorted(tool_imports):
+        lines.append(f"from {import_path} import {class_name}")
+    if has_output_api:
+        lines.append("from datetime import datetime, timezone")
+        lines.append("import requests")
+    return lines
+
+
 def render_flow_run_block(
     graph: CanvasGraph,
     node_map: dict[str, GraphNode],
@@ -3584,23 +3643,19 @@ def compile_graph(graph: CanvasGraph, *, serve: bool = False) -> tuple[str, list
             lines.append("")
             continue
 
-    if needs_tool_decorator:
-        import_lines.append("from agno.tools import tool")
-    if has_workflow_nodes:
-        import_lines.append("from agno.workflow import Step, Workflow")
-    if has_direct_vector_db_runner_link:
-        import_lines.append("from agno.knowledge.knowledge import Knowledge")
-    for module, class_name in sorted(knowledge_reader_imports):
-        import_lines.append(f"from {module} import {class_name}")
-    for module, class_name in sorted(interface_imports):
-        import_lines.append(f"from {module} import {class_name}")
-    import_lines.extend(raw_expression_import_lines)
-    import_lines.extend(provider_import_lines)
-    for import_path, class_name in sorted(tool_imports):
-        import_lines.append(f"from {import_path} import {class_name}")
-    if has_output_api:
-        import_lines.append("from datetime import datetime, timezone")
-        import_lines.append("import requests")
+    import_lines.extend(
+        render_import_tail(
+            needs_tool_decorator=needs_tool_decorator,
+            has_workflow_nodes=has_workflow_nodes,
+            has_direct_vector_db_runner_link=has_direct_vector_db_runner_link,
+            knowledge_reader_imports=knowledge_reader_imports,
+            interface_imports=interface_imports,
+            raw_expression_import_lines=raw_expression_import_lines,
+            provider_import_lines=provider_import_lines,
+            tool_imports=tool_imports,
+            has_output_api=has_output_api,
+        )
+    )
 
     if serve:
         # Serve target: expose the graph's agents/teams/workflows as an AgentOS app
@@ -3621,20 +3676,9 @@ def compile_graph(graph: CanvasGraph, *, serve: bool = False) -> tuple[str, list
         node for node in ordered_nodes if node.type in {NodeType.OUTPUT, NodeType.OUTPUT_API, *QUEUE_OUTPUT_NODE_TYPES}
     ]
 
-    if not input_nodes:
-        warnings.append("No input node found; preview uses a default prompt string.")
-        lines.append('flow_input = "Explain what this flow does."')
-        lines.append("flow_input_payload = {'text': flow_input, 'files': [], 'metadata': {}}")
-        lines.append("flow_input_files = []")
-        lines.append("flow_input_file_path = None")
-    else:
-        lines.extend(render_input_payload(input_nodes[0]))
-
-    lines.append("")
-    lines.append("_agnolab_media_kwargs = _agnolab_build_media_kwargs(flow_input_files)")
-    lines.append("_agnolab_media_kwargs['__flow_input_metadata__'] = flow_input_metadata")
-    lines.append("")
-    lines.extend(render_knowledge_file_ingestion(knowledge_target_specs))
+    input_lines, input_warnings = render_input_setup(input_nodes, knowledge_target_specs)
+    lines.extend(input_lines)
+    warnings.extend(input_warnings)
 
     run_lines, run_warnings = render_flow_run_block(graph, node_map, symbol_map, ordered_nodes, terminal_nodes)
     lines.extend(run_lines)
