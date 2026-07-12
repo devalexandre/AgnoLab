@@ -1,17 +1,16 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
-from pathlib import Path
 import re
+from datetime import UTC, datetime
+from pathlib import Path
 
 from .models import CanvasGraph, FlowRecord, FlowSummary
-
 
 FLOWS_DIR = Path(__file__).resolve().parents[1] / "data" / "flows"
 
 
 def _timestamp_now() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(UTC).isoformat()
 
 
 def normalize_flow_name(name: str) -> str:

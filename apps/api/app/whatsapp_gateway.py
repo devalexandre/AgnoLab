@@ -1,13 +1,12 @@
 from __future__ import annotations
 
+import base64
 import os
 import re
-import base64
 import time
 from typing import Any
 
 import requests
-
 
 DEFAULT_WHATSAPP_GATEWAY_BASE_URL = "http://whatsapp:21465"
 DEFAULT_WHATSAPP_GATEWAY_SECRET_KEY = "agnolab_wppconnect_secret"

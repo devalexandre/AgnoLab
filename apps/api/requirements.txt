@@ -1,4 +1,6 @@
-agno
+# Core framework — pinned to the version the compiler targets.
+# Bump deliberately (and re-run the compiler golden tests) to adopt a newer Agno.
+agno==2.5.11
 aiohttp
 aiofiles
 anthropic

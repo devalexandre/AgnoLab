@@ -2,10 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from .provider_catalog import build_provider_config
 from .models import CanvasGraph, CanvasTemplateSummary, GraphEdge, GraphNode, NodeData, Position, ProjectMeta
-
-
+from .provider_catalog import build_provider_config
 
 
 def _detect_repo_root() -> Path:

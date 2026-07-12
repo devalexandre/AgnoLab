@@ -2,23 +2,21 @@ from __future__ import annotations
 
 import asyncio
 import base64
-from datetime import datetime, timezone
 import html
 import json
 import os
-from pathlib import Path
 import re
 import threading
 import time
+from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI
-from fastapi import HTTPException
-from fastapi import Request
+import requests
+from dotenv import load_dotenv
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
-from dotenv import load_dotenv
-import requests
 from starlette.datastructures import UploadFile as StarletteUploadFile
 
 from .builtin_tools import inspect_builtin_tool_functions
@@ -28,32 +26,32 @@ from .executor import run_generated_code
 from .exporter import export_project
 from .flow_store import delete_flow_record, list_flow_summaries, load_flow_record, normalize_flow_name, save_flow_record
 from .models import (
-    CanvasGraph,
     BuiltInToolFunctionOption,
     BuiltInToolFunctionsRequest,
-    ListCanvasTemplatesResponse,
-    ListBuiltInToolFunctionsResponse,
-    ListSkillPathsResponse,
+    CanvasGraph,
     CodegenRequest,
     CodegenResponse,
+    ExportProjectResponse,
+    FlowRecord,
+    FlowRuntimeStatus,
+    GraphNode,
+    ListBuiltInToolFunctionsResponse,
+    ListCanvasTemplatesResponse,
     ListEmailListenerStatusesResponse,
     ListFlowRuntimeStatusesResponse,
-    ListQueueSubscriberStatusesResponse,
-    ExportProjectResponse,
-    FlowRuntimeStatus,
-    FlowRecord,
-    GraphNode,
     ListFlowsResponse,
+    ListQueueSubscriberStatusesResponse,
+    ListSkillPathsResponse,
+    NodeType,
+    QueueSubscriberStatus,
     RunResult,
     RunSavedFlowByNameRequest,
     SaveFlowRequest,
     SaveFlowResponse,
     SkillPathOption,
-    QueueSubscriberStatus,
     WhatsappSessionStatus,
     WhatsappWebhookDispatchResponse,
 )
-from .models import NodeType
 from .queue_subscriber import QueueSubscriberManager, extract_queue_subscriber_configs
 from .sample_graph import build_sample_graph, get_canvas_template, list_canvas_templates
 from .whatsapp_gateway import WhatsappGatewayClient, normalize_whatsapp_session_id
@@ -91,7 +89,7 @@ QUEUE_OUTPUT_NODE_TYPES = {
 
 
 def _runtime_timestamp_now() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(UTC).isoformat()
 
 
 def _ensure_flow_runtime_stats(flow_name: str) -> dict[str, object]:
@@ -189,10 +187,33 @@ SKILL_DISCOVERY_ROOTS = [
     ("user", Path.home() / ".agents/skills"),
 ]
 
+def _resolve_cors_origins() -> tuple[list[str], bool]:
+    """Resolve allowed CORS origins from ``AGNOLAB_CORS_ORIGINS``.
+
+    A wildcard combined with credentials is a browser-exploitable
+    misconfiguration, so credentials are only enabled when explicit origins are
+    configured. Defaults to the local dev servers.
+    """
+    raw = os.getenv("AGNOLAB_CORS_ORIGINS", "").strip()
+    if raw == "*":
+        return ["*"], False
+    if raw:
+        origins = [origin.strip() for origin in raw.split(",") if origin.strip()]
+        return origins, True
+    default_origins = [
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+        "http://localhost:3000",
+    ]
+    return default_origins, True
+
+
+_cors_origins, _cors_allow_credentials = _resolve_cors_origins()
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
+    allow_origins=_cors_origins,
+    allow_credentials=_cors_allow_credentials,
     allow_methods=["*"],
     allow_headers=["*"],
 )

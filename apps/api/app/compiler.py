@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import json
+import re
 from collections import defaultdict, deque
 from inspect import signature
-import json
 from pathlib import Path
-import re
+from typing import Any
 
 from jinja2 import Template
 

@@ -1,14 +1,13 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from dataclasses import replace
-from datetime import datetime, timezone
 import asyncio
 import json
-from json import JSONDecodeError
 import threading
 import time
-from typing import Callable
+from collections.abc import Callable
+from dataclasses import dataclass, replace
+from datetime import UTC, datetime
+from json import JSONDecodeError
 
 import boto3
 import requests
@@ -31,7 +30,7 @@ QUEUE_LISTENER_MAX_RESULT_CHARS = 240
 
 
 def _timestamp_now() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(UTC).isoformat()
 
 
 def _normalize_bool(value: object, default: bool) -> bool:
