@@ -3518,7 +3518,8 @@ def compile_graph(graph: CanvasGraph) -> tuple[str, list[str]]:
             warnings.extend(output_warnings)
         elif output_node.type in QUEUE_OUTPUT_NODE_TYPES:
             warnings.append(
-                f"Queue output node '{output_node.data.name}' is configured in the canvas, but runtime dispatch is not implemented yet in generated code."
+                f"Queue output node '{output_node.data.name}' is dispatched when the flow runs through AgnoLab, "
+                "but the exported standalone script does not publish to it yet."
             )
     else:
         executable_types = {NodeType.AGENT, NodeType.TEAM, NodeType.WORKFLOW, NodeType.TOOL}

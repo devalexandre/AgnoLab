@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import hmac
 import html
 import json
@@ -1204,6 +1205,86 @@ def _publish_nats_output_payload(*, nats_url: str, nats_subject: str, payload_te
     asyncio.run(_publish())
 
 
+def _publish_rabbitmq_output_payload(*, url: str, queue: str, exchange: str, routing_key: str, payload_text: str) -> None:
+    try:
+        import pika
+    except ModuleNotFoundError as error:
+        raise RuntimeError("RabbitMQ output dependency missing. Install 'pika' to publish to RabbitMQ output nodes.") from error
+
+    connection = pika.BlockingConnection(pika.URLParameters(url))
+    try:
+        channel = connection.channel()
+        if queue and not exchange:
+            channel.queue_declare(queue=queue, durable=False)
+        channel.basic_publish(
+            exchange=exchange or "",
+            routing_key=routing_key or queue,
+            body=payload_text.encode("utf-8"),
+        )
+    finally:
+        connection.close()
+
+
+def _publish_kafka_output_payload(*, bootstrap_servers: str, topic: str, payload_text: str) -> None:
+    try:
+        from confluent_kafka import Producer
+    except ModuleNotFoundError as error:
+        raise RuntimeError("Kafka output dependency missing. Install 'confluent-kafka' to publish to Kafka output nodes.") from error
+
+    producer = Producer({"bootstrap.servers": bootstrap_servers})
+    producer.produce(topic, payload_text.encode("utf-8"))
+    producer.flush(5)
+
+
+def _publish_redis_output_payload(*, url: str, channel: str, payload_text: str) -> None:
+    try:
+        import redis
+    except ModuleNotFoundError as error:
+        raise RuntimeError("Redis output dependency missing. Install 'redis' to publish to Redis output nodes.") from error
+
+    client = redis.Redis.from_url(url, decode_responses=True)
+    try:
+        # The Redis input consumes with lpop, so publish with rpush for FIFO delivery.
+        client.rpush(channel, payload_text)
+    finally:
+        with contextlib.suppress(Exception):
+            client.close()
+
+
+def _publish_sqs_output_payload(*, region: str, queue_url: str, extras: dict, payload_text: str) -> None:
+    try:
+        import boto3
+    except ModuleNotFoundError as error:
+        raise RuntimeError("SQS output dependency missing. Install 'boto3' to publish to SQS output nodes.") from error
+
+    kwargs: dict[str, str] = {"region_name": region or "us-east-1"}
+    access_key = str(extras.get("awsAccessKeyId") or "").strip()
+    secret_key = str(extras.get("awsSecretAccessKey") or "").strip()
+    endpoint_url = str(extras.get("awsEndpointUrl") or "").strip()
+    if access_key:
+        kwargs["aws_access_key_id"] = access_key
+    if secret_key:
+        kwargs["aws_secret_access_key"] = secret_key
+    if endpoint_url:
+        kwargs["endpoint_url"] = endpoint_url
+
+    client = boto3.client("sqs", **kwargs)
+    client.send_message(QueueUrl=queue_url, MessageBody=payload_text)
+
+
+def _publish_pubsub_output_payload(*, project_id: str, topic: str, emulator_host: str, payload_text: str) -> None:
+    endpoint = emulator_host.strip()
+    if endpoint and not endpoint.startswith(("http://", "https://")):
+        endpoint = f"http://{endpoint}"
+    data_b64 = base64.b64encode(payload_text.encode("utf-8")).decode("ascii")
+    response = requests.post(
+        f"{endpoint}/v1/projects/{project_id}/topics/{topic}:publish",
+        json={"messages": [{"data": data_b64}]},
+        timeout=5,
+    )
+    response.raise_for_status()
+
+
 def _dispatch_queue_output_payloads(
     graph: CanvasGraph,
     *,
@@ -1218,17 +1299,54 @@ def _dispatch_queue_output_payloads(
     output_nodes = _resolve_queue_output_nodes_for_dispatch(graph, target_input_node_id=target_input_node_id)
     for output_node in output_nodes:
         extras = output_node.data.extras if isinstance(output_node.data.extras, dict) else {}
-        if output_node.type == NodeType.NATS_OUTPUT:
-            nats_url = str(extras.get("natsUrl") or "nats://localhost:4222").strip()
-            nats_subject = str(extras.get("natsSubject") or "agnolab.output").strip()
-            if not nats_subject:
-                dispatch_errors.append(f"Queue output '{output_node.data.name}' has an empty NATS subject.")
-                continue
-            try:
-                _publish_nats_output_payload(nats_url=nats_url, nats_subject=nats_subject, payload_text=message)
-            except Exception as error:
-                dispatch_errors.append(f"NATS output '{output_node.data.name}' failed: {error}")
-            continue
+        name = output_node.data.name
+        try:
+            if output_node.type == NodeType.NATS_OUTPUT:
+                _publish_nats_output_payload(
+                    nats_url=str(extras.get("natsUrl") or "nats://localhost:4222").strip(),
+                    nats_subject=str(extras.get("natsSubject") or "agnolab.output").strip(),
+                    payload_text=message,
+                )
+            elif output_node.type == NodeType.RABBITMQ_OUTPUT:
+                _publish_rabbitmq_output_payload(
+                    url=str(extras.get("rabbitmqUrl") or "amqp://guest:guest@localhost:5672/").strip(),
+                    queue=str(extras.get("rabbitmqQueue") or "agnolab.output").strip(),
+                    exchange=str(extras.get("rabbitmqExchange") or "").strip(),
+                    routing_key=str(extras.get("rabbitmqRoutingKey") or "").strip(),
+                    payload_text=message,
+                )
+            elif output_node.type == NodeType.KAFKA_OUTPUT:
+                _publish_kafka_output_payload(
+                    bootstrap_servers=str(extras.get("kafkaBootstrapServers") or "localhost:9092").strip(),
+                    topic=str(extras.get("kafkaTopic") or "agnolab.output").strip(),
+                    payload_text=message,
+                )
+            elif output_node.type == NodeType.REDIS_OUTPUT:
+                _publish_redis_output_payload(
+                    url=str(extras.get("redisUrl") or "redis://localhost:6379/0").strip(),
+                    channel=str(extras.get("redisChannel") or "agnolab.output").strip(),
+                    payload_text=message,
+                )
+            elif output_node.type == NodeType.SQS_OUTPUT:
+                queue_url = str(extras.get("sqsQueueUrl") or "").strip()
+                if not queue_url:
+                    dispatch_errors.append(f"Queue output '{name}' has an empty SQS queue URL.")
+                    continue
+                _publish_sqs_output_payload(
+                    region=str(extras.get("awsRegion") or "us-east-1").strip(),
+                    queue_url=queue_url,
+                    extras=extras,
+                    payload_text=message,
+                )
+            elif output_node.type == NodeType.PUBSUB_OUTPUT:
+                _publish_pubsub_output_payload(
+                    project_id=str(extras.get("pubsubProjectId") or "agnolab-local").strip(),
+                    topic=str(extras.get("pubsubTopic") or "agnolab-output-topic").strip(),
+                    emulator_host=str(extras.get("pubsubEmulatorHost") or "localhost:8085").strip(),
+                    payload_text=message,
+                )
+        except Exception as error:
+            dispatch_errors.append(f"Queue output '{name}' failed: {error}")
 
     return dispatch_errors
 
