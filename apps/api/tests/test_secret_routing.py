@@ -2,6 +2,10 @@
 
 Covers provider extra env (provider_env_json) and email passwords (input + output),
 complementing the provider-API-key coverage in test_compiler_golden.py.
+
+NOTE FOR SECRET SCANNERS AND REVIEWERS: the "fake-not-a-real-*" strings below are
+throwaway fixtures, not credentials. They exist precisely so each test can assert the
+value does NOT appear in the generated source. There is nothing here to revoke.
 """
 
 from __future__ import annotations
@@ -35,15 +39,15 @@ def _agent_with_provider_env(secret: str) -> GraphNode:
 
 
 def test_provider_env_json_is_not_inlined() -> None:
-    node = _agent_with_provider_env("xyz123")
+    node = _agent_with_provider_env("fake-not-a-real-secret-xyz")
     lines = build_provider_env_setup(node)
-    assert all("xyz123" not in line for line in lines)
+    assert all("fake-not-a-real-secret-xyz" not in line for line in lines)
 
 
 def test_provider_env_json_is_collected_for_runtime() -> None:
-    node = _agent_with_provider_env("xyz123")
+    node = _agent_with_provider_env("fake-not-a-real-secret-xyz")
     secrets = collect_graph_runtime_secrets(CanvasGraph(nodes=[node], edges=[]))
-    assert secrets.get("MY_SECRET") == "xyz123"
+    assert secrets.get("MY_SECRET") == "fake-not-a-real-secret-xyz"
 
 
 def test_email_input_password_routed_through_env() -> None:
@@ -58,16 +62,16 @@ def test_email_input_password_routed_through_env() -> None:
                 "emailProtocol": "imap",
                 "emailHost": "imap.x.com",
                 "emailUsername": "u",
-                "emailPassword": "INPW-secret",
+                "emailPassword": "fake-not-a-real-email-pw-in",
             },
         ),
     )
     code = "\n".join(render_input_payload(node))
-    assert "INPW-secret" not in code
+    assert "fake-not-a-real-email-pw-in" not in code
     assert f"os.getenv('{email_password_env_name('in1')}'" in code
 
     secrets = collect_graph_runtime_secrets(CanvasGraph(nodes=[node], edges=[]))
-    assert secrets.get(email_password_env_name("in1")) == "INPW-secret"
+    assert secrets.get(email_password_env_name("in1")) == "fake-not-a-real-email-pw-in"
 
 
 def test_email_output_password_routed_through_env() -> None:
@@ -82,14 +86,14 @@ def test_email_output_password_routed_through_env() -> None:
                 "emailHost": "smtp.x.com",
                 "emailFrom": "a@x.com",
                 "emailTo": "b@x.com",
-                "emailPassword": "EMAILPW-out",
+                "emailPassword": "fake-not-a-real-email-pw-out",
             },
         ),
     )
     lines, _warnings = render_output_api_dispatch(node, project_name="p")
     code = "\n".join(lines)
-    assert "EMAILPW-out" not in code
+    assert "fake-not-a-real-email-pw-out" not in code
     assert f"os.getenv('{email_password_env_name('out1')}'" in code
 
     secrets = collect_graph_runtime_secrets(CanvasGraph(nodes=[node], edges=[]))
-    assert secrets.get(email_password_env_name("out1")) == "EMAILPW-out"
+    assert secrets.get(email_password_env_name("out1")) == "fake-not-a-real-email-pw-out"

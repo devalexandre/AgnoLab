@@ -23,10 +23,13 @@ dependencies = [
 
 [project.optional-dependencies]
 # Dev / CI tooling. Install with: pip install -e ".[dev]"
+# Linters are pinned: an unpinned range lets CI install a newer Ruff than the one
+# used locally, so a new rule fails the build on code that passed on the machine
+# that wrote it. Bump these deliberately.
 dev = [
-  "pytest>=8.0",
-  "ruff>=0.6",
-  "mypy>=1.11",
+  "pytest>=8.0,<9",
+  "ruff==0.15.21",
+  "mypy==1.18.2",
 ]
 
 [build-system]

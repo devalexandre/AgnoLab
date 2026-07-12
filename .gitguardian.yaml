@@ -1,0 +1,33 @@
+version: 2
+
+# GitGuardian / ggshield configuration.
+#
+# Real secrets must never be committed. Everything excluded below was reviewed and
+# is a scanner false positive — no credential exists in these locations.
+
+secret:
+  # Fail the check on any finding that is not explicitly excluded here.
+  show-secrets: false
+
+  ignored-paths:
+    # Throwaway fixtures ("fake-not-a-real-*") used by the tests that PROVE secrets are
+    # not inlined into generated code. Each test asserts the value is absent from the
+    # compiler output, so the literal must exist in the test to be asserted against.
+    - "apps/api/tests/test_secret_routing.py"
+
+    # Placeholder-only files: variable names and empty values, no credentials.
+    - ".env.example"
+    - "apps/api/.env.example"
+
+  ignored-matches:
+    # docker-compose.yml declares REQUIRED secrets as variable references with a
+    # fail-fast message, e.g.
+    #     POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
+    # The scanner reads the `:?<error message>` text as if it were the value. These are
+    # interpolations that resolve from the environment; no password is stored in the file.
+    - name: "docker-compose required-secret placeholders (POSTGRES_PASSWORD)"
+      match: "set POSTGRES_PASSWORD"
+    - name: "docker-compose required-secret placeholders (REDIS_PASSWORD)"
+      match: "set REDIS_PASSWORD"
+    - name: "docker-compose required-secret placeholders (RABBITMQ_PASSWORD)"
+      match: "set RABBITMQ_PASSWORD"

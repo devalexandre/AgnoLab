@@ -1,12 +1,20 @@
 Metadata-Version: 2.4
 Name: agnolab-api
-Version: 0.1.0
+Version: 0.2.0
 Summary: API for the AgnoLab visual builder
 Requires-Python: >=3.11
-Requires-Dist: agno
+Requires-Dist: agno==2.5.11
 Requires-Dist: fastapi>=0.115.0
-Requires-Dist: jinja2>=3.1.0
-Requires-Dist: openai
-Requires-Dist: pydantic>=2.8.0
-Requires-Dist: python-dotenv
 Requires-Dist: uvicorn>=0.30.0
+Requires-Dist: pydantic>=2.8.0
+Requires-Dist: jinja2>=3.1.0
+Requires-Dist: python-dotenv
+Requires-Dist: aiohttp
+Requires-Dist: aiofiles
+Requires-Dist: httpx
+Requires-Dist: requests
+Requires-Dist: cryptography>=41.0
+Provides-Extra: dev
+Requires-Dist: pytest<9,>=8.0; extra == "dev"
+Requires-Dist: ruff==0.15.21; extra == "dev"
+Requires-Dist: mypy==1.18.2; extra == "dev"
