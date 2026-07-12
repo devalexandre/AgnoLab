@@ -5859,6 +5859,20 @@ export default function App() {
     setConnectionMessage(`Generated code exported as ${normalizedName}.py`);
   }
 
+  async function handleExportServeApp() {
+    if (!graph) {
+      return;
+    }
+    try {
+      const response = await previewCode(graph, { serve: true });
+      downloadAsFile(response.code, "main.py", "text/x-python;charset=utf-8");
+      setConnectionMessage("Exported AgentOS server app as main.py (run with: python main.py).");
+    } catch (error) {
+      console.error(error);
+      setConnectionMessage("Failed to export the AgentOS server app.");
+    }
+  }
+
   function handleExportFlow() {
     if (!graph) {
       return;
@@ -11952,6 +11966,9 @@ export default function App() {
                 </button>
                 <button type="button" className="secondary-button" onClick={handleExportPython}>
                   Export .py
+                </button>
+                <button type="button" className="secondary-button" onClick={handleExportServeApp} title="Export an AgentOS server app (FastAPI) that serves this flow's agents/teams/workflows as an API.">
+                  Export Server App
                 </button>
                 <button type="button" className="secondary-button" onClick={handleUndo} disabled={historyPast.length === 0} title="Undo (Ctrl/Cmd+Z)">
                   Undo
