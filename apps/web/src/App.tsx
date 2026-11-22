@@ -547,6 +547,8 @@ type KnowledgeReaderKey = "auto" | "pdf" | "csv" | "field_labeled_csv" | "excel"
 
 const DATABASE_DEPENDENT_AGENT_FIELDS = new Set([
   "db",
+  "checkpoint",
+  "filesystem",
   "overwrite_db_session_state",
   "search_past_sessions",
   "num_past_sessions_to_search",
@@ -591,6 +593,7 @@ const COMPONENT_SELECT_AGENT_FIELDS = new Set([
 
 const DATABASE_DEPENDENT_TEAM_FIELDS = new Set([
   "db",
+  "checkpoint",
   "overwrite_db_session_state",
   "search_past_sessions",
   "num_past_sessions_to_search",

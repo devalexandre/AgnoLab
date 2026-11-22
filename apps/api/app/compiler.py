@@ -256,6 +256,9 @@ DEBUG_TRACE_HELPERS = [
 
 RAW_AGENT_FIELDS = {
     "db",
+    "fallback_models",
+    "fallback_config",
+    "compaction",
     "memory_manager",
     "session_summary_manager",
     "compression_manager",
@@ -286,6 +289,9 @@ JSON_AGENT_FIELDS = {
 
 RAW_TEAM_FIELDS = {
     "db",
+    "fallback_models",
+    "fallback_config",
+    "compaction",
     "memory_manager",
     "session_summary_manager",
     "compression_manager",
@@ -385,6 +391,13 @@ REMOVED_FIELD_HINTS = {
     "reasoning_max_steps": "set 'Reasoning Model' or attach the ReasoningTools built-in tool",
     "enable_user_memories": "use 'update_memory_on_run'",
 }
+
+
+def fallback_conflict_warning(owner: str, name: str, config: dict) -> list[str]:
+    """Agno ignores fallback_models when fallback_config is also set; say so instead of silently dropping it."""
+    if is_blank_field_value(config.get("fallback_models")) or is_blank_field_value(config.get("fallback_config")):
+        return []
+    return [f"{owner} '{name}' sets both Fallback Models and Fallback Config; Agno uses Fallback Config and ignores Fallback Models."]
 
 
 def unsupported_field_warning(owner: str, field: str) -> str:
@@ -502,6 +515,10 @@ RAW_EXPRESSION_IMPORTS = {
     "Slack": ("agno.os.interfaces.slack", "Slack"),
     "A2A": ("agno.os.interfaces.a2a", "A2A"),
     "AGUI": ("agno.os.interfaces.agui", "AGUI"),
+    # Agno 3: model fallback, context compaction and tool-result offloading.
+    "Compaction": ("agno.compaction", "Compaction"),
+    "FallbackConfig": ("agno.models.fallback", "FallbackConfig"),
+    "ResultStore": ("agno.offload", "ResultStore"),
     # Guardrails — usable via an agent/team pre_hooks / post_hooks expression.
     "PIIDetectionGuardrail": ("agno.guardrails", "PIIDetectionGuardrail"),
     "PromptInjectionGuardrail": ("agno.guardrails", "PromptInjectionGuardrail"),
@@ -1445,6 +1462,7 @@ def build_agent_kwargs(
     if node.data.description:
         ordered_pairs.append(("description", python_literal(node.data.description)))
 
+    model_warnings.extend(fallback_conflict_warning("Agent", node.data.name, agent_config))
     for original_key, value in agent_config.items():
         key = AGENT_FIELD_ALIASES.get(original_key, original_key)
         if key != original_key and not is_blank_field_value(agent_config.get(key)):
@@ -1572,6 +1590,7 @@ def build_team_kwargs(
     if node.data.description:
         ordered_pairs.append(("description", python_literal(node.data.description)))
 
+    model_warnings.extend(fallback_conflict_warning("Team", node.data.name, team_config))
     for original_key, value in team_config.items():
         key = TEAM_FIELD_ALIASES.get(original_key, original_key)
         if key != original_key and not is_blank_field_value(team_config.get(key)):

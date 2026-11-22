@@ -407,6 +407,50 @@ export const PROVIDER_DEFINITIONS: ProviderDefinition[] = [
     url: "https://api.v0.dev/v1/",
     aliases: ["vercel"],
   },
+  {
+    id: "openai-like",
+    name: "OpenAI-compatible endpoint",
+    model: "your-model-id",
+    key: "OPENAI_LIKE_API_KEY",
+    url: "http://localhost:8000/v1",
+    aliases: ["openai-compatible", "custom-openai"],
+  },
+  {
+    id: "open-responses",
+    name: "Open Responses endpoint",
+    model: "your-model-id",
+    key: "OPEN_RESPONSES_API_KEY",
+    url: "http://localhost:8000/v1",
+  },
+  {
+    id: "azure-openai-responses",
+    name: "Azure OpenAI Responses",
+    model: "gpt-4.1-mini",
+    key: "AZURE_OPENAI_API_KEY",
+    url: "https://<your-resource-name>.openai.azure.com/",
+    baseUrlEnv: "AZURE_OPENAI_ENDPOINT",
+  },
+  {
+    id: "xai-responses",
+    name: "xAI Responses",
+    model: "grok-4-1-fast-non-reasoning-latest",
+    key: "XAI_API_KEY",
+    url: "https://api.x.ai/v1",
+  },
+  {
+    id: "minimax",
+    name: "MiniMax",
+    model: "MiniMax-M3",
+    key: "MINIMAX_API_KEY",
+    url: "https://api.minimax.io/v1",
+  },
+  {
+    id: "cloudflare",
+    name: "Cloudflare AI Gateway",
+    model: "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
+    key: "CLOUDFLARE_API_TOKEN",
+    url: "",
+  },
 ];
 
 const PROVIDER_ALIAS_MAP = new Map<string, string>();

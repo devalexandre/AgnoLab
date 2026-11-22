@@ -21,6 +21,19 @@ FLOW_BASE_REQUIREMENTS = [
 ]
 
 TOOL_REQUIREMENTS_BY_KEY: dict[str, list[str]] = {
+    "bravesearch": ["brave-search"],
+    "baidusearch": ["baidusearch"],
+    "parallel": ["parallel-web"],
+    "valyu": ["valyu"],
+    "trafilatura": ["trafilatura"],
+    "scrapegraph": ["scrapegraph-py"],
+    "docling": ["docling"],
+    "resend": ["resend"],
+    "aws_ses": ["boto3"],
+    "twilio": ["twilio"],
+    "webex": ["webexpythonsdk"],
+    "salesforce": ["simple-salesforce"],
+    "zep": ["zep-cloud"],
     "websearch": ["ddgs"],
     "duckduckgo": ["ddgs"],
     "yfinance": ["yfinance"],
