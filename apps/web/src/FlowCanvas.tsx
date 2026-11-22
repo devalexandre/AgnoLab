@@ -43,6 +43,10 @@ import type { GraphEdge, NodeType, Position } from "./types";
 
 export const LIBRARY_DRAG_MIME = "application/x-agnolab-library-item";
 
+// Fit-to-view keeps the flow clear of the overlays drawn on top of the canvas: the toolbar
+// (top) and the minimap (bottom right).
+const FIT_VIEW_PADDING = { top: "128px", right: "32px", bottom: "40px", left: "32px" } as const;
+
 export const MIN_FLOW_ZOOM = 0.3;
 export const MAX_FLOW_ZOOM = 2.5;
 
@@ -343,7 +347,7 @@ const FlowCanvasInner = forwardRef<FlowCanvasHandle, FlowCanvasProps>(function F
       zoomIn: () => void flow.zoomIn({ duration: 160 }),
       zoomOut: () => void flow.zoomOut({ duration: 160 }),
       resetZoom: () => void flow.zoomTo(1, { duration: 160 }),
-      fitView: () => void flow.fitView({ padding: 0.08, duration: 220, maxZoom: 1.2 }),
+      fitView: () => void flow.fitView({ padding: FIT_VIEW_PADDING, duration: 220, maxZoom: 1.2 }),
       getNodeSize: (nodeId: string) => {
         const measured = flow.getNode(nodeId)?.measured;
         return measured?.width && measured?.height ? { width: measured.width, height: measured.height } : undefined;
@@ -383,7 +387,7 @@ const FlowCanvasInner = forwardRef<FlowCanvasHandle, FlowCanvasProps>(function F
         snapToGrid
         snapGrid={[10, 10]}
         fitView
-        fitViewOptions={{ padding: 0.08, maxZoom: 1.1 }}
+        fitViewOptions={{ padding: FIT_VIEW_PADDING, maxZoom: 1.1 }}
         defaultEdgeOptions={{ type: "default" }}
         proOptions={{ hideAttribution: false }}
       >
