@@ -14,8 +14,9 @@ Built on **Agno 3.2.1**.
 
 ## Highlights
 
-- **Visual canvas.** Searchable node library, validated connections, minimap, undo/redo, zoom,
-  autosave, and live run badges on every node.
+- **Visual canvas.** Built on React Flow: drag nodes in from the library, drag from a port to
+  connect, multi-select, copy/paste, auto-layout, minimap, and live run badges on every node.
+- **Command palette.** `Ctrl/Cmd+K` to run any action or add any node or tool by name.
 - **Agents, Teams, and Workflows.** Compile to real Agno objects, including sequential
   workflows with human-in-the-loop review steps.
 - **Code you can read.** Preview the generated Python before running, in an editor that
@@ -63,19 +64,50 @@ connections, minimap, and the code editor. Each node type gets its own accent co
 </p>
 
 The canvas now has a single toolbar: flow name, Save, Integration, an export menu,
-undo/redo, zoom, theme, and an always-visible **Run** button.
+undo/redo, zoom, fit, auto-layout, command palette, theme, and an always-visible **Run** button.
+
+### A faster canvas
+
+The canvas moved to [React Flow](https://reactflow.dev):
+
+- **Drag to connect.** Drag from a node's right port to another node's left port. Valid
+  targets light up and invalid ones fade, so you only make connections Agno accepts.
+  Clicking one port and then the other still works.
+- **Drag from the library.** Drop any component where you want it; added nodes otherwise
+  appear in the middle of the visible area.
+- **Work with many nodes at once.** Shift+drag to box-select, Ctrl/Cmd+click to add to the
+  selection, then move, copy, paste, duplicate, or delete them together.
+- **Auto-layout** arranges the flow left to right by data flow, and **Fit** frames it.
+
+![Connecting two nodes](docs/screenshots/connect.png)
+
+![Command palette](docs/screenshots/command-palette.png)
+
+### Keyboard shortcuts
+
+| Shortcut | Action |
+| --- | --- |
+| `Ctrl/Cmd+K` | Command palette |
+| `Ctrl/Cmd+Z` / `Ctrl/Cmd+Y` | Undo / redo |
+| `Ctrl/Cmd+C` / `Ctrl/Cmd+V` | Copy / paste nodes (with the connections between them) |
+| `Ctrl/Cmd+D` | Duplicate selection |
+| `Ctrl/Cmd+A` | Select all nodes |
+| `Delete` / `Backspace` | Delete the selected nodes or connection |
+| `Shift+1` | Fit flow to view |
+| `Shift+L` | Auto-layout |
+| `Esc` | Clear the selection |
 
 ## Main Features
 
 ### Visual Canvas
 
 - Add nodes from a searchable library grouped by category (Core, Logic, Queues,
-  Integrations, Interfaces, Tools, Skills, Learning).
-- Connect nodes; the node model validates which connections are allowed.
-- See execution badges and run state directly on the canvas.
+  Integrations, Interfaces, Tools, Skills, Learning), by click or drag and drop.
+- Connect nodes by dragging between ports; the node model validates every connection.
+- See execution badges and run state on the canvas; connections from running nodes animate.
 - Double-click an Input node to open the chat runner, or an Output node to show only the
   agent's response.
-- Undo/redo (Ctrl/Cmd+Z, Ctrl/Cmd+Y), zoom, pan, and a clickable minimap.
+- Zoom with the scroll wheel, pan by dragging the background, and navigate with the minimap.
 - Keyboard focus is visible on every control.
 
 ### Templates
@@ -128,7 +160,9 @@ review, and WhatsApp interface.
 - `apps/api/app/exporter.py`: export bundle generation.
 - `apps/api/app/flow_store.py`: saved-flow persistence.
 - `apps/web`: React canvas, properties panel, run console, code preview, and library panels.
-- `apps/web/src/App.tsx`: main canvas experience and panel logic.
+- `apps/web/src/App.tsx`: main editor experience and panel logic.
+- `apps/web/src/FlowCanvas.tsx`: the React Flow canvas (nodes, ports, edges, minimap, drop).
+- `apps/web/src/CommandPalette.tsx`: the `Ctrl/Cmd+K` command palette.
 - `apps/web/src/providerCatalog.ts`: frontend provider catalog and presets.
 - `apps/web/src/agentConfig.ts`: agent properties definition.
 - `apps/web/src/nodeCatalog.ts`: node templates and defaults.
@@ -142,7 +176,7 @@ review, and WhatsApp interface.
 ## Requirements
 
 - Python 3.11+
-- Node.js 18+
+- Node.js 18+ (run the frontend unit tests with `npm test` in `apps/web`)
 - Agno 3.2.1 (installed by `requirements.txt` as `agno[os]`)
 - An OpenAI API key if you want to use the default OpenAI provider out of the box
 

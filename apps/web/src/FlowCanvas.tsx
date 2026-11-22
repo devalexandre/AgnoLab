@@ -321,7 +321,7 @@ const FlowCanvasInner = forwardRef<FlowCanvasHandle, FlowCanvasProps>(function F
       zoomIn: () => void flow.zoomIn({ duration: 160 }),
       zoomOut: () => void flow.zoomOut({ duration: 160 }),
       resetZoom: () => void flow.zoomTo(1, { duration: 160 }),
-      fitView: () => void flow.fitView({ padding: 0.2, duration: 220, maxZoom: 1.2 }),
+      fitView: () => void flow.fitView({ padding: 0.08, duration: 220, maxZoom: 1.2 }),
       getNodeSize: (nodeId: string) => {
         const measured = flow.getNode(nodeId)?.measured;
         return measured?.width && measured?.height ? { width: measured.width, height: measured.height } : undefined;
@@ -361,7 +361,7 @@ const FlowCanvasInner = forwardRef<FlowCanvasHandle, FlowCanvasProps>(function F
         snapToGrid
         snapGrid={[10, 10]}
         fitView
-        fitViewOptions={{ padding: 0.2, maxZoom: 1.1 }}
+        fitViewOptions={{ padding: 0.08, maxZoom: 1.1 }}
         defaultEdgeOptions={{ type: "default" }}
         proOptions={{ hideAttribution: false }}
       >
