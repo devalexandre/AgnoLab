@@ -50,10 +50,20 @@ def test_serve_code_builds_a_fastapi_app_when_executed() -> None:
 def test_export_serve_adds_server_deps_and_run_docs() -> None:
     response = export_project(build_base_graph(), serve=True)
     files = {f.path: f.content for f in response.files}
-    assert "fastapi" in files["requirements.txt"]
-    assert "uvicorn" in files["requirements.txt"]
+    requirements = files["requirements.txt"].splitlines()
+    # AgentOS's server deps (fastapi, uvicorn, python-multipart, sqlalchemy[asyncio], ...)
+    # come from Agno's `os` extra, pinned to the version the code was generated for.
+    assert any(line.startswith("agno[os]==") for line in requirements)
+    assert "agno" not in requirements
     assert "AgentOS server app" in files["README.md"]
     assert "python main.py" in files["README.md"]
+
+
+def test_export_run_once_pins_plain_agno() -> None:
+    response = export_project(build_base_graph())
+    requirements = next(f.content for f in response.files if f.path == "requirements.txt").splitlines()
+    assert any(line.startswith("agno==") for line in requirements)
+    assert not any(line.startswith("agno[os]") for line in requirements)
 
 
 def test_export_default_is_still_run_once() -> None:

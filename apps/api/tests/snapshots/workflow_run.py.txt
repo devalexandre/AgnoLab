@@ -7,7 +7,7 @@ from agno.agent import Agent
 from agno.media import Audio, File, Image, Video
 from agno.team import Team
 from agno.tools import tool
-from agno.workflow import Step, Workflow
+from agno.workflow import HumanReview, Step, Workflow
 from agno.models.openai import OpenAIChat
 
 @tool
@@ -55,10 +55,7 @@ workflow_step_workflow_step_1 = Step(
     max_retries=3,
     skip_on_failure=False,
     strict_input_validation=False,
-    requires_confirmation=False,
-    on_reject='skip',
-    requires_user_input=False,
-    on_error='skip',
+    human_review=HumanReview(requires_confirmation=False, on_reject='skip', requires_user_input=False, on_error='skip'),
 )
 
 os.environ['OPENAI_BASE_URL'] = 'https://api.openai.com/v1'
@@ -83,10 +80,7 @@ workflow_step_workflow_step_2 = Step(
     max_retries=3,
     skip_on_failure=False,
     strict_input_validation=False,
-    requires_confirmation=False,
-    on_reject='skip',
-    requires_user_input=False,
-    on_error='skip',
+    human_review=HumanReview(requires_confirmation=False, on_reject='skip', requires_user_input=False, on_error='skip'),
 )
 
 workflow_workflow_1 = Workflow(

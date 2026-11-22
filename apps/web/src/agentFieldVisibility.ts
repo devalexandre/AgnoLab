@@ -34,8 +34,9 @@ export function shouldShowAgentField(
       );
     case "overwrite_db_session_state":
       return Boolean(agentConfig.enable_agentic_state) || Boolean(agentConfig.overwrite_db_session_state);
-    case "num_history_sessions":
-      return Boolean(agentConfig.search_session_history) || hasConfiguredValue(agentConfig.num_history_sessions);
+    case "num_past_sessions_to_search":
+    case "num_past_session_runs_in_search":
+      return Boolean(agentConfig.search_past_sessions) || hasConfiguredValue(agentConfig[field.key]);
     case "num_history_runs":
     case "num_history_messages":
       return Boolean(agentConfig.add_history_to_context) || hasConfiguredValue(agentConfig[field.key]);
@@ -58,11 +59,6 @@ export function shouldShowAgentField(
     case "pre_hooks":
     case "post_hooks":
       return hasConnectedTools || hasConfiguredValue(agentConfig[field.key]);
-    case "reasoning_model":
-    case "reasoning_agent":
-    case "reasoning_min_steps":
-    case "reasoning_max_steps":
-      return Boolean(agentConfig.reasoning) || hasConfiguredValue(agentConfig[field.key]);
     case "store_media":
       return Boolean(agentConfig.send_media_to_model) || hasConfiguredValue(agentConfig.store_media);
     case "parser_model_prompt":
@@ -92,8 +88,6 @@ export function shouldShowTeamField(
     case "num_past_sessions_to_search":
     case "num_past_session_runs_in_search":
       return Boolean(teamConfig.search_past_sessions) || hasConfiguredValue(teamConfig[field.key]);
-    case "num_history_sessions":
-      return Boolean(teamConfig.search_session_history) || hasConfiguredValue(teamConfig.num_history_sessions);
     case "num_team_history_runs":
       return Boolean(teamConfig.add_team_history_to_members) || hasConfiguredValue(teamConfig.num_team_history_runs);
     case "num_history_runs":
@@ -116,11 +110,6 @@ export function shouldShowTeamField(
     case "pre_hooks":
     case "post_hooks":
       return hasConnectedTools || hasConfiguredValue(teamConfig[field.key]);
-    case "reasoning_model":
-    case "reasoning_agent":
-    case "reasoning_min_steps":
-    case "reasoning_max_steps":
-      return Boolean(teamConfig.reasoning) || hasConfiguredValue(teamConfig[field.key]);
     case "store_media":
       return Boolean(teamConfig.send_media_to_model) || hasConfiguredValue(teamConfig.store_media);
     case "num_followups":
@@ -158,7 +147,7 @@ export function getTeamGroupNote(group: AgentFieldDefinition["group"]): string |
     case "Tools":
       return "Leader tool policy, member tool exposure, and hook lifecycle controls are grouped here.";
     case "Input/Output":
-      return "Team mode, reasoning, multimodal input, direct-response behavior, and followups are configured in one place.";
+      return "Team mode, reasoning model, multimodal input, direct-response behavior, and followups are configured in one place.";
     default:
       return null;
   }

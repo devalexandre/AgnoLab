@@ -559,8 +559,9 @@ type KnowledgeReaderKey = "auto" | "pdf" | "csv" | "field_labeled_csv" | "excel"
 const DATABASE_DEPENDENT_AGENT_FIELDS = new Set([
   "db",
   "overwrite_db_session_state",
-  "search_session_history",
-  "num_history_sessions",
+  "search_past_sessions",
+  "num_past_sessions_to_search",
+  "num_past_session_runs_in_search",
   "add_history_to_context",
   "num_history_runs",
   "num_history_messages",
@@ -602,8 +603,9 @@ const COMPONENT_SELECT_AGENT_FIELDS = new Set([
 const DATABASE_DEPENDENT_TEAM_FIELDS = new Set([
   "db",
   "overwrite_db_session_state",
-  "search_session_history",
-  "num_history_sessions",
+  "search_past_sessions",
+  "num_past_sessions_to_search",
+  "num_past_session_runs_in_search",
   "add_history_to_context",
   "num_history_runs",
   "num_history_messages",
@@ -7122,6 +7124,10 @@ export default function App() {
         requiresUserInput: false,
         userInputMessage: "",
         userInputSchema: "",
+        requiresOutputReview: false,
+        outputReviewMessage: "",
+        reviewTimeout: "" as number | "",
+        onTimeout: "cancel",
         onError: "skip",
         ...(currentNode.data.extras ?? {}),
       };
@@ -7278,6 +7284,7 @@ export default function App() {
                 >
                   <option value="skip">skip</option>
                   <option value="cancel">cancel</option>
+                  <option value="retry">retry</option>
                   <option value="else">else</option>
                 </select>
               </label>
@@ -7336,6 +7343,76 @@ export default function App() {
                   }
                 />
               </label>
+            </>
+          ) : null}
+          <label className="checkbox-field">
+            <input
+              type="checkbox"
+              checked={Boolean(currentExtras.requiresOutputReview)}
+              onChange={(event) =>
+                setGraph(
+                  updateNodeData(currentGraph, currentNode.id, {
+                    extras: { ...currentExtras, requiresOutputReview: event.target.checked },
+                  }),
+                )
+              }
+            />
+            {renderInspectorPropertyLabel("Requires Output Review", "Pauses after the step runs so a human can approve, reject, or retry its output (Agno 3 HumanReview).")}
+          </label>
+          {Boolean(currentExtras.requiresOutputReview) ? (
+            <label>
+              {renderInspectorPropertyLabel("Output Review Message", "Message shown when the step output is sent for review.")}
+              <textarea
+                value={fieldValueAsString(currentExtras.outputReviewMessage)}
+                onChange={(event) =>
+                  setGraph(
+                    updateNodeData(currentGraph, currentNode.id, {
+                      extras: { ...currentExtras, outputReviewMessage: event.target.value },
+                    }),
+                  )
+                }
+              />
+            </label>
+          ) : null}
+          {Boolean(currentExtras.requiresConfirmation) || Boolean(currentExtras.requiresUserInput) || Boolean(currentExtras.requiresOutputReview) ? (
+            <>
+              <label>
+                {renderInspectorPropertyLabel("Review Timeout (seconds)", "How long a human-review pause waits before the timeout action applies. Empty waits forever.")}
+                <input
+                  type="number"
+                  min={1}
+                  value={fieldValueAsString(currentExtras.reviewTimeout)}
+                  onChange={(event) =>
+                    setGraph(
+                      updateNodeData(currentGraph, currentNode.id, {
+                        extras: {
+                          ...currentExtras,
+                          reviewTimeout: event.target.value === "" ? "" : Number(event.target.value),
+                        },
+                      }),
+                    )
+                  }
+                />
+              </label>
+              {fieldValueAsString(currentExtras.reviewTimeout) ? (
+                <label>
+                  {renderInspectorPropertyLabel("On Timeout", "What happens when the review pause times out.")}
+                  <select
+                    value={fieldValueAsString(currentExtras.onTimeout || "cancel")}
+                    onChange={(event) =>
+                      setGraph(
+                        updateNodeData(currentGraph, currentNode.id, {
+                          extras: { ...currentExtras, onTimeout: event.target.value },
+                        }),
+                      )
+                    }
+                  >
+                    <option value="cancel">cancel</option>
+                    <option value="skip">skip</option>
+                    <option value="approve">approve</option>
+                  </select>
+                </label>
+              ) : null}
             </>
           ) : null}
           <label>

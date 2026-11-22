@@ -23,7 +23,7 @@ NO_DEP_TOOLKITS = [
     ("agno.tools.knowledge", "KnowledgeTools"),
     ("agno.tools.user_control_flow", "UserControlFlowTools"),
     ("agno.tools.serper", "SerperTools"),
-    ("agno.tools.searxng", "SearxngTools"),
+    ("agno.tools.searxng", "Searxng"),
     ("agno.tools.pubmed", "PubmedTools"),
     ("agno.tools.discord", "DiscordTools"),
 ]

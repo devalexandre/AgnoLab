@@ -10,7 +10,7 @@ from typing import Any
 
 from jinja2 import Template
 
-from .builtin_tools import inspect_builtin_tool_functions
+from .builtin_tools import inspect_builtin_tool_functions, resolve_builtin_tool_import
 from .models import CanvasGraph, GraphNode, NodeType, TargetRuntime
 from .provider_catalog import (
     get_provider_definition,
@@ -361,6 +361,36 @@ def get_supported_step_kwargs() -> set[str]:
 
 
 SUPPORTED_STEP_KWARGS = get_supported_step_kwargs()
+STEP_USES_HUMAN_REVIEW = "human_review" in SUPPORTED_STEP_KWARGS
+
+
+# Agno 3.x removed these Agent/Team kwargs in favour of an equivalent one. Saved flows that
+# still carry the old key are compiled to the new kwarg instead of being silently dropped.
+LEGACY_SESSION_FIELD_ALIASES = {
+    "search_session_history": "search_past_sessions",
+    "num_history_sessions": "num_past_sessions_to_search",
+}
+
+
+# Kwargs Agno 3.x removed with no 1:1 replacement, and what to use instead.
+REMOVED_FIELD_HINTS = {
+    "reasoning": "set 'Reasoning Model' or attach the ReasoningTools built-in tool",
+    "reasoning_min_steps": "set 'Reasoning Model' or attach the ReasoningTools built-in tool",
+    "reasoning_max_steps": "set 'Reasoning Model' or attach the ReasoningTools built-in tool",
+    "enable_user_memories": "use 'update_memory_on_run'",
+}
+
+
+def unsupported_field_warning(owner: str, field: str) -> str:
+    hint = REMOVED_FIELD_HINTS.get(field)
+    suffix = f" Agno 3.x removed it: {hint}." if hint else ""
+    return f"{owner} field '{field}' is not supported by the installed Agno version and was ignored.{suffix}"
+
+
+def add_legacy_field_aliases(aliases: dict[str, str], supported: set[str]) -> None:
+    for legacy_key, new_key in LEGACY_SESSION_FIELD_ALIASES.items():
+        if legacy_key not in supported and new_key in supported:
+            aliases[legacy_key] = new_key
 
 
 def get_agent_field_aliases() -> dict[str, str]:
@@ -377,6 +407,7 @@ def get_agent_field_aliases() -> dict[str, str]:
     if "references_format" not in SUPPORTED_AGENT_KWARGS and "context_format" in SUPPORTED_AGENT_KWARGS:
         aliases["references_format"] = "context_format"
 
+    add_legacy_field_aliases(aliases, SUPPORTED_AGENT_KWARGS)
     return aliases
 
 
@@ -397,6 +428,7 @@ def get_team_field_aliases() -> dict[str, str]:
     if "references_format" not in SUPPORTED_TEAM_KWARGS and "context_format" in SUPPORTED_TEAM_KWARGS:
         aliases["references_format"] = "context_format"
 
+    add_legacy_field_aliases(aliases, SUPPORTED_TEAM_KWARGS)
     return aliases
 
 
@@ -419,7 +451,6 @@ RAW_EXPRESSION_IMPORTS = {
     "Skills": ("agno.skills", "Skills"),
     "LocalSkills": ("agno.skills", "LocalSkills"),
     "LearningMachine": ("agno.learn", "LearningMachine"),
-    "AgentKnowledge": ("agno.agent", "AgentKnowledge"),
     "MemoryManager": ("agno.memory", "MemoryManager"),
     "SessionSummaryManager": ("agno.session.summary", "SessionSummaryManager"),
     "CompressionManager": ("agno.compression.manager", "CompressionManager"),
@@ -432,13 +463,24 @@ RAW_EXPRESSION_IMPORTS = {
     "LanceDb": ("agno.vectordb.lancedb", "LanceDb"),
     "MongoVectorDb": ("agno.vectordb.mongodb", "MongoVectorDb"),
     "RedisVectorDb": ("agno.vectordb.redis", "RedisVectorDb"),
+    "Elasticsearch": ("agno.vectordb.elasticsearch", "Elasticsearch"),
+    "OpenSearch": ("agno.vectordb.opensearch", "OpenSearch"),
     "SearchType": ("agno.vectordb.search", "SearchType"),
+    # Knowledge rerankers (Agno 3.x) — usable in a Knowledge `reranker=` expression.
+    "MMRReranker": ("agno.knowledge.reranker", "MMRReranker"),
+    "RecencyReranker": ("agno.knowledge.reranker", "RecencyReranker"),
     "PostgresDb": ("agno.db.postgres", "PostgresDb"),
     "AsyncPostgresDb": ("agno.db.postgres", "AsyncPostgresDb"),
     "SqliteDb": ("agno.db.sqlite", "SqliteDb"),
     "MongoDb": ("agno.db.mongo", "MongoDb"),
     "RedisDb": ("agno.db.redis", "RedisDb"),
-    "DynamoDb": ("agno.db.dynamodb", "DynamoDb"),
+    "DynamoDb": ("agno.db.dynamo", "DynamoDb"),
+    "MySQLDb": ("agno.db.mysql", "MySQLDb"),
+    "SingleStoreDb": ("agno.db.singlestore", "SingleStoreDb"),
+    "SurrealDb": ("agno.db.surrealdb", "SurrealDb"),
+    "GcsJsonDb": ("agno.db.gcs_json", "GcsJsonDb"),
+    "JsonDb": ("agno.db.json", "JsonDb"),
+    "InMemoryDb": ("agno.db.in_memory", "InMemoryDb"),
     "FirestoreDb": ("agno.db.firestore", "FirestoreDb"),
     "PDFReader": ("agno.knowledge.reader.pdf_reader", "PDFReader"),
     "CSVReader": ("agno.knowledge.reader.csv_reader", "CSVReader"),
@@ -891,8 +933,10 @@ def render_tool_node(node: GraphNode, var_name: str, *, graph: CanvasGraph | Non
     tool_mode = extras.get("toolMode", "builtin")
 
     if tool_mode == "builtin":
-        class_name = extras.get("builtinClassName", "WebSearchTools")
-        import_path = extras.get("builtinImportPath", "agno.tools.websearch")
+        import_path, class_name = resolve_builtin_tool_import(
+            extras.get("builtinImportPath", "agno.tools.websearch"),
+            extras.get("builtinClassName", "WebSearchTools"),
+        )
         config_raw = extras.get("builtinConfig") or ""
         parsed_config: dict[str, Any] = {}
         if isinstance(config_raw, str) and config_raw.strip():
@@ -1397,6 +1441,9 @@ def build_agent_kwargs(
 
     for original_key, value in agent_config.items():
         key = AGENT_FIELD_ALIASES.get(original_key, original_key)
+        if key != original_key and not is_blank_field_value(agent_config.get(key)):
+            # A legacy key aliased onto a kwarg the flow also sets directly: the direct one wins.
+            continue
 
         if key in {"name", "model", "instructions", "description"}:
             continue
@@ -1405,9 +1452,7 @@ def build_agent_kwargs(
         if value in (None, "", [], {}):
             continue
         if SUPPORTED_AGENT_KWARGS and key not in SUPPORTED_AGENT_KWARGS:
-            model_warnings.append(
-                f"Agent field '{original_key}' is not supported by the installed Agno version and was ignored."
-            )
+            model_warnings.append(unsupported_field_warning("Agent", original_key))
             continue
         if key in RAW_AGENT_FIELDS:
             ordered_pairs.append((key, str(value)))
@@ -1523,6 +1568,9 @@ def build_team_kwargs(
 
     for original_key, value in team_config.items():
         key = TEAM_FIELD_ALIASES.get(original_key, original_key)
+        if key != original_key and not is_blank_field_value(team_config.get(key)):
+            # A legacy key aliased onto a kwarg the flow also sets directly: the direct one wins.
+            continue
 
         if key in {"members", "name", "model", "instructions", "description", "tools"}:
             continue
@@ -1531,9 +1579,7 @@ def build_team_kwargs(
         if value in (None, "", [], {}):
             continue
         if SUPPORTED_TEAM_KWARGS and key not in SUPPORTED_TEAM_KWARGS:
-            model_warnings.append(
-                f"Team field '{original_key}' is not supported by the installed Agno version and was ignored."
-            )
+            model_warnings.append(unsupported_field_warning("Team", original_key))
             continue
         if key in RAW_TEAM_FIELDS:
             ordered_pairs.append((key, str(value)))
@@ -1629,16 +1675,10 @@ def build_workflow_step_kwargs(
         ("max_retries", extras.get("maxRetries")),
         ("skip_on_failure", extras.get("skipOnFailure")),
         ("strict_input_validation", extras.get("strictInputValidation")),
-        ("requires_confirmation", extras.get("requiresConfirmation")),
-        ("confirmation_message", extras.get("confirmationMessage")),
-        ("on_reject", extras.get("onReject")),
-        ("requires_user_input", extras.get("requiresUserInput")),
-        ("user_input_message", extras.get("userInputMessage")),
-        ("on_error", extras.get("onError")),
     ]
 
     for key, value in step_fields:
-        if value in (None, "", [], {}):
+        if is_blank_field_value(value):
             continue
         if SUPPORTED_STEP_KWARGS and key not in SUPPORTED_STEP_KWARGS:
             warnings.append(
@@ -1647,24 +1687,80 @@ def build_workflow_step_kwargs(
             continue
         ordered_pairs.append((key, python_literal(value)))
 
-    user_input_schema_raw = extras.get("userInputSchema")
-    if user_input_schema_raw not in (None, "", [], {}):
-        if SUPPORTED_STEP_KWARGS and "user_input_schema" not in SUPPORTED_STEP_KWARGS:
-            warnings.append(
-                "Workflow step field 'user_input_schema' is not supported by the installed Agno version and was ignored."
-            )
+    review_pairs, review_warnings = build_step_human_review_pairs(node)
+    warnings.extend(review_warnings)
+    if review_pairs:
+        if STEP_USES_HUMAN_REVIEW:
+            # Agno 3.x groups every human-in-the-loop setting into one HumanReview object.
+            review_kwargs = ", ".join(f"{key}={value}" for key, value in review_pairs)
+            ordered_pairs.append(("human_review", f"HumanReview({review_kwargs})"))
         else:
-            parsed_user_input_schema = user_input_schema_raw
-            if isinstance(user_input_schema_raw, str):
-                parsed_user_input_schema = parse_json_if_needed(user_input_schema_raw)
-            if isinstance(parsed_user_input_schema, (list, dict)):
-                ordered_pairs.append(("user_input_schema", python_literal(parsed_user_input_schema)))
-            else:
-                warnings.append(
-                    f"Workflow step '{node.data.name}' has invalid user_input_schema JSON. Expected a list or object, got {type(parsed_user_input_schema).__name__}."
-                )
+            for key, value in review_pairs:
+                if SUPPORTED_STEP_KWARGS and key not in SUPPORTED_STEP_KWARGS:
+                    warnings.append(
+                        f"Workflow step field '{key}' is not supported by the installed Agno version and was ignored."
+                    )
+                    continue
+                ordered_pairs.append((key, value))
 
     return "\n".join(f"    {key}={value}," for key, value in ordered_pairs), warnings
+
+
+# Human-in-the-loop fields of a workflow step, as (Agno kwarg, node extras key).
+# Agno 3.x takes them via `Step(human_review=HumanReview(...))`; 2.x took them as Step kwargs.
+STEP_HUMAN_REVIEW_FIELDS: list[tuple[str, str]] = [
+    ("requires_confirmation", "requiresConfirmation"),
+    ("confirmation_message", "confirmationMessage"),
+    ("on_reject", "onReject"),
+    ("requires_user_input", "requiresUserInput"),
+    ("user_input_message", "userInputMessage"),
+    ("requires_output_review", "requiresOutputReview"),
+    ("output_review_message", "outputReviewMessage"),
+    ("on_error", "onError"),
+    ("timeout", "reviewTimeout"),
+    ("on_timeout", "onTimeout"),
+]
+
+# Fields that only exist on HumanReview (Agno 3.x); they have no 2.x Step kwarg equivalent.
+HUMAN_REVIEW_ONLY_FIELDS = {"requires_output_review", "output_review_message", "timeout", "on_timeout"}
+
+
+def is_blank_field_value(value: object) -> bool:
+    return value is None or (isinstance(value, (str, list, dict)) and not value)
+
+
+def build_step_human_review_pairs(node: GraphNode) -> tuple[list[tuple[str, str]], list[str]]:
+    """Collect a workflow step's human-in-the-loop settings as rendered (key, literal) pairs."""
+    extras = node.data.extras or {}
+    pairs: list[tuple[str, str]] = []
+    warnings: list[str] = []
+
+    for key, extras_key in STEP_HUMAN_REVIEW_FIELDS:
+        value = extras.get(extras_key)
+        if is_blank_field_value(value):
+            continue
+        if key == "on_timeout" and is_blank_field_value(extras.get("reviewTimeout")):
+            continue  # meaningless without a timeout; keep the default out of generated code
+        if key in HUMAN_REVIEW_ONLY_FIELDS and not STEP_USES_HUMAN_REVIEW:
+            warnings.append(
+                f"Workflow step field '{key}' requires Agno 3.x (HumanReview) and was ignored."
+            )
+            continue
+        pairs.append((key, python_literal(value)))
+
+    user_input_schema_raw = extras.get("userInputSchema")
+    if not is_blank_field_value(user_input_schema_raw):
+        parsed_user_input_schema = user_input_schema_raw
+        if isinstance(user_input_schema_raw, str):
+            parsed_user_input_schema = parse_json_if_needed(user_input_schema_raw)
+        if isinstance(parsed_user_input_schema, (list, dict)):
+            pairs.append(("user_input_schema", python_literal(parsed_user_input_schema)))
+        else:
+            warnings.append(
+                f"Workflow step '{node.data.name}' has invalid user_input_schema JSON. Expected a list or object, got {type(parsed_user_input_schema).__name__}."
+            )
+
+    return pairs, warnings
 
 
 def build_builtin_tool_workflow_executor(
@@ -1675,8 +1771,10 @@ def build_builtin_tool_workflow_executor(
     executor_var_name: str,
 ) -> tuple[list[str], list[str]]:
     extras = tool_node.data.extras or {}
-    import_path = str(extras.get("builtinImportPath") or "").strip()
-    class_name = str(extras.get("builtinClassName") or "").strip()
+    import_path, class_name = resolve_builtin_tool_import(
+        str(extras.get("builtinImportPath") or ""),
+        str(extras.get("builtinClassName") or ""),
+    )
     config_raw = str(extras.get("builtinConfig") or "")
     selected_function_name = str(extras.get("builtinWorkflowFunction") or "").strip()
     raw_executor_args = extras.get("builtinWorkflowExecutorArgs")
@@ -3328,6 +3426,7 @@ def render_import_tail(
     *,
     needs_tool_decorator: bool,
     has_workflow_nodes: bool,
+    needs_human_review: bool = False,
     has_direct_vector_db_runner_link: bool,
     knowledge_reader_imports: set[tuple[str, str]],
     interface_imports: set[tuple[str, str]],
@@ -3341,7 +3440,8 @@ def render_import_tail(
     if needs_tool_decorator:
         lines.append("from agno.tools import tool")
     if has_workflow_nodes:
-        lines.append("from agno.workflow import Step, Workflow")
+        workflow_names = ["HumanReview", "Step", "Workflow"] if needs_human_review else ["Step", "Workflow"]
+        lines.append(f"from agno.workflow import {', '.join(workflow_names)}")
     if has_direct_vector_db_runner_link:
         lines.append("from agno.knowledge.knowledge import Knowledge")
     for module, class_name in sorted(knowledge_reader_imports):
@@ -3644,6 +3744,11 @@ def compile_graph(graph: CanvasGraph, *, serve: bool = False) -> tuple[str, list
         render_import_tail(
             needs_tool_decorator=needs_tool_decorator,
             has_workflow_nodes=has_workflow_nodes,
+            needs_human_review=STEP_USES_HUMAN_REVIEW
+            and any(
+                node.type == NodeType.WORKFLOW_STEP and build_step_human_review_pairs(node)[0]
+                for node in ordered_nodes
+            ),
             has_direct_vector_db_runner_link=has_direct_vector_db_runner_link,
             knowledge_reader_imports=knowledge_reader_imports,
             interface_imports=interface_imports,

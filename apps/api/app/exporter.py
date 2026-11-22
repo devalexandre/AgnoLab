@@ -1,18 +1,38 @@
 from __future__ import annotations
 
+from importlib.metadata import PackageNotFoundError, version
+
 from .compiler import compile_graph
 from .models import CanvasGraph, ExportedFile, ExportProjectResponse
 from .runtime_dependencies import graph_runtime_requirements
 
 
+def installed_agno_version() -> str | None:
+    try:
+        return version("agno")
+    except PackageNotFoundError:
+        return None
+
+
+def pin_agno_requirement(requirements_list: list[str], *, serve: bool) -> list[str]:
+    """Pin `agno` to the version the compiler generated code for.
+
+    Agno majors rename and remove constructor kwargs, so an unpinned export can silently
+    install an incompatible version. Serve exports use the `os` extra, which carries what
+    AgentOS needs at import time (fastapi, uvicorn, python-multipart, sqlalchemy[asyncio], ...).
+    """
+    agno_version = installed_agno_version()
+    package = "agno[os]" if serve else "agno"
+    pinned = f"{package}=={agno_version}" if agno_version else package
+    result = [pinned if line.strip() == "agno" else line for line in requirements_list]
+    if pinned not in result:
+        result.insert(0, pinned)
+    return result
+
+
 def export_project(graph: CanvasGraph, *, serve: bool = False) -> ExportProjectResponse:
     code, warnings = compile_graph(graph, serve=serve)
-    requirements_list = graph_runtime_requirements(graph)
-    if serve:
-        # The AgentOS app is served with uvicorn/fastapi.
-        for dependency in ("fastapi", "uvicorn"):
-            if not any(line.split("==")[0].split(">=")[0].strip() == dependency for line in requirements_list):
-                requirements_list.append(dependency)
+    requirements_list = pin_agno_requirement(graph_runtime_requirements(graph), serve=serve)
     requirements = "\n".join(requirements_list) + "\n"
 
     if serve:

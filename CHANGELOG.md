@@ -3,6 +3,45 @@
 All notable changes to AgnoLab are documented here.
 This project adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### ⚠️ Breaking changes
+
+- **Agno upgraded from 2.5.11 to 3.2.1** (a new major). The API now depends on
+  `agno[os]==3.2.1`; reinstall with `pip install -r apps/api/requirements.txt`.
+- Exported projects pin `agno==<version>` (`agno[os]==<version>` for AgentOS serve exports)
+  instead of an unpinned `agno`, so an export can no longer pull an incompatible major.
+
+### Changed
+
+- **Workflow step human-in-the-loop** settings are emitted as
+  `Step(human_review=HumanReview(...))`, the Agno 3.x API. Before this, Agno 3.x would have
+  silently dropped them (the compiler filters kwargs the installed Agno does not accept).
+- Saved flows keep working: legacy `search_session_history` / `num_history_sessions` are
+  compiled to `search_past_sessions` / `num_past_sessions_to_search`, and removed fields
+  (`reasoning`, `reasoning_min_steps`, `reasoning_max_steps`) produce a warning that says what
+  to use instead. Built-in tools stored with an old import path are resolved to the new one.
+- The Agent and Team inspectors drop the fields Agno 3.x removed and expose the
+  `search_past_sessions` family on agents.
+
+### Added
+
+- Workflow step: **Requires Output Review**, **Review Timeout** and **On Timeout**, plus the
+  `retry` reject action (Agno 3.x `HumanReview`).
+- Compiler import + runtime-dependency support for `MySQLDb`, `SingleStoreDb`, `SurrealDb`,
+  `GcsJsonDb`, `JsonDb`, `InMemoryDb`, the `Elasticsearch` and `OpenSearch` vector DBs, and the
+  `MMRReranker` / `RecencyReranker` knowledge rerankers, when used in node expressions.
+- Tests that validate every compiler import and every built-in tool catalog entry against the
+  installed Agno, so a wrong module path or class name fails CI instead of a user's run.
+
+### Fixed
+
+- `DynamoDb` imported from the non-existent `agno.db.dynamodb` (now `agno.db.dynamo`).
+- Removed `AgentKnowledge`, which does not exist in Agno.
+- Built-in tools that failed with "class not found": BigQuery, Google Calendar, Google Sheets,
+  Google Drive, Google Maps, Gmail (moved to `agno.tools.google.*`), Crawl4AI, Jina Reader,
+  Luma Lab, ModelsLab and SearXNG (wrong class names).
+
 ## [0.2.0] — 2026-07-12
 
 The first hardened release. AgnoLab generates and **executes** Python code, and this
