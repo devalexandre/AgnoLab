@@ -34,6 +34,26 @@ This project adheres to [Semantic Versioning](https://semver.org/).
 - Tests that validate every compiler import and every built-in tool catalog entry against the
   installed Agno, so a wrong module path or class name fails CI instead of a user's run.
 
+### Added — Agno 3 features
+
+- **Workflow control flow:** Router, Parallel, Loop and Branch (if / else) nodes that compile to
+  Agno `Router`, `Parallel`, `Loop` and `Condition`, with Python-expression rules, nesting, and a
+  "Workflow Control Flow" template.
+- **Scheduled flows:** a Schedule (cron) input source runs a saved flow on a cron expression in a
+  chosen time zone; status at `GET /api/integrations/schedules` and in the inspector.
+- **Agent / Team options:** fallback models and fallback config, checkpoints, context compaction,
+  tool-result offloading, filesystem tools.
+- **Providers:** OpenAI-compatible endpoint, Open Responses, Azure OpenAI Responses, xAI Responses,
+  MiniMax, Cloudflare AI Gateway.
+- **28 built-in tools** (search, scraping, documents, messaging, CRM/commerce, memory).
+
+### Fixed — workflows and editor
+
+- A Function Tool used as a workflow step executor failed at runtime ("'Function' object is not
+  callable"); it is now wrapped through its entrypoint.
+- A node added from the library was never selected (two different random ids were generated).
+- Fit-to-view could hide the top nodes under the toolbar.
+
 ### Added — UI
 
 - **Themes:** Agno Dark, Agno Light, Dracula, One Dark and Neon, picked from the canvas
@@ -49,6 +69,8 @@ This project adheres to [Semantic Versioning](https://semver.org/).
 - Frontend unit tests (Vitest), run in CI.
 
 ### Changed — UI
+
+- `App.tsx` is split into modules and one inspector component per node type (~11.5k → ~6.3k lines).
 
 - Node drags commit once on release, so the editor no longer re-renders on every mouse move.
 - A loaded flow is framed with fit-to-view instead of having its node positions rewritten.

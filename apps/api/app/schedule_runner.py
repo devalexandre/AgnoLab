@@ -18,7 +18,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from croniter import croniter
+from croniter import croniter  # type: ignore[import-untyped]
 
 from .flow_store import list_flow_records, normalize_flow_name
 from .models import FlowRecord, NodeType, ScheduleStatus

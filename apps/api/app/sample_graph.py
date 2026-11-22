@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from .models import CanvasGraph, CanvasTemplateSummary, GraphEdge, GraphNode, NodeData, Position, ProjectMeta
+from .models import CanvasGraph, CanvasTemplateSummary, GraphEdge, GraphNode, NodeData, NodeType, Position, ProjectMeta
 from .provider_catalog import build_provider_config
 
 
@@ -552,7 +552,7 @@ def _workflow_control_node(
     """A Parallel / Loop / Router / Branch node (see app/workflow_control.py)."""
     return GraphNode(
         id=node_id,
-        type=node_type,
+        type=NodeType(node_type),
         position=Position(x=x, y=y),
         data=NodeData(name=name, description=description, extras={"stepOrder": order, **extras}),
     )

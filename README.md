@@ -23,10 +23,12 @@ Built on **Agno 3.2.1**.
   follows the app theme.
 - **Safe execution.** Isolated subprocess runner with timeouts, resource limits, optional
   environment isolation, and no secrets written into generated code.
-- **85+ built-in tools,** custom `@tool` functions, local skills, guardrails, knowledge/RAG,
-  memory, and vector databases.
-- **Integrations.** Email, webhook/form, WhatsApp, and six message queues (RabbitMQ, Kafka,
-  Redis, NATS, SQS, Pub/Sub) as inputs and outputs.
+- **110+ built-in tools** and 55 model providers, custom `@tool` functions, local skills,
+  guardrails, knowledge/RAG, memory, and vector databases.
+- **Integrations.** Email, webhook/form, WhatsApp, cron schedules, and six message queues
+  (RabbitMQ, Kafka, Redis, NATS, SQS, Pub/Sub) as inputs and outputs.
+- **Workflow control flow.** Router, Parallel, Loop, and if/else Branch nodes compile to Agno's
+  own workflow primitives.
 - **Export.** A run-once `main.py` or an AgentOS FastAPI server, with a pinned
   `requirements.txt`.
 - **Five themes.** Agno Dark, Agno Light, Dracula, One Dark, and Neon.
@@ -51,6 +53,42 @@ AgnoLab now targets Agno 3.x, the latest major version:
   CI now checks every catalog entry against the installed Agno.
 
 ![Workflow step with human review](docs/screenshots/human-review.png)
+
+### Workflow control flow
+
+Four new **Logic** nodes sit in a workflow's step list like a Workflow Step, and can be nested:
+
+| Node | Agno class | What it does |
+| --- | --- | --- |
+| **Router** | `Router` | Runs one of its connected steps, chosen by a rule that returns a step name. |
+| **Parallel** | `Parallel` | Runs every connected step at the same time. |
+| **Loop** | `Loop` | Repeats its steps until an end condition holds or the iteration limit is hit. |
+| **Branch (if / else)** | `Condition` | Runs the steps on its *if* port when the rule is true, otherwise the steps on its *else* port. |
+
+Rules are short Python expressions, for example `'Billing Step' if 'invoice' in text.lower() else 'Support Step'`
+for a Router or `'APPROVED' in last` for a Loop. They are checked when the flow compiles, and a rule
+that fails at runtime is reported instead of stopping the workflow. The **Workflow Control Flow**
+template shows all four working together.
+
+![Workflow control flow](docs/screenshots/control-flow.png)
+
+### Scheduled flows
+
+Set an Input node's source to **Schedule (cron)**, pick a cron expression (or a preset such as
+"Weekdays at 09:00") and a time zone, and save. The API then runs the saved flow on that schedule,
+and the inspector shows the next run, the last run, and any error.
+
+![Schedule input](docs/screenshots/schedule.png)
+
+### More models, tools, and agent options
+
+- **Models:** any OpenAI-compatible endpoint, Open Responses, Azure OpenAI Responses, xAI
+  Responses, MiniMax, and Cloudflare AI Gateway.
+- **Agent and Team options from Agno 3:** fallback models (tried when the main model errors, is rate
+  limited, or runs out of context), context compaction, checkpoints, offloading large tool results,
+  and a filesystem toolkit.
+- **28 new built-in tools,** including Brave, You.com, Parallel, Valyu, Trafilatura, Docling, Resend,
+  Twilio, WhatsApp, Salesforce, Shopify, Zendesk, and Zep.
 
 ### Themes and a new toolbar
 
@@ -113,8 +151,8 @@ The canvas moved to [React Flow](https://reactflow.dev):
 ### Templates
 
 Start from a blank canvas or a ready-made template: base agent, team support desk,
-workflow handoff, memory, RAG, learning, skills, workflow with tools, human-in-the-loop
-review, and WhatsApp interface.
+workflow handoff, workflow control flow (router, parallel, loop, if/else), memory, RAG,
+learning, skills, workflow with tools, human-in-the-loop review, and WhatsApp interface.
 
 ![Templates](docs/screenshots/home-templates.png)
 
@@ -163,6 +201,10 @@ review, and WhatsApp interface.
 - `apps/web/src/App.tsx`: main editor experience and panel logic.
 - `apps/web/src/FlowCanvas.tsx`: the React Flow canvas (nodes, ports, edges, minimap, drop).
 - `apps/web/src/CommandPalette.tsx`: the `Ctrl/Cmd+K` command palette.
+- `apps/web/src/inspector/`: one property inspector per node type.
+- `apps/web/src/nodeData.tsx`, `apps/web/src/editorConstants.ts`: node factories, expression builders, and library catalogs.
+- `apps/api/app/workflow_control.py`: Router / Parallel / Loop / Branch code generation.
+- `apps/api/app/schedule_runner.py`: cron schedules for saved flows.
 - `apps/web/src/providerCatalog.ts`: frontend provider catalog and presets.
 - `apps/web/src/agentConfig.ts`: agent properties definition.
 - `apps/web/src/nodeCatalog.ts`: node templates and defaults.
