@@ -133,44 +133,6 @@ body {
   background-size: 24px 24px, 24px 24px, auto;
 }
 
-.canvas.is-dragging,
-.canvas.is-panning {
-  user-select: none;
-}
-
-.canvas.is-panning {
-  cursor: grabbing;
-}
-
-.canvas-viewport {
-  position: absolute;
-  inset: 0;
-  overflow: visible;
-  transform-origin: 0 0;
-  will-change: transform;
-}
-
-.canvas-hint {
-  position: absolute;
-  bottom: 24px;
-  left: 50%;
-  z-index: 3;
-  width: min(720px, calc(100% - 120px));
-  padding: 12px 18px;
-  border-radius: 16px;
-  background: rgba(var(--agno-primary-rgb), 0.14);
-  border: 1px solid rgba(var(--agno-primary-rgb), 0.55);
-  color: rgb(var(--agno-gray-50));
-  box-shadow: 0 14px 32px rgba(var(--agno-primary-rgb), 0.16);
-  backdrop-filter: blur(10px);
-  transform: translateX(-50%);
-}
-
-.canvas-hint p {
-  margin: 0;
-  text-align: center;
-}
-
 .canvas-settings-menu {
   position: relative;
 }
@@ -235,49 +197,6 @@ body {
 .canvas-zoom-readout {
   min-width: 74px !important;
   font-variant-numeric: tabular-nums;
-}
-
-.canvas-minimap {
-  position: absolute;
-  right: 24px;
-  bottom: 24px;
-  z-index: 3;
-  width: 220px;
-  height: 140px;
-  padding: 8px;
-  border-radius: 14px;
-  border: 1px solid var(--agno-border);
-  background: rgba(var(--agno-gray-900), 0.9);
-  backdrop-filter: blur(10px);
-  box-shadow: 0 10px 28px rgba(var(--agno-shadow-rgb), 0.22);
-}
-
-.canvas-minimap svg {
-  width: 100%;
-  height: 100%;
-}
-
-.canvas-minimap-background {
-  fill: rgba(var(--agno-overlay-rgb), 0.04);
-  stroke: rgba(var(--agno-overlay-rgb), 0.14);
-  stroke-width: 1;
-}
-
-.canvas-minimap-node {
-  fill: rgba(var(--agno-info-rgb), 0.56);
-  stroke: rgba(var(--agno-info-rgb), 0.96);
-  stroke-width: 0.8;
-}
-
-.canvas-minimap-node.selected {
-  fill: rgba(var(--agno-warning-rgb), 0.62);
-  stroke: rgba(var(--agno-warning-rgb), 0.96);
-}
-
-.canvas-minimap-viewport {
-  fill: rgba(var(--agno-success-rgb), 0.12);
-  stroke: rgba(var(--agno-success-rgb), 0.92);
-  stroke-width: 1;
 }
 
 .brand h1,
@@ -862,51 +781,6 @@ body {
   color: var(--agno-primary-soft);
 }
 
-.canvas-grid,
-.edges {
-  position: absolute;
-  inset: 0;
-}
-
-.canvas-grid {
-  pointer-events: none;
-}
-
-.edges {
-  width: 100%;
-  height: 100%;
-  overflow: visible;
-  pointer-events: auto;
-}
-
-.edge-path {
-  fill: none;
-  stroke: rgba(var(--agno-primary-rgb), 0.85);
-  stroke-width: 3;
-  stroke-linecap: round;
-  transition: stroke 160ms ease, stroke-width 160ms ease, filter 160ms ease;
-}
-
-.edge-path.selected {
-  stroke: var(--agno-primary-soft-strong);
-  stroke-width: 4;
-  filter: drop-shadow(0 0 10px rgba(var(--agno-primary-rgb), 0.35));
-}
-
-.edge-path-pending {
-  stroke: rgba(var(--agno-primary-rgb), 0.8);
-  stroke-dasharray: 8 8;
-  animation: edge-dash 900ms linear infinite;
-}
-
-.edge-hit-area {
-  fill: none;
-  stroke: transparent;
-  stroke-width: 18;
-  cursor: pointer;
-  pointer-events: stroke;
-}
-
 @keyframes edge-dash {
   from {
     stroke-dashoffset: 0;
@@ -1003,27 +877,6 @@ body {
   margin-top: 8px;
   color: var(--agno-text-secondary);
   font-size: 0.85rem;
-}
-
-.port {
-  position: absolute;
-  top: 40px;
-  width: 14px;
-  height: 14px;
-  margin-top: -7px;
-  border-radius: 999px;
-  border: 2px solid rgb(var(--agno-background-dark-rgb));
-  background: var(--agno-primary);
-  box-shadow: 0 0 0 3px rgba(var(--agno-primary-rgb), 0.18);
-  cursor: pointer;
-}
-
-.port-left {
-  left: -7px;
-}
-
-.port-right {
-  right: -7px;
 }
 
 .node-help {
@@ -1712,17 +1565,6 @@ body {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
-  .canvas-hint {
-    left: 12px;
-    right: 12px;
-    max-width: none;
-    top: auto;
-  }
-
-  .canvas-minimap {
-    display: none;
-  }
-
   .flow-name-input {
     width: 100%;
     max-width: 300px;
@@ -1845,7 +1687,7 @@ textarea {
   box-shadow: var(--agno-glow);
 }
 
-:root[data-theme="neon"] .edge-path {
+:root[data-theme="neon"] .flow-canvas .react-flow__edge-path {
   filter: drop-shadow(0 0 4px rgba(var(--agno-primary-rgb), 0.7));
 }
 
@@ -2161,4 +2003,376 @@ textarea {
 
 .canvas-node .node-type {
   color: var(--node-accent, var(--agno-primary));
+}
+
+/* ------------------------------------------------------------------------------------------
+ * React Flow canvas (FlowCanvas.tsx). All colors come from theme tokens.
+ * ------------------------------------------------------------------------------------------ */
+.canvas {
+  cursor: default;
+  background: radial-gradient(circle at top center, rgba(var(--agno-primary-rgb), calc(var(--agno-backdrop-tint) * 0.8)), transparent 34%);
+}
+
+.flow-canvas {
+  position: absolute;
+  inset: 0;
+}
+
+.flow-canvas .react-flow {
+  --xy-background-color: transparent;
+  --xy-node-border-radius: 18px;
+  --xy-selection-background-color: rgba(var(--agno-primary-rgb), 0.1);
+  --xy-selection-border: 1px dashed rgba(var(--agno-primary-rgb), 0.7);
+  --xy-attribution-background-color: transparent;
+  background: transparent;
+}
+
+.flow-background {
+  --xy-background-pattern-color: rgba(var(--agno-overlay-rgb), 0.13);
+}
+
+/* Node card: React Flow positions the wrapper, so the card itself flows normally. */
+.flow-canvas .canvas-node {
+  position: relative;
+  left: auto;
+  top: auto;
+  width: 190px;
+  cursor: grab;
+}
+
+.flow-canvas .react-flow__node.dragging .canvas-node,
+.flow-canvas .canvas-node.is-dragging {
+  cursor: grabbing;
+  box-shadow: var(--agno-shadow-lg);
+}
+
+.flow-canvas .react-flow__node:focus-visible {
+  outline: none;
+}
+
+.flow-canvas .react-flow__node:focus-visible .canvas-node {
+  box-shadow: var(--agno-focus-ring);
+}
+
+/* Ports (React Flow handles). Larger hit target than the visible dot. */
+.flow-canvas .port.react-flow__handle {
+  top: 40px;
+  width: 14px;
+  height: 14px;
+  border: 2px solid rgb(var(--agno-background-dark-rgb));
+  border-radius: var(--agno-radius-pill);
+  background: var(--node-accent, var(--agno-primary));
+  box-shadow: 0 0 0 3px rgba(var(--agno-primary-rgb), 0.16);
+  cursor: crosshair;
+  transition: transform var(--agno-duration) var(--agno-ease), box-shadow var(--agno-duration) var(--agno-ease);
+}
+
+.flow-canvas .port.react-flow__handle::after {
+  content: "";
+  position: absolute;
+  inset: -8px;
+  border-radius: inherit;
+}
+
+.flow-canvas .port.react-flow__handle:hover,
+.flow-canvas .port.react-flow__handle.connectingfrom,
+.flow-canvas .port.react-flow__handle.clickconnecting {
+  transform: translate(var(--handle-shift, 0), -50%) scale(1.35);
+  box-shadow: 0 0 0 4px rgba(var(--agno-primary-rgb), 0.3), var(--agno-glow);
+}
+
+.flow-canvas .port-left.react-flow__handle {
+  --handle-shift: -50%;
+  left: 0;
+}
+
+.flow-canvas .port-right.react-flow__handle {
+  --handle-shift: 50%;
+  right: 0;
+}
+
+/* While connecting: valid targets glow, invalid ones fade. */
+.flow-canvas .react-flow__handle.connectionindicator.valid {
+  background: rgb(var(--agno-success-rgb));
+  box-shadow: 0 0 0 5px rgba(var(--agno-success-rgb), 0.3);
+}
+
+.flow-canvas .react-flow__handle.connectingto:not(.valid) {
+  opacity: 0.35;
+}
+
+/* Edges */
+.flow-canvas .react-flow__edge-path,
+.flow-canvas .react-flow__connection-path {
+  stroke: rgba(var(--agno-primary-rgb), 0.78);
+  stroke-width: 2.4;
+}
+
+.flow-canvas .react-flow__connection-path {
+  stroke-dasharray: 6 6;
+}
+
+.flow-canvas .react-flow__edge:hover .react-flow__edge-path {
+  stroke: var(--agno-primary-soft);
+  stroke-width: 3;
+}
+
+.flow-canvas .react-flow__edge.selected .react-flow__edge-path {
+  stroke: var(--agno-primary);
+  stroke-width: 3.4;
+  filter: drop-shadow(0 0 8px rgba(var(--agno-primary-rgb), 0.5));
+}
+
+.flow-canvas .react-flow__edge.animated .react-flow__edge-path {
+  stroke: rgb(var(--agno-success-rgb));
+  stroke-dasharray: 6 4;
+}
+
+/* Minimap */
+.flow-canvas .react-flow__minimap.canvas-minimap {
+  margin: var(--agno-space-4);
+  overflow: hidden;
+  border: 1px solid var(--agno-border);
+  border-radius: var(--agno-radius-md);
+  background: var(--agno-surface-0);
+  box-shadow: var(--agno-shadow-md);
+}
+
+.flow-canvas .react-flow__minimap-mask {
+  fill: rgba(var(--agno-background-dark-rgb), 0.62);
+}
+
+.flow-canvas .react-flow__minimap-node {
+  stroke: none;
+}
+
+.flow-canvas .react-flow__attribution {
+  opacity: 0.45;
+  font-size: 10px;
+}
+
+.flow-canvas .react-flow__attribution a {
+  color: var(--agno-text-tertiary);
+}
+
+/* Toasts (replace the old fixed hint bar) */
+.toast-stack {
+  position: absolute;
+  bottom: var(--agno-space-5);
+  left: 50%;
+  z-index: 40;
+  display: grid;
+  gap: var(--agno-space-2);
+  width: min(520px, calc(100% - 48px));
+  transform: translateX(-50%);
+  pointer-events: none;
+}
+
+.toast {
+  display: flex;
+  align-items: center;
+  gap: var(--agno-space-3);
+  padding: 10px 12px 10px 16px;
+  border: 1px solid var(--agno-border);
+  border-left: 3px solid rgb(var(--agno-info-rgb));
+  border-radius: var(--agno-radius-md);
+  background: var(--agno-surface-0);
+  box-shadow: var(--agno-shadow-md);
+  backdrop-filter: blur(12px);
+  font-size: var(--agno-font-sm);
+  pointer-events: auto;
+  animation: toast-in 180ms var(--agno-ease);
+}
+
+.toast > span {
+  flex: 1 1 auto;
+}
+
+.toast.is-success {
+  border-left-color: rgb(var(--agno-success-rgb));
+}
+
+.toast.is-error {
+  border-left-color: rgb(var(--agno-danger-rgb));
+  color: var(--agno-danger-text);
+}
+
+.toast-close {
+  border: 0;
+  background: transparent;
+  color: var(--agno-text-tertiary);
+  font-size: 1.1rem;
+  line-height: 1;
+  cursor: pointer;
+}
+
+@keyframes toast-in {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+.canvas-runtime-status {
+  position: absolute;
+  top: 84px;
+  left: 50%;
+  z-index: 25;
+  padding: 6px 14px;
+  border: 1px solid rgba(var(--agno-success-rgb), 0.4);
+  border-radius: var(--agno-radius-pill);
+  background: rgba(var(--agno-success-rgb), 0.12);
+  font-size: var(--agno-font-sm);
+  transform: translateX(-50%);
+}
+
+.canvas-footer-left {
+  z-index: 20;
+}
+
+/* Library drag affordance */
+.library-item[draggable="true"]:not(:disabled),
+.library-item-main[draggable="true"] {
+  cursor: grab;
+}
+
+.library-item[draggable="true"]:not(:disabled):active {
+  cursor: grabbing;
+}
+
+/* Command palette */
+.command-palette-trigger {
+  gap: 6px;
+  border-color: var(--agno-border);
+}
+
+kbd {
+  padding: 1px 6px;
+  border: 1px solid var(--agno-border);
+  border-bottom-width: 2px;
+  border-radius: var(--agno-radius-xs);
+  background: rgba(var(--agno-overlay-rgb), 0.05);
+  color: var(--agno-text-tertiary);
+  font-family: inherit;
+  font-size: var(--agno-font-xs);
+}
+
+.command-palette-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 200;
+  display: flex;
+  justify-content: center;
+  align-items: flex-start;
+  padding-top: 12vh;
+  background: rgba(var(--agno-shadow-rgb), 0.45);
+  backdrop-filter: blur(3px);
+  animation: toast-in 120ms var(--agno-ease);
+}
+
+.command-palette {
+  display: flex;
+  flex-direction: column;
+  width: min(640px, calc(100vw - 32px));
+  max-height: min(560px, 72vh);
+  overflow: hidden;
+  border: 1px solid var(--agno-border);
+  border-radius: var(--agno-radius-lg);
+  background: var(--agno-surface-0);
+  box-shadow: var(--agno-shadow-lg), var(--agno-glow);
+}
+
+.command-palette-input {
+  width: 100%;
+  padding: 18px 20px;
+  border: 0;
+  border-bottom: 1px solid var(--agno-border-soft);
+  background: transparent;
+  color: var(--agno-text-primary);
+  font-size: var(--agno-font-lg);
+}
+
+.command-palette-input:focus-visible {
+  outline: none;
+  box-shadow: none;
+}
+
+.command-palette-list {
+  flex: 1 1 auto;
+  margin: 0;
+  padding: var(--agno-space-2);
+  overflow-y: auto;
+  list-style: none;
+}
+
+.command-palette-group {
+  margin: var(--agno-space-3) var(--agno-space-3) var(--agno-space-1);
+  color: var(--agno-text-tertiary);
+  font-size: var(--agno-font-xs);
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+
+.command-palette-item {
+  display: flex;
+  align-items: center;
+  gap: var(--agno-space-3);
+  width: 100%;
+  padding: 9px 12px;
+  border: 0;
+  border-radius: var(--agno-radius-sm);
+  background: transparent;
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.command-palette-item.is-active {
+  background: rgba(var(--agno-primary-rgb), 0.14);
+}
+
+.command-palette-icon {
+  display: inline-flex;
+  width: 20px;
+  justify-content: center;
+}
+
+.command-palette-icon svg {
+  width: 18px;
+  height: 18px;
+  stroke: currentColor;
+  fill: none;
+  stroke-width: 1.8;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.command-palette-label {
+  display: grid;
+  flex: 1 1 auto;
+  font-size: var(--agno-font-md);
+}
+
+.command-palette-label small {
+  color: var(--agno-text-tertiary);
+  font-size: var(--agno-font-xs);
+}
+
+.command-palette-empty {
+  padding: var(--agno-space-5);
+  color: var(--agno-text-tertiary);
+  text-align: center;
+}
+
+.command-palette-footer {
+  display: flex;
+  gap: var(--agno-space-4);
+  padding: 10px 16px;
+  border-top: 1px solid var(--agno-border-soft);
+  color: var(--agno-text-tertiary);
+  font-size: var(--agno-font-xs);
 }

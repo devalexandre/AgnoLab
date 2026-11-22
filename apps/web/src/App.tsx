@@ -1,4 +1,4 @@
-import { type ChangeEvent, type MouseEvent as ReactMouseEvent, type WheelEvent as ReactWheelEvent, Suspense, lazy, useEffect, useMemo, useRef, useState } from "react";
+import { type ChangeEvent, type DragEvent as ReactDragEvent, type MouseEvent as ReactMouseEvent, Suspense, lazy, useEffect, useMemo, useRef, useState } from "react";
 import { API_BASE, deleteFlowByName, fetchCanvasTemplate, fetchDefaultGraph, fetchFlowByName, fetchQueueSubscriberStatus, fetchWhatsappSessionStatus, listBuiltInToolFunctions, listCanvasTemplates, listFlowRuntimeStatuses, listFlows, listOllamaModels, listSkillPaths, previewCode, runFlowByName, runGraph, saveFlow, startQueueSubscriber, startWhatsappSession, stopQueueSubscriber, stopWhatsappSession } from "./api";
 import { AGENT_FIELDS, AGENT_FIELD_GROUPS, AGNO_MODEL_PROVIDER_OPTIONS, type AgentFieldDefinition } from "./agentConfig";
 import {
@@ -15,13 +15,15 @@ import {
   type IntegrationLanguage,
 } from "./integrationSnippets";
 import {
-  NODE_MIN_HEIGHT,
   NODE_WIDTH,
-  centerGraphInCanvas,
   cloneGraph,
   createNodeId,
   createNodePosition,
-  organizeGraphNodes,
+  copySubgraph,
+  layoutGraphLayered,
+  pasteSubgraph,
+  removeFromGraph,
+  type GraphClipboard,
   updateNodeData,
 } from "./graph";
 import {
@@ -50,11 +52,12 @@ import {
   getGraphProjectRuntime,
   normalizeImportedFlowPayload,
 } from "./flowNormalize";
-import { MAX_CANVAS_ZOOM, MIN_CANVAS_ZOOM, clampCanvasZoom, isCanvasBackgroundTarget } from "./canvas";
+import FlowCanvas, { LIBRARY_DRAG_MIME, MAX_FLOW_ZOOM, MIN_FLOW_ZOOM, type CanvasNodeView, type FlowCanvasHandle } from "./FlowCanvas";
 import { MarkdownRenderer } from "./markdown";
 import type { MonacoToolEditorProps } from "./MonacoToolEditor";
+import CommandPalette, { type PaletteCommand } from "./CommandPalette";
 import ThemePicker from "./ThemePicker";
-import { applyTheme, loadInitialThemeId, type ThemeId } from "./themes";
+import { THEMES, applyTheme, getThemeDefinition, loadInitialThemeId, type ThemeId } from "./themes";
 import {
   buildFlowPath,
   buildPersistedFlowSnapshot,
@@ -85,12 +88,7 @@ import { BuiltInToolFunctionOption, CanvasGraph, CanvasTemplateSummary, FlowRunt
 
 const MY_TOOLS_STORAGE_KEY = "agnolab.my_tools";
 const FLOW_AUTOSAVE_DELAY_MS = 1200;
-const CANVAS_WORLD_MIN = -4000;
-const CANVAS_WORLD_MAX = 8000;
-const CANVAS_ZOOM_STEP = 0.1;
 const HISTORY_MAX_ENTRIES = 80;
-const MINIMAP_WIDTH = 220;
-const MINIMAP_HEIGHT = 140;
 const DEFAULT_SECTION_OPEN = false;
 const FLOW_INPUT_FILE_ACCEPT = [
   ".pdf",
@@ -139,19 +137,6 @@ const FLOW_INPUT_FILE_ACCEPT = [
 ].join(",");
 const FLOW_INPUT_FILE_SUPPORT_NOTE =
   "Input accepts docs, images, audio, and video. Knowledge ingestion only indexes supported document formats and skips pure multimodal media files.";
-
-interface DragState {
-  nodeId: string;
-  offsetX: number;
-  offsetY: number;
-}
-
-interface CanvasPanState {
-  startX: number;
-  startY: number;
-  originX: number;
-  originY: number;
-}
 
 interface PointerPosition {
   x: number;
@@ -2242,7 +2227,6 @@ export default function App() {
   const chatHistoryRef = useRef<HTMLDivElement | null>(null);
   const canvasRef = useRef<HTMLElement | null>(null);
   const hasAutoCenteredRef = useRef(false);
-  const ignoreCanvasClickRef = useRef(false);
   const pendingImportedGraphRef = useRef<CanvasGraph | null>(null);
   const pendingImportedFlowNameRef = useRef("imported_flow");
   const hitlRunConfirmResolverRef = useRef<((approved: boolean) => void) | null>(null);
@@ -2253,21 +2237,25 @@ export default function App() {
   const [graph, setGraph] = useState<CanvasGraph | null>(null);
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
   const [selectedEdgeId, setSelectedEdgeId] = useState<string | null>(null);
+  // Multi-selection on the canvas; selectedNodeId stays the "primary" node shown in the inspector.
+  const [selectedNodeIds, setSelectedNodeIds] = useState<string[]>([]);
+  const [toasts, setToasts] = useState<Array<{ id: number; message: string; tone: "info" | "success" | "error" }>>([]);
+  const [isCommandPaletteOpen, setIsCommandPaletteOpen] = useState(false);
+  const flowCanvasRef = useRef<FlowCanvasHandle | null>(null);
+  const graphClipboardRef = useRef<GraphClipboard | null>(null);
+  const pendingDropPositionRef = useRef<Position | null>(null);
+  const draggedLibraryItemRef = useRef<HTMLButtonElement | null>(null);
+  const toastIdRef = useRef(0);
   const [code, setCode] = useState("");
   const [warnings, setWarnings] = useState<string[]>([]);
   const [runResult, setRunResult] = useState<RunResult | null>(null);
   const [runError, setRunError] = useState<string | null>(null);
   const [isRunning, setIsRunning] = useState(false);
-  const [pendingConnectionSourceId, setPendingConnectionSourceId] = useState<string | null>(null);
   const [connectionMessage, setConnectionMessage] = useState<string | null>(null);
   const [activeRightTab, setActiveRightTab] = useState<"properties" | "code" | "runtime">("properties");
-  const [dragState, setDragState] = useState<DragState | null>(null);
-  const [canvasPanState, setCanvasPanState] = useState<CanvasPanState | null>(null);
-  const [canvasOffset, setCanvasOffset] = useState<PointerPosition>({ x: 0, y: 0 });
   const [canvasZoom, setCanvasZoom] = useState(1);
   const [editingFunctionNodeId, setEditingFunctionNodeId] = useState<string | null>(null);
   const [myTools, setMyTools] = useState<SavedUserTool[]>([]);
-  const [connectionPointer, setConnectionPointer] = useState<PointerPosition | null>(null);
   const [openSections, setOpenSections] = useState<Record<string, boolean>>({});
   const [librarySearchInput, setLibrarySearchInput] = useState("");
   const [outputResponseOnly, setOutputResponseOnly] = useState(false);
@@ -2348,6 +2336,30 @@ export default function App() {
   useEffect(() => {
     applyTheme(themeId);
   }, [themeId]);
+
+  // Status messages from anywhere in the app surface as transient toasts.
+  useEffect(() => {
+    if (!connectionMessage) {
+      return;
+    }
+    const tone = /fail|error|cannot|invalid|not allowed|could not|unable/i.test(connectionMessage)
+      ? "error"
+      : /saved|connected|copied|pasted|exported|imported|arranged|applied|added/i.test(connectionMessage)
+        ? "success"
+        : "info";
+    pushToast(connectionMessage, tone);
+    setConnectionMessage(null);
+  }, [connectionMessage]);
+
+  // Keep the canvas multi-selection in step when other UI picks the primary node.
+  useEffect(() => {
+    setSelectedNodeIds((current) => {
+      if (!selectedNodeId) {
+        return current.length === 0 ? current : [];
+      }
+      return current.includes(selectedNodeId) ? current : [selectedNodeId];
+    });
+  }, [selectedNodeId]);
 
   useEffect(() => {
     setHistoryPast([]);
@@ -2566,12 +2578,7 @@ export default function App() {
       setGraph(null);
       setSelectedNodeId(null);
       setSelectedEdgeId(null);
-      setPendingConnectionSourceId(null);
-      setConnectionPointer(null);
-      setCanvasPanState(null);
-      setCanvasOffset({ x: 0, y: 0 });
       setCanvasZoom(1);
-      ignoreCanvasClickRef.current = false;
       pendingImportedGraphRef.current = null;
       pendingImportedFlowNameRef.current = "imported_flow";
       return;
@@ -2600,10 +2607,7 @@ export default function App() {
               return;
             }
             hasAutoCenteredRef.current = false;
-            setCanvasPanState(null);
-            setCanvasOffset({ x: 0, y: 0 });
             setCanvasZoom(1);
-            ignoreCanvasClickRef.current = false;
             lastPersistedFlowSnapshotRef.current = buildPersistedFlowSnapshot(importedFlowName || slugifyFlowName(importedGraph.project.name) || "imported_flow", importedGraph);
             setGraph(importedGraph);
             setFlowName(importedFlowName || slugifyFlowName(importedGraph.project.name) || "imported_flow");
@@ -2620,10 +2624,7 @@ export default function App() {
               return;
             }
             hasAutoCenteredRef.current = false;
-            setCanvasPanState(null);
-            setCanvasOffset({ x: 0, y: 0 });
             setCanvasZoom(1);
-            ignoreCanvasClickRef.current = false;
             lastPersistedFlowSnapshotRef.current = buildPersistedFlowSnapshot(localDraft.flowName || "new_flow", localDraft.graph);
             setGraph(localDraft.graph);
             setFlowName(localDraft.flowName || "new_flow");
@@ -2639,10 +2640,7 @@ export default function App() {
             return;
           }
           hasAutoCenteredRef.current = false;
-          setCanvasPanState(null);
-          setCanvasOffset({ x: 0, y: 0 });
           setCanvasZoom(1);
-          ignoreCanvasClickRef.current = false;
           lastPersistedFlowSnapshotRef.current = buildPersistedFlowSnapshot(slugifyFlowName(defaultGraph.project.name) || "new_flow", defaultGraph);
           setGraph(defaultGraph);
           setFlowName(slugifyFlowName(defaultGraph.project.name) || "new_flow");
@@ -2659,10 +2657,7 @@ export default function App() {
               return;
             }
             hasAutoCenteredRef.current = false;
-            setCanvasPanState(null);
-            setCanvasOffset({ x: 0, y: 0 });
             setCanvasZoom(1);
-            ignoreCanvasClickRef.current = false;
             lastPersistedFlowSnapshotRef.current = buildPersistedFlowSnapshot(localDraft.flowName || "blank_flow", localDraft.graph);
             setGraph(localDraft.graph);
             setFlowName(localDraft.flowName || "blank_flow");
@@ -2676,10 +2671,7 @@ export default function App() {
             return;
           }
           hasAutoCenteredRef.current = false;
-          setCanvasPanState(null);
-          setCanvasOffset({ x: 0, y: 0 });
           setCanvasZoom(1);
-          ignoreCanvasClickRef.current = false;
           const blankGraph = buildBlankGraph();
           lastPersistedFlowSnapshotRef.current = buildPersistedFlowSnapshot("blank_flow", blankGraph);
           setGraph(blankGraph);
@@ -2698,10 +2690,7 @@ export default function App() {
         const nextGraph = localDraft?.graph ?? record.graph;
         const nextFlowName = localDraft?.flowName || slugifyFlowName(record.name) || record.name;
         hasAutoCenteredRef.current = false;
-        setCanvasPanState(null);
-        setCanvasOffset({ x: 0, y: 0 });
         setCanvasZoom(1);
-        ignoreCanvasClickRef.current = false;
         lastPersistedFlowSnapshotRef.current = buildPersistedFlowSnapshot(slugifyFlowName(record.name) || record.name, record.graph);
         setGraph(nextGraph);
         setFlowName(nextFlowName);
@@ -2862,104 +2851,14 @@ export default function App() {
   }, [graph]);
 
   useEffect(() => {
-    if (!graph || !canvasRef.current || hasAutoCenteredRef.current) {
+    if (!graph || hasAutoCenteredRef.current || graph.nodes.length === 0) {
       return;
     }
-
-    const rect = canvasRef.current.getBoundingClientRect();
-    if (rect.width < 100 || rect.height < 100) {
-      return;
-    }
-
     hasAutoCenteredRef.current = true;
-    setGraph(centerGraphInCanvas(graph, rect.width, rect.height));
+    // Wait a frame so React Flow has measured the freshly loaded nodes.
+    const frame = window.requestAnimationFrame(() => flowCanvasRef.current?.fitView());
+    return () => window.cancelAnimationFrame(frame);
   }, [graph]);
-
-  useEffect(() => {
-    if (!dragState || !graph || !canvasRef.current) {
-      return;
-    }
-
-    const handleMouseMove = (event: MouseEvent) => {
-      const canvasRect = canvasRef.current?.getBoundingClientRect();
-      if (!canvasRect) {
-        return;
-      }
-
-      const nextX = Math.max(
-        CANVAS_WORLD_MIN,
-        Math.min(CANVAS_WORLD_MAX, (event.clientX - canvasRect.left - canvasOffset.x) / canvasZoom - dragState.offsetX),
-      );
-      const nextY = Math.max(
-        CANVAS_WORLD_MIN,
-        Math.min(CANVAS_WORLD_MAX, (event.clientY - canvasRect.top - canvasOffset.y) / canvasZoom - dragState.offsetY),
-      );
-
-      setGraph((currentGraph) => {
-        if (!currentGraph) {
-          return currentGraph;
-        }
-
-        return {
-          ...currentGraph,
-          nodes: currentGraph.nodes.map((node) =>
-            node.id === dragState.nodeId
-              ? {
-                  ...node,
-                  position: {
-                    x: nextX,
-                    y: nextY,
-                  },
-                }
-              : node,
-          ),
-        };
-      });
-    };
-
-    const handleMouseUp = () => {
-      setDragState(null);
-    };
-
-    window.addEventListener("mousemove", handleMouseMove);
-    window.addEventListener("mouseup", handleMouseUp);
-
-    return () => {
-      window.removeEventListener("mousemove", handleMouseMove);
-      window.removeEventListener("mouseup", handleMouseUp);
-    };
-  }, [canvasOffset.x, canvasOffset.y, canvasZoom, dragState, graph]);
-
-  useEffect(() => {
-    if (!canvasPanState) {
-      return;
-    }
-
-    const handleMouseMove = (event: MouseEvent) => {
-      const deltaX = event.clientX - canvasPanState.startX;
-      const deltaY = event.clientY - canvasPanState.startY;
-      if (Math.abs(deltaX) > 2 || Math.abs(deltaY) > 2) {
-        ignoreCanvasClickRef.current = true;
-      }
-
-      setCanvasOffset({
-        x: canvasPanState.originX + deltaX,
-        y: canvasPanState.originY + deltaY,
-      });
-    };
-
-    const handleMouseUp = () => {
-      setCanvasPanState(null);
-    };
-
-    window.addEventListener("mousemove", handleMouseMove);
-    window.addEventListener("mouseup", handleMouseUp);
-
-    return () => {
-      window.removeEventListener("mousemove", handleMouseMove);
-      window.removeEventListener("mouseup", handleMouseUp);
-    };
-  }, [canvasPanState]);
 
   useEffect(() => {
     const handleKeyDown = (event: KeyboardEvent) => {
@@ -2991,17 +2890,60 @@ export default function App() {
         return;
       }
 
-      if (!selectedNodeId && !selectedEdgeId) {
+      const mod = event.ctrlKey || event.metaKey;
+      const key = event.key.toLowerCase();
+
+      if (mod && key === "k") {
+        event.preventDefault();
+        setIsCommandPaletteOpen((current) => !current);
         return;
       }
 
-      if (event.key === "Delete" || event.key === "Backspace") {
+      // Canvas shortcuts stay out of the way while a modal is open or text is selected.
+      if (isCommandPaletteOpen || document.querySelector(".modal-backdrop")) {
+        return;
+      }
+      const hasTextSelection = Boolean(window.getSelection()?.toString());
+
+      if (mod && key === "c" && !hasTextSelection) {
+        if (handleCopySelection()) event.preventDefault();
+        return;
+      }
+      if (mod && key === "v") {
+        if (handlePasteClipboard()) event.preventDefault();
+        return;
+      }
+      if (mod && key === "d") {
         event.preventDefault();
-        if (selectedEdgeId) {
-          deleteSelectedEdge();
-          return;
+        handleDuplicateSelection();
+        return;
+      }
+      if (mod && key === "a" && !hasTextSelection) {
+        event.preventDefault();
+        handleSelectAllNodes();
+        return;
+      }
+      if (event.shiftKey && event.code === "Digit1") {
+        event.preventDefault();
+        handleFitView();
+        return;
+      }
+      if (event.shiftKey && key === "l") {
+        event.preventDefault();
+        handleAutoLayout();
+        return;
+      }
+      if (event.key === "Escape" && (selectedNodeIds.length > 0 || selectedEdgeId)) {
+        setSelectedNodeId(null);
+        setSelectedNodeIds([]);
+        setSelectedEdgeId(null);
+      }
+      if (event.key === "Delete" || event.key === "Backspace") {
+        const nodeIds = currentSelectionIds();
+        if (nodeIds.length > 0 || selectedEdgeId) {
+          event.preventDefault();
+          handleCanvasDelete(nodeIds, nodeIds.length === 0 && selectedEdgeId ? [selectedEdgeId] : []);
         }
-        deleteSelectedNode();
       }
     };
 
@@ -3009,7 +2951,7 @@ export default function App() {
     return () => {
       window.removeEventListener("keydown", handleKeyDown);
     };
-  }, [selectedNodeId, selectedEdgeId, graph, pendingConnectionSourceId, editingFunctionNodeId, historyPast.length, historyFuture.length]);
+  });
 
   const selectedNode = graph?.nodes.find((node) => node.id === selectedNodeId) ?? null;
   const selectedEdge = graph?.edges.find((edge) => edge.id === selectedEdgeId) ?? null;
@@ -3020,57 +2962,6 @@ export default function App() {
     () => Object.fromEntries((graph?.nodes ?? []).map((node) => [node.id, node])),
     [graph],
   );
-  const minimapModel = useMemo(() => {
-    if (!graph || graph.nodes.length === 0) {
-      return null;
-    }
-
-    const padding = 120;
-    const minX = Math.min(...graph.nodes.map((node) => node.position.x)) - padding;
-    const minY = Math.min(...graph.nodes.map((node) => node.position.y)) - padding;
-    const maxX = Math.max(...graph.nodes.map((node) => node.position.x + NODE_WIDTH)) + padding;
-    const maxY = Math.max(...graph.nodes.map((node) => node.position.y + NODE_MIN_HEIGHT)) + padding;
-    const worldWidth = Math.max(1, maxX - minX);
-    const worldHeight = Math.max(1, maxY - minY);
-
-    const scale = Math.min(MINIMAP_WIDTH / worldWidth, MINIMAP_HEIGHT / worldHeight);
-    if (!Number.isFinite(scale) || scale <= 0) {
-      return null;
-    }
-    const contentWidth = worldWidth * scale;
-    const contentHeight = worldHeight * scale;
-    const contentOffsetX = (MINIMAP_WIDTH - contentWidth) / 2;
-    const contentOffsetY = (MINIMAP_HEIGHT - contentHeight) / 2;
-
-    const nodes = graph.nodes.map((node) => ({
-      id: node.id,
-      x: Math.max(0, Math.min(MINIMAP_WIDTH - 6, contentOffsetX + (node.position.x - minX) * scale)),
-      y: Math.max(0, Math.min(MINIMAP_HEIGHT - 4, contentOffsetY + (node.position.y - minY) * scale)),
-      width: Math.max(6, Math.min(MINIMAP_WIDTH, NODE_WIDTH * scale)),
-      height: Math.max(4, Math.min(MINIMAP_HEIGHT, NODE_MIN_HEIGHT * scale)),
-      selected: node.id === selectedNodeId,
-    }));
-
-    const viewportWidth = (canvasRef.current?.clientWidth ?? 1) / canvasZoom;
-    const viewportHeight = (canvasRef.current?.clientHeight ?? 1) / canvasZoom;
-    const viewportWorldX = -canvasOffset.x / canvasZoom;
-    const viewportWorldY = -canvasOffset.y / canvasZoom;
-
-    return {
-      minX,
-      minY,
-      scale,
-      contentOffsetX,
-      contentOffsetY,
-      nodes,
-      viewport: {
-        x: Math.max(0, Math.min(MINIMAP_WIDTH - 12, contentOffsetX + (viewportWorldX - minX) * scale)),
-        y: Math.max(0, Math.min(MINIMAP_HEIGHT - 8, contentOffsetY + (viewportWorldY - minY) * scale)),
-        width: Math.max(12, viewportWidth * scale),
-        height: Math.max(8, viewportHeight * scale),
-      },
-    };
-  }, [graph, selectedNodeId, canvasOffset.x, canvasOffset.y, canvasZoom]);
 
   useEffect(() => {
     if (!selectedQueueNode || !isQueueInputNodeType(selectedQueueNode.type)) {
@@ -3223,6 +3114,37 @@ export default function App() {
   const displayedCode = useMemo(() => sanitizeGeneratedCode(code), [code]);
   const debugObservation = useMemo(() => parseDebugObservation(runResult), [runResult]);
   const nodeRunBadges = useMemo(() => deriveNodeRunBadges(graph, debugObservation), [graph, debugObservation]);
+
+  const canvasNodeViews = useMemo<CanvasNodeView[]>(
+    () =>
+      (graph?.nodes ?? []).map((node) => {
+        const definition = NODE_CATALOG[node.type];
+        const visual = getNodeVisualIcon(node);
+        return {
+          id: node.id,
+          type: node.type,
+          position: node.position,
+          typeLabel: getCanvasNodeLabel(node.data, node.type),
+          name: node.data.name,
+          meta:
+            node.type === "output" && outputResponseOnly
+              ? "Response only view"
+              : node.type === "output"
+                ? "Double-click for clean response"
+                : getCanvasNodeMeta(node),
+          icon: visual.icon,
+          color: visual.color,
+          runBadge: nodeRunBadges[node.id],
+          hasInputs: definition.receivesFrom.length > 0,
+          hasOutputs: definition.sendsTo.length > 0,
+          receivesFromLabel: listNodeTypes(definition.receivesFrom),
+          sendsToLabel: listNodeTypes(definition.sendsTo),
+          helpTitle: definition.label,
+          helpDescription: definition.description,
+        };
+      }),
+    [graph, nodeRunBadges, outputResponseOnly],
+  );
   const displayedStdout = useMemo(() => {
     if (outputResponseOnly && runResult?.clean_stdout) {
       return runResult.clean_stdout;
@@ -3236,7 +3158,6 @@ export default function App() {
     }
     return extractAgentResponse(runResult.stdout);
   }, [runResult, outputResponseOnly]);
-  const pendingSourceNode = pendingConnectionSourceId ? nodeMap[pendingConnectionSourceId] : null;
   const inputNode = useMemo(() => getPrimaryInputNode(graph), [graph]);
   const inputSource = useMemo(() => (inputNode ? getInputSource(inputNode.data) : "manual"), [inputNode]);
   const inputMode = useMemo(() => (inputNode ? getInputMode(inputNode.data) : "text"), [inputNode]);
@@ -3412,7 +3333,7 @@ export default function App() {
           {
             id: safeNodeId,
             type,
-            position: createNodePosition(currentGraph),
+            position: nextNodePosition(currentGraph),
             data: definition.createData(safeNextIndex),
           },
         ],
@@ -3445,7 +3366,7 @@ export default function App() {
           {
             id: safeNodeId,
             type: "input",
-            position: createNodePosition(currentGraph),
+            position: nextNodePosition(currentGraph),
             data: createData(nextIndex),
           },
         ],
@@ -3494,7 +3415,7 @@ export default function App() {
           {
             id: safeNodeId,
             type: "output_api",
-            position: createNodePosition(currentGraph),
+            position: nextNodePosition(currentGraph),
             data: createData(nextIndex),
           },
         ],
@@ -3576,7 +3497,7 @@ export default function App() {
           {
             id: safeNodeId,
             type: "tool",
-            position: createNodePosition(currentGraph),
+            position: nextNodePosition(currentGraph),
             data: createBuiltInToolData(tool, nextIndex),
           },
         ],
@@ -3608,7 +3529,7 @@ export default function App() {
           {
             id: safeNodeId,
             type: "tool",
-            position: createNodePosition(currentGraph),
+            position: nextNodePosition(currentGraph),
             data: createSavedToolNodeData(tool),
           },
         ],
@@ -3640,7 +3561,7 @@ export default function App() {
           {
             id: safeNodeId,
             type: "tool",
-            position: createNodePosition(currentGraph),
+            position: nextNodePosition(currentGraph),
             data: createStarterToolNodeData(tool),
           },
         ],
@@ -3675,7 +3596,7 @@ export default function App() {
           {
             id: safeNodeId,
             type,
-            position: createNodePosition(currentGraph),
+            position: nextNodePosition(currentGraph),
             data,
           },
         ],
@@ -3825,9 +3746,6 @@ export default function App() {
     if (editingFunctionNodeId === selectedNode.id) {
       setEditingFunctionNodeId(null);
     }
-    if (pendingConnectionSourceId === selectedNode.id) {
-      setPendingConnectionSourceId(null);
-    }
     setConnectionMessage(`${selectedNode.data.name} removed from canvas.`);
     setSelectedNodeId(null);
     setSelectedEdgeId(null);
@@ -3852,105 +3770,221 @@ export default function App() {
     setSelectedEdgeId(null);
   }
 
-  function startConnection(nodeId: string) {
+
+
+  function pushToast(message: string, tone: "info" | "success" | "error" = "info") {
+    toastIdRef.current += 1;
+    const id = toastIdRef.current;
+    setToasts((current) => [...current.slice(-3), { id, message, tone }]);
+    window.setTimeout(() => setToasts((current) => current.filter((toast) => toast.id !== id)), tone === "error" ? 7000 : 3800);
+  }
+
+  function dismissToast(id: number) {
+    setToasts((current) => current.filter((toast) => toast.id !== id));
+  }
+
+  /** Where a new node goes: the drop point if it came from a drag, else the visible center. */
+  function nextNodePosition(currentGraph: CanvasGraph): Position {
+    if (pendingDropPositionRef.current) {
+      return pendingDropPositionRef.current;
+    }
+    const center = flowCanvasRef.current?.getViewportCenter();
+    if (!center) {
+      return createNodePosition(currentGraph);
+    }
+    // Stagger so consecutive adds don't stack exactly on top of each other.
+    const stagger = (currentGraph.nodes.length % 6) * 24;
+    return { x: Math.round(center.x - NODE_WIDTH / 2 + stagger), y: Math.round(center.y - 40 + stagger) };
+  }
+
+  function canConnectNodeIds(sourceId: string, targetId: string): boolean {
+    const source = nodeMap[sourceId];
+    const target = nodeMap[targetId];
+    return Boolean(source && target && canConnect(source.type, target.type));
+  }
+
+  function connectNodes(sourceId: string, targetId: string) {
+    const sourceNode = nodeMap[sourceId];
+    const targetNode = nodeMap[targetId];
+    if (!graph || !sourceNode || !targetNode) {
+      return;
+    }
+    if (sourceNode.id === targetNode.id) {
+      setConnectionMessage("A component cannot be connected to itself.");
+      return;
+    }
+    if (!canConnect(sourceNode.type, targetNode.type)) {
+      setConnectionMessage(`${NODE_CATALOG[sourceNode.type].label} cannot connect to ${NODE_CATALOG[targetNode.type].label}.`);
+      return;
+    }
+    const edgeId = `edge_${sourceNode.id}_${targetNode.id}`;
+    setGraph((currentGraph) => {
+      if (!currentGraph || currentGraph.edges.some((edge) => edge.source === sourceNode.id && edge.target === targetNode.id)) {
+        return currentGraph;
+      }
+      return { ...currentGraph, edges: [...currentGraph.edges, { id: edgeId, source: sourceNode.id, target: targetNode.id }] };
+    });
+    setConnectionMessage(`${sourceNode.data.name} connected to ${targetNode.data.name}.`);
+  }
+
+  function handleNodesMoved(positions: Record<string, Position>) {
+    setGraph((currentGraph) =>
+      currentGraph
+        ? {
+            ...currentGraph,
+            nodes: currentGraph.nodes.map((node) => (positions[node.id] ? { ...node, position: positions[node.id] } : node)),
+          }
+        : currentGraph,
+    );
+  }
+
+  function handleCanvasSelectionChange(nodeIds: string[], edgeIds: string[]) {
+    setSelectedNodeIds(nodeIds);
+    setSelectedNodeId((current) => (current && nodeIds.includes(current) ? current : nodeIds[nodeIds.length - 1] ?? null));
+    setSelectedEdgeId(nodeIds.length === 0 ? edgeIds[0] ?? null : null);
+    if (nodeIds.length > 0 || edgeIds.length > 0) {
+      setActiveRightTab("properties");
+    }
+  }
+
+  function handleCanvasDelete(nodeIds: string[], edgeIds: string[]) {
+    if (!graph || (nodeIds.length === 0 && edgeIds.length === 0)) {
+      return;
+    }
+    setGraph((currentGraph) => (currentGraph ? removeFromGraph(currentGraph, nodeIds, edgeIds) : currentGraph));
+    if (editingFunctionNodeId && nodeIds.includes(editingFunctionNodeId)) {
+      setEditingFunctionNodeId(null);
+    }
+    setSelectedNodeId(null);
+    setSelectedNodeIds([]);
+    setSelectedEdgeId(null);
+    if (nodeIds.length === 1) {
+      setConnectionMessage(`${nodeMap[nodeIds[0]]?.data.name ?? "Node"} removed from canvas.`);
+    } else if (nodeIds.length > 1) {
+      setConnectionMessage(`${nodeIds.length} nodes removed from canvas.`);
+    } else {
+      setConnectionMessage(edgeIds.length === 1 ? "Connection removed from canvas." : `${edgeIds.length} connections removed.`);
+    }
+  }
+
+  function handleNodeDoubleClick(nodeId: string) {
     const node = nodeMap[nodeId];
     if (!node) {
       return;
     }
-
-    if (pendingConnectionSourceId === nodeId) {
-      setPendingConnectionSourceId(null);
-      setConnectionPointer(null);
-      setConnectionMessage("Connection canceled.");
+    if (node.type === "input") {
+      setSelectedNodeId(null);
+      setSelectedEdgeId(null);
+      setIsChatOpen((current) => !current);
       return;
     }
-
-    setSelectedNodeId(nodeId);
-    setSelectedEdgeId(null);
-    setPendingConnectionSourceId(nodeId);
-    setConnectionPointer({
-      x: node.position.x + NODE_WIDTH,
-      y: node.position.y + NODE_MIN_HEIGHT / 2,
-    });
-    setConnectionMessage(`Source selected: ${node.data.name}. Now click the destination input port.`);
+    if (node.type === "output") {
+      setSelectedNodeId(node.id);
+      setActiveRightTab("code");
+      setOutputResponseOnly((current) => !current);
+    }
   }
 
-  function finishConnection(targetId: string) {
-    if (!graph || !pendingConnectionSourceId) {
+  function handleLibraryDragStart(event: ReactDragEvent<HTMLElement>) {
+    const item = (event.target as HTMLElement).closest<HTMLButtonElement>("button.library-item, button.library-item-main");
+    if (!item || item.disabled) {
+      event.preventDefault();
       return;
     }
+    draggedLibraryItemRef.current = item;
+    event.dataTransfer.setData(LIBRARY_DRAG_MIME, item.textContent ?? "node");
+    event.dataTransfer.effectAllowed = "copy";
+  }
 
-    const sourceNode = nodeMap[pendingConnectionSourceId];
-    const targetNode = nodeMap[targetId];
-
-    if (!sourceNode || !targetNode) {
-      setPendingConnectionSourceId(null);
-      setConnectionPointer(null);
+  function handleLibraryItemDrop(position: Position) {
+    const item = draggedLibraryItemRef.current;
+    draggedLibraryItemRef.current = null;
+    if (!item) {
       return;
     }
+    // Library buttons add nodes through their click handlers; the drop point is picked up by
+    // nextNodePosition() while React processes the resulting state update.
+    pendingDropPositionRef.current = position;
+    item.click();
+    window.setTimeout(() => {
+      pendingDropPositionRef.current = null;
+    }, 0);
+  }
 
-    if (sourceNode.id === targetNode.id) {
-      setConnectionMessage("A component cannot be connected to itself.");
-      setPendingConnectionSourceId(null);
-      setConnectionPointer(null);
+  function handleZoomIn() {
+    flowCanvasRef.current?.zoomIn();
+  }
+
+  function handleZoomOut() {
+    flowCanvasRef.current?.zoomOut();
+  }
+
+  function handleZoomReset() {
+    flowCanvasRef.current?.resetZoom();
+  }
+
+  function handleFitView() {
+    flowCanvasRef.current?.fitView();
+  }
+
+  function handleAutoLayout() {
+    if (!graph || graph.nodes.length < 2) {
       return;
     }
+    setGraph(layoutGraphLayered(graph, (nodeId) => flowCanvasRef.current?.getNodeSize(nodeId)));
+    setConnectionMessage("Nodes arranged left to right by data flow.");
+    window.setTimeout(() => flowCanvasRef.current?.fitView(), 60);
+  }
 
-    if (!canConnect(sourceNode.type, targetNode.type)) {
-      setConnectionMessage(
-        `${NODE_CATALOG[sourceNode.type].label} cannot connect to ${NODE_CATALOG[targetNode.type].label}.`,
-      );
-      setPendingConnectionSourceId(null);
-      setConnectionPointer(null);
-      return;
-    }
+  function currentSelectionIds(): string[] {
+    if (selectedNodeIds.length > 0) return selectedNodeIds;
+    return selectedNodeId ? [selectedNodeId] : [];
+  }
 
-    const alreadyExists = graph.edges.some(
-      (edge) => edge.source === sourceNode.id && edge.target === targetNode.id,
-    );
+  function handleCopySelection(): boolean {
+    if (!graph) return false;
+    const clipboard = copySubgraph(graph, currentSelectionIds());
+    if (!clipboard) return false;
+    graphClipboardRef.current = clipboard;
+    setConnectionMessage(`Copied ${clipboard.nodes.length} node${clipboard.nodes.length === 1 ? "" : "s"}.`);
+    return true;
+  }
 
-    if (alreadyExists) {
-      setConnectionMessage("This connection already exists.");
-      setPendingConnectionSourceId(null);
-      setConnectionPointer(null);
-      return;
-    }
+  function pasteGraphClipboard(clipboard: GraphClipboard) {
+    if (!graph) return;
+    const result = pasteSubgraph(graph, clipboard);
+    setGraph(result.graph);
+    setSelectedNodeIds(result.pastedIds);
+    setSelectedNodeId(result.pastedIds[result.pastedIds.length - 1] ?? null);
+    setSelectedEdgeId(null);
+    // Paste again offsets from the new copy, not the original.
+    graphClipboardRef.current = copySubgraph(result.graph, result.pastedIds);
+    setConnectionMessage(`Pasted ${result.pastedIds.length} node${result.pastedIds.length === 1 ? "" : "s"}.`);
+  }
 
-    setGraph((currentGraph) => {
-      if (!currentGraph) {
-        return currentGraph;
-      }
+  function handlePasteClipboard(): boolean {
+    if (!graphClipboardRef.current) return false;
+    pasteGraphClipboard(graphClipboardRef.current);
+    return true;
+  }
 
-      const edgeAlreadyExists = currentGraph.edges.some(
-        (edge) => edge.source === sourceNode.id && edge.target === targetNode.id,
-      );
-      if (edgeAlreadyExists) {
-        return currentGraph;
-      }
+  function handleDuplicateSelection() {
+    if (!graph) return;
+    const clipboard = copySubgraph(graph, currentSelectionIds());
+    if (clipboard) pasteGraphClipboard(clipboard);
+  }
 
-      return {
-        ...currentGraph,
-        edges: [
-          ...currentGraph.edges,
-          {
-            id: `edge_${sourceNode.id}_${targetNode.id}`,
-            source: sourceNode.id,
-            target: targetNode.id,
-          },
-        ],
-      };
-    });
-    setPendingConnectionSourceId(null);
-    setConnectionPointer(null);
-    setSelectedNodeId(null);
-    setSelectedEdgeId(`edge_${sourceNode.id}_${targetNode.id}`);
-    setConnectionMessage(`${sourceNode.data.name} connected to ${targetNode.data.name}.`);
+  function handleSelectAllNodes() {
+    if (!graph) return;
+    const ids = graph.nodes.map((node) => node.id);
+    setSelectedNodeIds(ids);
+    setSelectedNodeId(ids[ids.length - 1] ?? null);
+    setSelectedEdgeId(null);
   }
 
   function selectEdge(edge: GraphEdge) {
     setSelectedEdgeId(edge.id);
     setSelectedNodeId(null);
-    setPendingConnectionSourceId(null);
     setConnectionMessage(`Connection selected: ${nodeMap[edge.source]?.data.name ?? edge.source} -> ${nodeMap[edge.target]?.data.name ?? edge.target}.`);
     setActiveRightTab("properties");
   }
@@ -4500,13 +4534,8 @@ export default function App() {
       pendingImportedFlowNameRef.current = imported.flowName;
       setSelectedNodeId(null);
       setSelectedEdgeId(null);
-      setPendingConnectionSourceId(null);
-      setConnectionPointer(null);
-      setCanvasPanState(null);
-      setCanvasOffset({ x: 0, y: 0 });
       setCanvasZoom(1);
       hasAutoCenteredRef.current = false;
-      ignoreCanvasClickRef.current = false;
 
       if (currentPath === importedFlowPath && currentSearch === "") {
         pendingImportedGraphRef.current = null;
@@ -4791,58 +4820,10 @@ export default function App() {
     }
   }
 
-  function getCanvasLocalPoint(clientX: number, clientY: number): PointerPosition | null {
-    const canvasRect = canvasRef.current?.getBoundingClientRect();
-    if (!canvasRect) {
-      return null;
-    }
 
-    return {
-      x: clientX - canvasRect.left,
-      y: clientY - canvasRect.top,
-    };
-  }
 
-  function applyCanvasZoom(nextZoom: number, anchor?: PointerPosition | null) {
-    const clampedZoom = clampCanvasZoom(nextZoom);
-    if (Math.abs(clampedZoom - canvasZoom) < 0.001) {
-      return;
-    }
 
-    const fallbackAnchor = canvasRef.current
-      ? {
-          x: canvasRef.current.clientWidth / 2,
-          y: canvasRef.current.clientHeight / 2,
-        }
-      : null;
-    const anchorPoint = anchor ?? fallbackAnchor;
 
-    if (!anchorPoint) {
-      setCanvasZoom(clampedZoom);
-      return;
-    }
-
-    const worldX = (anchorPoint.x - canvasOffset.x) / canvasZoom;
-    const worldY = (anchorPoint.y - canvasOffset.y) / canvasZoom;
-    setCanvasOffset({
-      x: anchorPoint.x - worldX * clampedZoom,
-      y: anchorPoint.y - worldY * clampedZoom,
-    });
-    setCanvasZoom(clampedZoom);
-  }
-
-  function handleZoomIn() {
-    applyCanvasZoom(canvasZoom + CANVAS_ZOOM_STEP);
-  }
-
-  function handleZoomOut() {
-    applyCanvasZoom(canvasZoom - CANVAS_ZOOM_STEP);
-  }
-
-  function handleZoomReset() {
-    setCanvasZoom(1);
-    setCanvasOffset({ x: 0, y: 0 });
-  }
 
   function handleUndo() {
     if (!graph || historyPast.length === 0) {
@@ -4874,101 +4855,11 @@ export default function App() {
     setConnectionMessage("Redo applied.");
   }
 
-  function handleOrganizeNodes() {
-    if (!graph) {
-      return;
-    }
-    setGraph(organizeGraphNodes(graph));
-    setConnectionMessage("Nodes organized automatically.");
-  }
 
-  function handleMinimapClick(event: ReactMouseEvent<SVGSVGElement>) {
-    if (!minimapModel || !canvasRef.current) {
-      return;
-    }
 
-    const rect = event.currentTarget.getBoundingClientRect();
-    if (rect.width <= 0 || rect.height <= 0) {
-      return;
-    }
 
-    const minimapX = ((event.clientX - rect.left) / rect.width) * MINIMAP_WIDTH;
-    const minimapY = ((event.clientY - rect.top) / rect.height) * MINIMAP_HEIGHT;
-    const worldX = (minimapX - minimapModel.contentOffsetX) / minimapModel.scale + minimapModel.minX;
-    const worldY = (minimapY - minimapModel.contentOffsetY) / minimapModel.scale + minimapModel.minY;
 
-    setCanvasOffset({
-      x: canvasRef.current.clientWidth / 2 - worldX * canvasZoom,
-      y: canvasRef.current.clientHeight / 2 - worldY * canvasZoom,
-    });
-    ignoreCanvasClickRef.current = true;
-  }
 
-  function handleNodeMouseDown(nodeId: string, event: ReactMouseEvent<HTMLDivElement>) {
-    const target = event.target as HTMLElement;
-    if (target.closest("button")) {
-      return;
-    }
-
-    const canvasRect = canvasRef.current?.getBoundingClientRect();
-    const node = nodeMap[nodeId];
-    if (!canvasRect || !node) {
-      return;
-    }
-
-    setSelectedNodeId(nodeId);
-    setDragState({
-      nodeId,
-      offsetX: (event.clientX - canvasRect.left - canvasOffset.x) / canvasZoom - node.position.x,
-      offsetY: (event.clientY - canvasRect.top - canvasOffset.y) / canvasZoom - node.position.y,
-    });
-  }
-
-  function handleCanvasMouseDown(event: ReactMouseEvent<HTMLElement>) {
-    if (event.button !== 0 || pendingConnectionSourceId) {
-      return;
-    }
-
-    if (!isCanvasBackgroundTarget(event.target, event.currentTarget)) {
-      return;
-    }
-
-    ignoreCanvasClickRef.current = false;
-    setCanvasPanState({
-      startX: event.clientX,
-      startY: event.clientY,
-      originX: canvasOffset.x,
-      originY: canvasOffset.y,
-    });
-    event.preventDefault();
-  }
-
-  function handleCanvasWheel(event: ReactWheelEvent<HTMLElement>) {
-    if (!event.ctrlKey && !event.metaKey) {
-      return;
-    }
-
-    const anchor = getCanvasLocalPoint(event.clientX, event.clientY);
-    const direction = event.deltaY < 0 ? 1 : -1;
-    applyCanvasZoom(canvasZoom + direction * CANVAS_ZOOM_STEP, anchor);
-    event.preventDefault();
-  }
-
-  function handleCanvasPointerMove(event: ReactMouseEvent<HTMLElement>) {
-    if (!pendingConnectionSourceId) {
-      return;
-    }
-
-    const canvasRect = canvasRef.current?.getBoundingClientRect();
-    if (!canvasRect) {
-      return;
-    }
-
-    setConnectionPointer({
-      x: (event.clientX - canvasRect.left - canvasOffset.x) / canvasZoom,
-      y: (event.clientY - canvasRect.top - canvasOffset.y) / canvasZoom,
-    });
-  }
 
   function renderRequiredMark(field: { required?: boolean }) {
     if (!field.required) {
@@ -9939,9 +9830,65 @@ export default function App() {
     });
   }
 
+  const hasCanvasSelection = selectedNodeIds.length > 0 || Boolean(selectedNodeId);
+  const paletteCommands: PaletteCommand[] = [
+    { id: "run", group: "Flow", label: "Run flow", keywords: "execute play", run: () => void handleRun(), disabled: isRunning || isRunningSavedFlow },
+    { id: "save", group: "Flow", label: "Save flow", keywords: "persist", run: () => void handleSaveFlow() },
+    { id: "code", group: "Flow", label: "Show generated Python", keywords: "code preview source", run: () => setIsCodePreviewOpen(true) },
+    { id: "undo", group: "Edit", label: "Undo", shortcut: "Ctrl Z", run: handleUndo, disabled: historyPast.length === 0 },
+    { id: "redo", group: "Edit", label: "Redo", shortcut: "Ctrl Y", run: handleRedo, disabled: historyFuture.length === 0 },
+    { id: "select-all", group: "Edit", label: "Select all nodes", shortcut: "Ctrl A", run: handleSelectAllNodes },
+    { id: "copy", group: "Edit", label: "Copy selection", shortcut: "Ctrl C", run: () => void handleCopySelection(), disabled: !hasCanvasSelection },
+    { id: "paste", group: "Edit", label: "Paste", shortcut: "Ctrl V", run: () => void handlePasteClipboard(), disabled: !graphClipboardRef.current },
+    { id: "duplicate", group: "Edit", label: "Duplicate selection", shortcut: "Ctrl D", run: handleDuplicateSelection, disabled: !hasCanvasSelection },
+    { id: "fit", group: "View", label: "Fit flow to view", shortcut: "Shift 1", run: handleFitView },
+    { id: "layout", group: "View", label: "Auto-layout nodes", keywords: "arrange organize tidy", shortcut: "Shift L", run: handleAutoLayout },
+    { id: "zoom-in", group: "View", label: "Zoom in", run: handleZoomIn },
+    { id: "zoom-out", group: "View", label: "Zoom out", run: handleZoomOut },
+    { id: "zoom-reset", group: "View", label: "Reset zoom to 100%", run: handleZoomReset },
+    ...THEMES.map((theme) => ({
+      id: `theme:${theme.id}`,
+      group: "Theme",
+      label: `Theme: ${theme.label}`,
+      keywords: theme.description,
+      run: () => setThemeId(theme.id),
+    })),
+    { id: "import", group: "File", label: "Import flow (.json)", run: handleTriggerImportFlow },
+    { id: "export-json", group: "File", label: "Export flow (.json)", run: handleExportFlow },
+    { id: "export-py", group: "File", label: "Export Python (.py)", run: handleExportPython },
+    { id: "export-serve", group: "File", label: "Export AgentOS server app", keywords: "fastapi serve", run: () => void handleExportServeApp() },
+    { id: "home", group: "Navigate", label: "Go to Flow Hub", keywords: "home templates", run: handleGoHome },
+    ...Object.values(NODE_CATALOG)
+      .filter((definition) => definition.type !== "tool")
+      .map((definition) => ({
+        id: `node:${definition.type}`,
+        group: "Add node",
+        label: `Add ${definition.label}`,
+        keywords: `${definition.category} ${definition.description}`,
+        icon: (
+          <span style={{ color: definition.color }}>
+            <NodeIcon type={definition.type} />
+          </span>
+        ),
+        run: () => addNode(definition.type),
+      })),
+    ...BUILT_IN_TOOLS.map((tool) => ({
+      id: `tool:${tool.key}`,
+      group: "Add tool",
+      label: `Add ${tool.label}`,
+      keywords: `${tool.category} ${tool.description}`,
+      icon: (
+        <span style={{ color: toolIconColor(tool) }}>
+          <ToolIcon toolKey={tool.key} category={tool.category} />
+        </span>
+      ),
+      run: () => addBuiltInToolNode(tool),
+    })),
+  ];
+
   return (
     <div className="layout">
-      <aside className="left-dock">
+      <aside className="left-dock" onDragStart={handleLibraryDragStart}>
         <section className="dock-library panel">
           <div className="panel-header">
             <div>
@@ -9973,6 +9920,7 @@ export default function App() {
                     <button
                       key={item.key}
                       type="button"
+                      draggable
                       className="library-item"
                       onClick={() => {
                         item.onSelect();
@@ -10024,6 +9972,7 @@ export default function App() {
                       <button
                         key={definition.type}
                         type="button"
+                        draggable
                         className="library-item"
                         onClick={() => addNode(definition.type)}
                         title={definition.description}
@@ -10060,6 +10009,7 @@ export default function App() {
                   <button
                     key={item.key}
                     type="button"
+                    draggable
                     className={`library-item ${item.status === "planned" ? "library-item-disabled" : ""}`}
                     onClick={item.status === "available" ? () => handleIntegrationInputLibrarySelect(item.key) : undefined}
                     disabled={item.status === "planned"}
@@ -10096,6 +10046,7 @@ export default function App() {
                   <button
                     key={item.key}
                     type="button"
+                    draggable
                     className={`library-item ${item.status === "planned" ? "library-item-disabled" : ""}`}
                     onClick={item.status === "available" ? () => handleIntegrationOutputLibrarySelect(item.key) : undefined}
                     disabled={item.status === "planned"}
@@ -10132,6 +10083,7 @@ export default function App() {
                   <button
                     key={tool.id}
                     type="button"
+                    draggable
                     className="library-item"
                     onClick={() => addStarterToolNode(tool)}
                     title={`${tool.description ?? tool.name}\n\nPrerequisite: ${tool.prerequisite ?? "Check tool setup before running."}`}
@@ -10166,6 +10118,7 @@ export default function App() {
                   <button
                     key={item.key}
                     type="button"
+                    draggable
                     className="library-item library-item-disabled"
                     disabled
                     title={`${item.description}${item.helper ? `\n\n${item.helper}` : ""}`}
@@ -10179,6 +10132,7 @@ export default function App() {
                 ))}
                 <button
                   type="button"
+                  draggable
                   className="library-item"
                   onClick={() => addLearningMachineNode()}
                   title="Add a Learning Machine node to the canvas and connect it to an Agent or Team."
@@ -10210,6 +10164,7 @@ export default function App() {
               <div className="library-grid">
                 <button
                   type="button"
+                  draggable
                   className="library-item"
                   onClick={() => addNode("tool")}
                   title={NODE_CATALOG.tool.description}
@@ -10243,6 +10198,7 @@ export default function App() {
                   <button
                     key={item.key}
                     type="button"
+                    draggable
                     className="library-item"
                     onClick={() => addSkillsNode()}
                     title={`${item.description}${item.helper ? `\n\n${item.helper}` : ""}`}
@@ -10278,6 +10234,7 @@ export default function App() {
                   <button
                     key={item.key}
                     type="button"
+                    draggable
                     className="library-item"
                     onClick={() => addInterfaceNode(item.key)}
                     title={`${item.description}${item.helper ? `\n\n${item.helper}` : ""}`}
@@ -10313,6 +10270,7 @@ export default function App() {
                   <div key={tool.id} className="library-item library-item-card" title={tool.description ?? tool.name}>
                     <button
                       type="button"
+                      draggable
                       className="library-item-main"
                       onClick={() => addMyToolNode(tool)}
                     >
@@ -10365,6 +10323,7 @@ export default function App() {
                   <button
                     key={item.key}
                     type="button"
+                    draggable
                     className="library-item"
                     onClick={() => addVectorDbNode(item.key as VectorDbPresetKey)}
                     title={`${item.description}${item.helper ? `\n\n${item.helper}` : ""}`}
@@ -10400,6 +10359,7 @@ export default function App() {
                   <button
                     key={item.key}
                     type="button"
+                    draggable
                     className="library-item library-item-disabled"
                     disabled
                     title={`${item.description}${item.helper ? `\n\n${item.helper}` : ""}`}
@@ -10413,6 +10373,7 @@ export default function App() {
                 ))}
                 <button
                   type="button"
+                  draggable
                   className="library-item"
                   onClick={() => addKnowledgeNode("knowledge")}
                   title="Add a Knowledge node to the canvas and connect it to an Agent."
@@ -10424,6 +10385,7 @@ export default function App() {
                 </button>
                 <button
                   type="button"
+                  draggable
                   className="library-item"
                   onClick={() => addKnowledgeNode("knowledge_contents")}
                   title="Add a Knowledge node with Contents DB support to the canvas."
@@ -10457,6 +10419,7 @@ export default function App() {
                   <button
                     key={item.key}
                     type="button"
+                    draggable
                     className="library-item"
                     onClick={() => addManagerNode(item.key)}
                     title={`${item.description}\n\n${item.helper}`}
@@ -10491,6 +10454,7 @@ export default function App() {
                   <button
                     key={item.key}
                     type="button"
+                    draggable
                     className="library-item"
                     onClick={() => addDatabaseNode(item.key as DatabasePresetKey)}
                     title={`${item.description}${item.helper ? `\n\n${item.helper}` : ""}`}
@@ -10548,6 +10512,7 @@ export default function App() {
                             <button
                               key={tool.key}
                               type="button"
+                              draggable
                               className="library-item"
                               onClick={() => addBuiltInToolNode(tool)}
                               title={formatToolLibraryTitle(tool)}
@@ -10588,24 +10553,8 @@ export default function App() {
       </aside>
 
       <main
-        className={`canvas ${dragState ? "is-dragging" : ""} ${canvasPanState ? "is-panning" : ""}`}
+        className="canvas"
         ref={canvasRef}
-        onMouseDown={handleCanvasMouseDown}
-        onMouseMove={handleCanvasPointerMove}
-        onWheel={handleCanvasWheel}
-        onClick={(event) => {
-          if (ignoreCanvasClickRef.current) {
-            ignoreCanvasClickRef.current = false;
-            return;
-          }
-
-          if (isCanvasBackgroundTarget(event.target, event.currentTarget)) {
-            setSelectedNodeId(null);
-            setSelectedEdgeId(null);
-            setPendingConnectionSourceId(null);
-            setConnectionPointer(null);
-          }
-        }}
       >
         <header className="canvas-toolbar" role="toolbar" aria-label="Flow toolbar">
           <div className="canvas-toolbar-group canvas-toolbar-identity">
@@ -10678,7 +10627,7 @@ export default function App() {
               </button>
             </div>
             <div className="segmented zoom-control" role="group" aria-label="Zoom">
-              <button type="button" className="icon-button" onClick={handleZoomOut} disabled={canvasZoom <= MIN_CANVAS_ZOOM} title="Zoom out" aria-label="Zoom out">
+              <button type="button" className="icon-button" onClick={handleZoomOut} disabled={canvasZoom <= MIN_FLOW_ZOOM + 0.001} title="Zoom out (Ctrl/Cmd -)" aria-label="Zoom out">
                 <svg viewBox="0 0 24 24" aria-hidden="true">
                   <path d="M6 12h12" />
                 </svg>
@@ -10686,12 +10635,30 @@ export default function App() {
               <button type="button" className="icon-button canvas-zoom-readout" onClick={handleZoomReset} title="Reset zoom to 100%">
                 {Math.round(canvasZoom * 100)}%
               </button>
-              <button type="button" className="icon-button" onClick={handleZoomIn} disabled={canvasZoom >= MAX_CANVAS_ZOOM} title="Zoom in" aria-label="Zoom in">
+              <button type="button" className="icon-button" onClick={handleZoomIn} disabled={canvasZoom >= MAX_FLOW_ZOOM - 0.001} title="Zoom in (Ctrl/Cmd +)" aria-label="Zoom in">
                 <svg viewBox="0 0 24 24" aria-hidden="true">
                   <path d="M6 12h12M12 6v12" />
                 </svg>
               </button>
             </div>
+            <div className="segmented" role="group" aria-label="Layout">
+              <button type="button" className="icon-button" onClick={handleFitView} title="Fit flow to view (Shift+1)" aria-label="Fit to view">
+                <svg viewBox="0 0 24 24" aria-hidden="true">
+                  <path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5" />
+                </svg>
+              </button>
+              <button type="button" className="icon-button" onClick={handleAutoLayout} title="Auto-layout: arrange nodes left to right by data flow (Shift+L)" aria-label="Auto-layout">
+                <svg viewBox="0 0 24 24" aria-hidden="true">
+                  <path d="M4 5h5v5H4zM15 5h5v5h-5zM15 14h5v5h-5zM9 7.5h6M17.5 10v4" />
+                </svg>
+              </button>
+            </div>
+            <button type="button" className="icon-button command-palette-trigger" onClick={() => setIsCommandPaletteOpen(true)} title="Command palette (Ctrl/Cmd+K)" aria-label="Open command palette">
+              <svg viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M10.5 4a6.5 6.5 0 1 0 0 13 6.5 6.5 0 0 0 0-13zM20 20l-4.6-4.6" />
+              </svg>
+              <kbd>⌘K</kbd>
+            </button>
             <ThemePicker value={themeId} onChange={setThemeId} placement="bottom-end" />
             <button type="button" className="primary-button run-button" onClick={handleRun} disabled={isRunning || isRunningSavedFlow}>
               <svg viewBox="0 0 24 24" aria-hidden="true">
@@ -10722,216 +10689,43 @@ export default function App() {
           onChange={handleImportFlowFileChange}
         />
 
-        {minimapModel ? (
-          <div className="canvas-minimap" aria-label="Flow minimap">
-            <svg viewBox={`0 0 ${MINIMAP_WIDTH} ${MINIMAP_HEIGHT}`} role="img" onClick={handleMinimapClick}>
-              <rect className="canvas-minimap-background" x={0} y={0} width={MINIMAP_WIDTH} height={MINIMAP_HEIGHT} rx={4} ry={4} />
-              {minimapModel.nodes.map((node) => (
-                <rect
-                  key={node.id}
-                  x={node.x}
-                  y={node.y}
-                  width={node.width}
-                  height={node.height}
-                  className={`canvas-minimap-node ${node.selected ? "selected" : ""}`}
-                  rx={2}
-                  ry={2}
-                />
-              ))}
-              <rect
-                x={minimapModel.viewport.x}
-                y={minimapModel.viewport.y}
-                width={minimapModel.viewport.width}
-                height={minimapModel.viewport.height}
-                className="canvas-minimap-viewport"
-                rx={3}
-                ry={3}
-              />
-            </svg>
+        {currentFlowRuntimeStatus?.active_runs ? (
+          <div className="canvas-runtime-status" role="status">
+            <strong>Running:</strong> {currentFlowRuntimeStatus.active_runs} active request(s) · total {currentFlowRuntimeStatus.total_runs} · success{" "}
+            {currentFlowRuntimeStatus.success_runs} · failed {currentFlowRuntimeStatus.failed_runs}
           </div>
         ) : null}
 
-        <div className="canvas-hint">
-          <p>
-            {pendingSourceNode
-              ? `Connecting ${pendingSourceNode.data.name}. Click the destination left port to complete.`
-              : connectionMessage ?? "To connect components: click the source right port and then the destination left port."}
-          </p>
-          {currentFlowRuntimeStatus?.active_runs ? (
-            <p>
-              <strong>Running:</strong> {currentFlowRuntimeStatus.active_runs} active request(s) · total {currentFlowRuntimeStatus.total_runs} ·
-              success {currentFlowRuntimeStatus.success_runs} · failed {currentFlowRuntimeStatus.failed_runs}
-            </p>
-          ) : null}
-        </div>
-
-        <div
-          className="canvas-viewport"
-          style={{ transform: `translate(${canvasOffset.x}px, ${canvasOffset.y}px) scale(${canvasZoom})` }}
-        >
-        <div className="canvas-grid" />
-        <svg className="edges">
-          {graph.edges.map((edge) => {
-            const source = nodeMap[edge.source];
-            const target = nodeMap[edge.target];
-            if (!source || !target) {
-              return null;
-            }
-
-            const sourceCenterX = source.position.x + NODE_WIDTH / 2;
-            const sourceCenterY = source.position.y + NODE_MIN_HEIGHT / 2;
-            const targetCenterX = target.position.x + NODE_WIDTH / 2;
-            const targetCenterY = target.position.y + NODE_MIN_HEIGHT / 2;
-            const horizontalGap = targetCenterX - sourceCenterX;
-
-            let x1 = source.position.x + NODE_WIDTH;
-            let y1 = sourceCenterY;
-            let x2 = target.position.x;
-            let y2 = targetCenterY;
-
-            if (Math.abs(horizontalGap) < 180) {
-              x1 = sourceCenterX;
-              y1 = source.position.y + 80;
-              x2 = targetCenterX;
-              y2 = target.position.y;
-            } else if (horizontalGap < 0) {
-              x1 = source.position.x;
-              x2 = target.position.x + NODE_WIDTH;
-            }
-
-            const cx1 = x1 + (x2 - x1) * 0.45;
-            const cx2 = x1 + (x2 - x1) * 0.55;
-
-            return (
-              <g key={edge.id}>
-                <path
-                  d={`M ${x1} ${y1} C ${cx1} ${y1}, ${cx2} ${y2}, ${x2} ${y2}`}
-                  className={`edge-path ${selectedEdgeId === edge.id ? "selected" : ""}`}
-                />
-                <path
-                  d={`M ${x1} ${y1} C ${cx1} ${y1}, ${cx2} ${y2}, ${x2} ${y2}`}
-                  className="edge-hit-area"
-                  onClick={(event) => {
-                    event.stopPropagation();
-                    selectEdge(edge);
-                  }}
-                />
-              </g>
-            );
-          })}
-          {pendingSourceNode && connectionPointer ? (
-            <path
-              d={`M ${pendingSourceNode.position.x + NODE_WIDTH} ${pendingSourceNode.position.y + NODE_MIN_HEIGHT / 2} C ${
-                pendingSourceNode.position.x + NODE_WIDTH + (connectionPointer.x - (pendingSourceNode.position.x + NODE_WIDTH)) * 0.45
-              } ${pendingSourceNode.position.y + NODE_MIN_HEIGHT / 2}, ${
-                pendingSourceNode.position.x + NODE_WIDTH + (connectionPointer.x - (pendingSourceNode.position.x + NODE_WIDTH)) * 0.55
-              } ${connectionPointer.y}, ${connectionPointer.x} ${connectionPointer.y}`}
-              className="edge-path edge-path-pending"
-            />
-          ) : null}
-        </svg>
-
-        {graph.nodes.map((node) => {
-          const visual = getNodeVisualIcon(node);
-          const runBadge = nodeRunBadges[node.id];
-
-          return (
-            <div
-              key={node.id}
-              className={`canvas-node ${runBadge ? "has-run-status" : ""} ${selectedNodeId === node.id ? "selected" : ""} ${pendingConnectionSourceId === node.id ? "is-connecting" : ""} ${dragState?.nodeId === node.id ? "is-dragging" : ""}`}
-              style={{
-                left: `${node.position.x}px`,
-                top: `${node.position.y}px`,
-                borderColor: selectedNodeId === node.id ? visual.color : undefined,
-                ["--node-accent" as string]: visual.color,
-              }}
-              onClick={() => setSelectedNodeId(node.id)}
-              onClickCapture={() => setSelectedEdgeId(null)}
-              onDoubleClick={() => {
-                if (node.type === "input") {
-                  setSelectedNodeId(null);
-                  setSelectedEdgeId(null);
-                  setIsChatOpen((current) => !current);
-                  return;
-                }
-
-                if (node.type !== "output") {
-                  return;
-                }
-                setSelectedNodeId(node.id);
-                setActiveRightTab("code");
-                setOutputResponseOnly((current) => !current);
-              }}
-              onMouseDown={(event) => handleNodeMouseDown(node.id, event)}
-            >
-              {NODE_CATALOG[node.type].receivesFrom.length > 0 ? (
-                <button
-                  type="button"
-                  className="port port-left"
-                  title={`Receives from: ${listNodeTypes(NODE_CATALOG[node.type].receivesFrom)}`}
-                  onClick={(event) => {
-                    event.stopPropagation();
-                    finishConnection(node.id);
-                  }}
-                />
-              ) : null}
-
-              {NODE_CATALOG[node.type].sendsTo.length > 0 ? (
-                <button
-                  type="button"
-                  className="port port-right"
-                  title={`Sends to: ${listNodeTypes(NODE_CATALOG[node.type].sendsTo)}`}
-                  onClick={(event) => {
-                    event.stopPropagation();
-                    startConnection(node.id);
-                  }}
-                />
-              ) : null}
-
-              {runBadge ? (
-                <span
-                  className={`node-run-badge ${
-                    runBadge.variant === "running"
-                      ? "is-running"
-                      : runBadge.variant === "tool-completed"
-                        ? "is-tool-completed"
-                        : "is-completed"
-                  }`}
-                  title={runBadge.title}
-                >
-                  {runBadge.text}
-                </span>
-              ) : null}
-
-              <div className="node-help">
-                <button type="button" className="help-button" onClick={(event) => event.stopPropagation()}>
-                  ?
-                </button>
-                <div className="help-tooltip">
-                  <strong>{NODE_CATALOG[node.type].label}</strong>
-                  <p>{NODE_CATALOG[node.type].description}</p>
-                  <p>Receives from: {listNodeTypes(NODE_CATALOG[node.type].receivesFrom)}</p>
-                  <p>Sends to: {listNodeTypes(NODE_CATALOG[node.type].sendsTo)}</p>
-                </div>
-              </div>
-
-              <span className="node-icon" style={{ color: visual.color }}>
-                {visual.icon}
-              </span>
-              <span className="node-type">{getCanvasNodeLabel(node.data, node.type)}</span>
-              <strong>{node.data.name}</strong>
-              <span className="node-meta">
-                {node.type === "output" && outputResponseOnly
-                  ? "Response only view"
-                  : node.type === "output"
-                    ? "Double-click for clean response"
-                    : getCanvasNodeMeta(node)}
-              </span>
+        <div className="toast-stack" role="status" aria-live="polite">
+          {toasts.map((toast) => (
+            <div key={toast.id} className={`toast is-${toast.tone}`}>
+              <span>{toast.message}</span>
+              <button type="button" className="toast-close" aria-label="Dismiss" onClick={() => dismissToast(toast.id)}>
+                ×
+              </button>
             </div>
-          );
-        })}
+          ))}
         </div>
+
+        <FlowCanvas
+          ref={flowCanvasRef}
+          nodes={canvasNodeViews}
+          edges={graph.edges}
+          selectedNodeIds={selectedNodeIds}
+          selectedEdgeIds={selectedEdgeId ? [selectedEdgeId] : []}
+          colorScheme={getThemeDefinition(themeId).scheme}
+          canConnect={canConnectNodeIds}
+          onConnect={connectNodes}
+          onNodesMoved={handleNodesMoved}
+          onSelectionChange={handleCanvasSelectionChange}
+          onDelete={handleCanvasDelete}
+          onNodeDoubleClick={handleNodeDoubleClick}
+          onDropLibraryItem={handleLibraryItemDrop}
+          onZoomChange={setCanvasZoom}
+        />
       </main>
+
+      <CommandPalette open={isCommandPaletteOpen} commands={paletteCommands} onClose={() => setIsCommandPaletteOpen(false)} />
 
       <aside className="right-dock">
         <section className="dock-inspector panel">
