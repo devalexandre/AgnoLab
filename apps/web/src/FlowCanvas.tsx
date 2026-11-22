@@ -65,6 +65,8 @@ export interface CanvasNodeView {
   runBadge?: CanvasNodeRunBadge;
   hasInputs: boolean;
   hasOutputs: boolean;
+  /** Named input ports (e.g. a Branch's "if" and "else"); default is one unnamed input. */
+  targetHandles?: Array<{ id: string | null; label: string }>;
   receivesFromLabel: string;
   sendsToLabel: string;
   helpTitle: string;
@@ -92,7 +94,7 @@ export interface FlowCanvasProps {
   selectedEdgeIds: string[];
   colorScheme: "dark" | "light";
   canConnect: (sourceId: string, targetId: string) => boolean;
-  onConnect: (sourceId: string, targetId: string) => void;
+  onConnect: (sourceId: string, targetId: string, targetHandle: string | null) => void;
   onNodesMoved: (positions: Record<string, Position>) => void;
   onSelectionChange: (nodeIds: string[], edgeIds: string[]) => void;
   onDelete: (nodeIds: string[], edgeIds: string[]) => void;
@@ -107,11 +109,26 @@ const AgnoNodeCard = memo(function AgnoNodeCard({ data, selected, dragging }: No
   const badge = view.runBadge;
   return (
     <div
-      className={`canvas-node${badge ? " has-run-status" : ""}${selected ? " selected" : ""}${dragging ? " is-dragging" : ""}`}
+      className={`canvas-node${badge ? " has-run-status" : ""}${selected ? " selected" : ""}${dragging ? " is-dragging" : ""}${view.targetHandles ? " has-named-ports" : ""}`}
       style={{ borderColor: selected ? view.color : undefined, ["--node-accent" as string]: view.color }}
       data-node-type={view.type}
     >
-      {view.hasInputs ? (
+      {view.hasInputs && view.targetHandles ? (
+        view.targetHandles.map((handle, index) => (
+          <Handle
+            key={handle.id ?? "default"}
+            type="target"
+            id={handle.id ?? undefined}
+            position={HandlePosition.Left}
+            className={`port port-left port-named${handle.id ? ` port-${handle.id}` : ""}`}
+            style={{ top: 40 + index * 34 }}
+            title={`${handle.label} — receives from: ${view.receivesFromLabel}`}
+            aria-label={`${view.name} ${handle.label} input`}
+          >
+            <span className="port-label">{handle.label}</span>
+          </Handle>
+        ))
+      ) : view.hasInputs ? (
         <Handle
           type="target"
           position={HandlePosition.Left}
@@ -232,6 +249,8 @@ const FlowCanvasInner = forwardRef<FlowCanvasHandle, FlowCanvasProps>(function F
         id: edge.id,
         source: edge.source,
         target: edge.target,
+        targetHandle: edge.target_handle ?? undefined,
+        label: edge.target_handle ? edge.target_handle : undefined,
         selected: selected.has(edge.id),
         animated: runningNodeIds.has(edge.source),
         className: "agno-edge",
@@ -283,8 +302,11 @@ const FlowCanvasInner = forwardRef<FlowCanvasHandle, FlowCanvasProps>(function F
   const isValidConnection = useCallback<IsValidConnection<Edge>>(
     (connection) => {
       const { source, target } = connection;
+      const targetHandle = connection.targetHandle ?? null;
       if (!source || !target || source === target) return false;
-      if (graphEdges.some((edge) => edge.source === source && edge.target === target)) return false;
+      if (graphEdges.some((edge) => edge.source === source && edge.target === target && (edge.target_handle ?? null) === targetHandle)) {
+        return false;
+      }
       return canConnect(source, target);
     },
     [canConnect, graphEdges],
@@ -293,7 +315,7 @@ const FlowCanvasInner = forwardRef<FlowCanvasHandle, FlowCanvasProps>(function F
   const handleConnect = useCallback(
     (connection: Connection) => {
       if (connection.source && connection.target) {
-        onConnect(connection.source, connection.target);
+        onConnect(connection.source, connection.target, connection.targetHandle ?? null);
       }
     },
     [onConnect],

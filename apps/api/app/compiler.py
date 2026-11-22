@@ -18,6 +18,12 @@ from .provider_catalog import (
     render_provider_model_expression,
     resolve_api_key_env_and_value,
 )
+from .workflow_control import (
+    WORKFLOW_CONTROL_CLASSES,
+    WORKFLOW_CONTROL_TYPES,
+    WORKFLOW_STEP_LIKE_TYPES,
+    render_workflow_control_node,
+)
 
 AGENT_TEMPLATE = Template(
     """{{ var_name }} = Agent(
@@ -3181,7 +3187,18 @@ def render_workflow_step_node(
     elif connected_team_symbol:
         primary_executor_label = "Team"
     elif connected_function_tool_ids:
-        connected_executor_symbol = symbol_map[connected_function_tool_ids[0]]
+        # A @tool-decorated function is an agno Function object, not a callable, so Step cannot
+        # call it directly ("'Function' object is not callable"). Wrap its entrypoint instead.
+        function_tool_symbol = symbol_map[connected_function_tool_ids[0]]
+        connected_executor_symbol = sanitize_identifier(f"{var_name}_{connected_function_tool_ids[0]}_executor")
+        lines.extend(
+            [
+                f"def {connected_executor_symbol}(step_input, session_state=None, run_context=None):",
+                f"    _agnolab_executor = getattr({function_tool_symbol}, 'entrypoint', {function_tool_symbol})",
+                '    return _agnolab_executor(step_input.get_input_as_string() or "")',
+                "",
+            ]
+        )
         primary_executor_label = "Function Tool"
     elif connected_builtin_tool_ids:
         primary_builtin_tool_id = connected_builtin_tool_ids[0]
@@ -3266,7 +3283,7 @@ def render_workflow_node(
         [
             node_map[source_id]
             for source_id in incoming_source_ids
-            if source_id in symbol_map and node_map.get(source_id) and node_map[source_id].type == NodeType.WORKFLOW_STEP
+            if source_id in symbol_map and node_map.get(source_id) and node_map[source_id].type in WORKFLOW_STEP_LIKE_TYPES
         ],
         key=get_workflow_step_order,
     )
@@ -3426,6 +3443,7 @@ def render_import_tail(
     *,
     needs_tool_decorator: bool,
     has_workflow_nodes: bool,
+    workflow_control_classes: list[str] | None = None,
     needs_human_review: bool = False,
     has_direct_vector_db_runner_link: bool,
     knowledge_reader_imports: set[tuple[str, str]],
@@ -3440,7 +3458,9 @@ def render_import_tail(
     if needs_tool_decorator:
         lines.append("from agno.tools import tool")
     if has_workflow_nodes:
-        workflow_names = ["HumanReview", "Step", "Workflow"] if needs_human_review else ["Step", "Workflow"]
+        workflow_names = sorted(
+            {"Step", "Workflow", *(workflow_control_classes or []), *(["HumanReview"] if needs_human_review else [])}
+        )
         lines.append(f"from agno.workflow import {', '.join(workflow_names)}")
     if has_direct_vector_db_runner_link:
         lines.append("from agno.knowledge.knowledge import Knowledge")
@@ -3634,7 +3654,8 @@ def compile_graph(graph: CanvasGraph, *, serve: bool = False) -> tuple[str, list
     raw_expression_import_lines = collect_raw_expression_imports(ordered_nodes)
     warnings.extend(provider_warnings)
     has_output_api = any(node.type == NodeType.OUTPUT_API for node in ordered_nodes)
-    has_workflow_nodes = any(node.type in {NodeType.WORKFLOW, NodeType.WORKFLOW_STEP} for node in ordered_nodes)
+    has_workflow_nodes = any(node.type in {NodeType.WORKFLOW, *WORKFLOW_STEP_LIKE_TYPES} for node in ordered_nodes)
+    workflow_control_classes = sorted({WORKFLOW_CONTROL_CLASSES[node.type] for node in ordered_nodes if node.type in WORKFLOW_CONTROL_TYPES})
     has_direct_vector_db_runner_link = any(
         node_map.get(edge.source) and node_map.get(edge.target)
         and node_map[edge.source].type == NodeType.VECTOR_DB
@@ -3734,6 +3755,14 @@ def compile_graph(graph: CanvasGraph, *, serve: bool = False) -> tuple[str, list
             warnings.extend(step_warnings)
             continue
 
+        if node.type in WORKFLOW_CONTROL_TYPES:
+            control_lines, control_warnings = render_workflow_control_node(
+                node, var_name, graph, node_map, symbol_map, get_workflow_step_order
+            )
+            lines.extend(control_lines)
+            warnings.extend(control_warnings)
+            continue
+
         if node.type == NodeType.WORKFLOW:
             workflow_lines, workflow_warnings = render_workflow_node(node, var_name, graph, node_map, symbol_map)
             lines.extend(workflow_lines)
@@ -3744,6 +3773,7 @@ def compile_graph(graph: CanvasGraph, *, serve: bool = False) -> tuple[str, list
         render_import_tail(
             needs_tool_decorator=needs_tool_decorator,
             has_workflow_nodes=has_workflow_nodes,
+            workflow_control_classes=workflow_control_classes,
             needs_human_review=STEP_USES_HUMAN_REVIEW
             and any(
                 node.type == NodeType.WORKFLOW_STEP and build_step_human_review_pairs(node)[0]

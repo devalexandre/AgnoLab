@@ -173,7 +173,7 @@ export function pasteSubgraph(
   const edges = clipboard.edges.map((edge) => {
     const source = idMap.get(edge.source) ?? edge.source;
     const target = idMap.get(edge.target) ?? edge.target;
-    return { ...edge, id: `edge_${source}_${target}`, source, target };
+    return { ...edge, id: `edge_${source}_${target}${edge.target_handle ? `_${edge.target_handle}` : ""}`, source, target };
   });
   return {
     graph: { ...graph, nodes: [...graph.nodes, ...nodes], edges: [...graph.edges, ...edges] },

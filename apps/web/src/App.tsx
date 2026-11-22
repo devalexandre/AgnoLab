@@ -57,6 +57,8 @@ import { MarkdownRenderer } from "./markdown";
 import type { MonacoToolEditorProps } from "./MonacoToolEditor";
 import CommandPalette, { type PaletteCommand } from "./CommandPalette";
 import ThemePicker from "./ThemePicker";
+import { renderInspectorPropertyLabel } from "./inspector/fields";
+import WorkflowControlInspector from "./inspector/WorkflowControlInspector";
 import { THEMES, applyTheme, getThemeDefinition, loadInitialThemeId, type ThemeId } from "./themes";
 import {
   buildFlowPath,
@@ -78,7 +80,7 @@ function MonacoToolEditor(props: MonacoToolEditorProps) {
     </Suspense>
   );
 }
-import { NODE_CATALOG, NODE_CATEGORIES, canConnect, listNodeTypes } from "./nodeCatalog";
+import { BRANCH_ELSE_HANDLE, NODE_CATALOG, NODE_CATEGORIES, WORKFLOW_CONTROL_TYPES, canConnect, listNodeTypes } from "./nodeCatalog";
 import { buildProviderConfig, getProviderDefinition, normalizeProviderId } from "./providerCatalog";
 import { TEAM_FIELDS, TEAM_FIELD_GROUPS } from "./teamConfig";
 import { STARTER_TOOLS } from "./starterTools";
@@ -1877,6 +1879,17 @@ function getCanvasNodeMeta(node: { type: keyof typeof NODE_CATALOG; data: NodeDa
     return `Step ${stepOrder}`;
   }
 
+  if (WORKFLOW_CONTROL_TYPES.includes(node.type)) {
+    const stepOrder = fieldValueAsString(node.data.extras?.stepOrder) || "1";
+    if (node.type === "workflow_loop") {
+      const maxIterations = fieldValueAsString(node.data.extras?.maxIterations) || "3";
+      return `Step ${stepOrder} · up to ${maxIterations}×`;
+    }
+    if (node.type === "workflow_parallel") return `Step ${stepOrder} · runs in parallel`;
+    if (node.type === "workflow_router") return `Step ${stepOrder} · picks one route`;
+    return `Step ${stepOrder} · if / else`;
+  }
+
   if (node.type === "input") {
     const inputSource = getInputSource(node.data);
     if (inputSource === "email") {
@@ -1988,26 +2001,6 @@ function parseFieldValue(field: AgentFieldDefinition, rawValue: string, checked:
   }
 
   return rawValue;
-}
-
-function renderInspectorPropertyLabel(label: string, helper: string, required = false) {
-  return (
-    <span className="field-label-row">
-      <span>
-        {label}
-        {required ? <span className="required-mark">*</span> : null}
-      </span>
-      <div className="property-help">
-        <button type="button" className="help-button" onClick={(event) => event.preventDefault()}>
-          ?
-        </button>
-        <div className="help-tooltip">
-          <strong>{label}</strong>
-          <p>{helper}</p>
-        </div>
-      </div>
-    </span>
-  );
 }
 
 function NodeIcon({ type }: { type: keyof typeof NODE_CATALOG }) {
@@ -2200,6 +2193,38 @@ function NodeIcon({ type }: { type: keyof typeof NODE_CATALOG }) {
     return (
       <svg viewBox="0 0 24 24" aria-hidden="true">
         <path d="M12 3l8 9-8 9-8-9 8-9z" />
+      </svg>
+    );
+  }
+
+  if (type === "workflow_parallel") {
+    return (
+      <svg viewBox="0 0 24 24" aria-hidden="true">
+        <path d="M4 12h3M7 6v12M7 6h10M7 12h10M7 18h10M17 6v12M17 12h3" />
+      </svg>
+    );
+  }
+
+  if (type === "workflow_loop") {
+    return (
+      <svg viewBox="0 0 24 24" aria-hidden="true">
+        <path d="M17 7H8a4 4 0 0 0 0 8h1M14 4l3 3-3 3M7 17h9a4 4 0 0 0 0-8h-1" />
+      </svg>
+    );
+  }
+
+  if (type === "workflow_router") {
+    return (
+      <svg viewBox="0 0 24 24" aria-hidden="true">
+        <path d="M4 12h6M10 12l6-6h4M10 12l6 6h4M17 3l3 3-3 3M17 15l3 3-3 3" />
+      </svg>
+    );
+  }
+
+  if (type === "workflow_branch") {
+    return (
+      <svg viewBox="0 0 24 24" aria-hidden="true">
+        <path d="M6 4v6a4 4 0 0 0 4 4h8M6 4v16M15 11l3 3-3 3" />
       </svg>
     );
   }
@@ -3136,6 +3161,13 @@ export default function App() {
           color: visual.color,
           runBadge: nodeRunBadges[node.id],
           hasInputs: definition.receivesFrom.length > 0,
+          targetHandles:
+            node.type === "workflow_branch"
+              ? [
+                  { id: null, label: "if" },
+                  { id: BRANCH_ELSE_HANDLE, label: "else" },
+                ]
+              : undefined,
           hasOutputs: definition.sendsTo.length > 0,
           receivesFromLabel: listNodeTypes(definition.receivesFrom),
           sendsToLabel: listNodeTypes(definition.sendsTo),
@@ -3803,7 +3835,7 @@ export default function App() {
     return Boolean(source && target && canConnect(source.type, target.type));
   }
 
-  function connectNodes(sourceId: string, targetId: string) {
+  function connectNodes(sourceId: string, targetId: string, targetHandle: string | null = null) {
     const sourceNode = nodeMap[sourceId];
     const targetNode = nodeMap[targetId];
     if (!graph || !sourceNode || !targetNode) {
@@ -3817,14 +3849,24 @@ export default function App() {
       setConnectionMessage(`${NODE_CATALOG[sourceNode.type].label} cannot connect to ${NODE_CATALOG[targetNode.type].label}.`);
       return;
     }
-    const edgeId = `edge_${sourceNode.id}_${targetNode.id}`;
+    const edgeId = `edge_${sourceNode.id}_${targetNode.id}${targetHandle ? `_${targetHandle}` : ""}`;
     setGraph((currentGraph) => {
-      if (!currentGraph || currentGraph.edges.some((edge) => edge.source === sourceNode.id && edge.target === targetNode.id)) {
+      if (
+        !currentGraph ||
+        currentGraph.edges.some(
+          (edge) => edge.source === sourceNode.id && edge.target === targetNode.id && (edge.target_handle ?? null) === targetHandle,
+        )
+      ) {
         return currentGraph;
       }
-      return { ...currentGraph, edges: [...currentGraph.edges, { id: edgeId, source: sourceNode.id, target: targetNode.id }] };
+      const edge = targetHandle
+        ? { id: edgeId, source: sourceNode.id, target: targetNode.id, target_handle: targetHandle }
+        : { id: edgeId, source: sourceNode.id, target: targetNode.id };
+      return { ...currentGraph, edges: [...currentGraph.edges, edge] };
     });
-    setConnectionMessage(`${sourceNode.data.name} connected to ${targetNode.data.name}.`);
+    setConnectionMessage(
+      `${sourceNode.data.name} connected to ${targetNode.data.name}${targetHandle ? ` (${targetHandle})` : ""}.`,
+    );
   }
 
   function handleNodesMoved(positions: Record<string, Position>) {
@@ -6775,7 +6817,7 @@ export default function App() {
       const connectedSteps = currentGraph.edges
         .filter((edge) => edge.target === currentNode.id)
         .map((edge) => nodeMap[edge.source])
-        .filter((node): node is GraphNode => Boolean(node) && node.type === "workflow_step")
+        .filter((node): node is GraphNode => Boolean(node) && (node.type === "workflow_step" || WORKFLOW_CONTROL_TYPES.includes(node.type)))
         .sort((left, right) => {
           const leftOrder = Number(fieldValueAsString(left.data.extras?.stepOrder) || "9999");
           const rightOrder = Number(fieldValueAsString(right.data.extras?.stepOrder) || "9999");
@@ -6981,6 +7023,21 @@ export default function App() {
             {renderInspectorPropertyLabel("Telemetry", "Keeps Agno workflow telemetry enabled.")}
           </label>
         </>
+      );
+    }
+
+    if (WORKFLOW_CONTROL_TYPES.includes(selectedNode.type)) {
+      const currentGraph = graph;
+      if (!currentGraph) {
+        return null;
+      }
+      const nodeId = selectedNode.id;
+      return (
+        <WorkflowControlInspector
+          node={selectedNode}
+          graph={currentGraph}
+          onChange={(patch) => setGraph((current) => updateNodeData(current, nodeId, patch))}
+        />
       );
     }
 
