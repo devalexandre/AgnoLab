@@ -12,7 +12,7 @@ export function isCanvasBackgroundTarget(target: EventTarget | null, currentTarg
     return false;
   }
 
-  if (target.closest(".canvas-node, .canvas-brand, .run-cta, .flow-actions, .canvas-hint, .edge-hit-area")) {
+  if (target.closest(".canvas-node, .canvas-toolbar, .canvas-hint, .canvas-minimap, .edge-hit-area")) {
     return false;
   }
 

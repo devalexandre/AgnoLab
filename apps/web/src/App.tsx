@@ -53,6 +53,8 @@ import {
 import { MAX_CANVAS_ZOOM, MIN_CANVAS_ZOOM, clampCanvasZoom, isCanvasBackgroundTarget } from "./canvas";
 import { MarkdownRenderer } from "./markdown";
 import type { MonacoToolEditorProps } from "./MonacoToolEditor";
+import ThemePicker from "./ThemePicker";
+import { applyTheme, loadInitialThemeId, type ThemeId } from "./themes";
 import {
   buildFlowPath,
   buildPersistedFlowSnapshot,
@@ -2270,13 +2272,7 @@ export default function App() {
   const [librarySearchInput, setLibrarySearchInput] = useState("");
   const [outputResponseOnly, setOutputResponseOnly] = useState(false);
   const [flowName, setFlowName] = useState("support_agent_flow");
-  const [themeMode, setThemeMode] = useState<"dark" | "light">(() => {
-    const persisted = window.localStorage.getItem("agnolab.theme");
-    if (persisted === "dark" || persisted === "light") {
-      return persisted;
-    }
-    return window.matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark";
-  });
+  const [themeId, setThemeId] = useState<ThemeId>(() => loadInitialThemeId());
   const [savedFlows, setSavedFlows] = useState<FlowSummary[]>([]);
   const [runByNameInputText, setRunByNameInputText] = useState("");
   const [runByNameMetadata, setRunByNameMetadata] = useState("{}\n");
@@ -2350,9 +2346,8 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    document.documentElement.setAttribute("data-theme", themeMode);
-    window.localStorage.setItem("agnolab.theme", themeMode);
-  }, [themeMode]);
+    applyTheme(themeId);
+  }, [themeId]);
 
   useEffect(() => {
     setHistoryPast([]);
@@ -4847,10 +4842,6 @@ export default function App() {
   function handleZoomReset() {
     setCanvasZoom(1);
     setCanvasOffset({ x: 0, y: 0 });
-  }
-
-  function handleToggleTheme() {
-    setThemeMode((current) => (current === "dark" ? "light" : "dark"));
   }
 
   function handleUndo() {
@@ -9540,6 +9531,10 @@ export default function App() {
               >
                 Models
               </button>
+              <div className="home-sidebar-footer">
+                <p className="eyebrow">Appearance</p>
+                <ThemePicker value={themeId} onChange={setThemeId} placement="top-start" />
+              </div>
             </aside>
 
             <section className="home-content panel">
@@ -10612,82 +10607,100 @@ export default function App() {
           }
         }}
       >
-        <div className="canvas-brand">
-          <p className="eyebrow">AgnoLab</p>
-          <h1>{graph.project.name}</h1>
-          <p className="muted">Visual canvas for Agno</p>
-          <div className="canvas-brand-actions">
-            <button type="button" className="secondary-button" onClick={handleGoHome}>
-              Home
+        <header className="canvas-toolbar" role="toolbar" aria-label="Flow toolbar">
+          <div className="canvas-toolbar-group canvas-toolbar-identity">
+            <button type="button" className="icon-button" onClick={handleGoHome} title="Back to the Flow Hub" aria-label="Home">
+              <svg viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M4 11.5 12 5l8 6.5V20a1 1 0 0 1-1 1h-4.5v-6h-5v6H5a1 1 0 0 1-1-1z" />
+              </svg>
+            </button>
+            <div className="canvas-toolbar-title">
+              <span className="eyebrow">AgnoLab · {graph.project.target}</span>
+              <strong title={graph.project.name}>{graph.project.name}</strong>
+            </div>
+          </div>
+
+          <div className="canvas-toolbar-group canvas-toolbar-flow">
+            <label className="visually-hidden" htmlFor="flow-name-input">
+              Flow name
+            </label>
+            <input
+              id="flow-name-input"
+              className="flow-name-input"
+              value={flowName}
+              onChange={(event) => setFlowName(event.target.value)}
+              list="saved-flow-names"
+              placeholder="flow_name"
+            />
+            <button type="button" className="secondary-button save-button" onClick={handleSaveFlow} disabled={isSavingFlow}>
+              {isSavingFlow ? "Saving…" : "Save"}
+            </button>
+            <button type="button" className="secondary-button" onClick={() => handleOpenIntegrationModal()}>
+              Integration
             </button>
             <details className="canvas-settings-menu">
-              <summary className="secondary-button">Settings</summary>
+              <summary className="secondary-button" aria-label="More flow actions">
+                More
+              </summary>
               <div className="canvas-settings-menu-items">
                 <button type="button" className="secondary-button" onClick={handleTriggerImportFlow}>
                   Import Flow
                 </button>
                 <button type="button" className="secondary-button" onClick={handleExportFlow}>
-                  Export Flow
+                  Export Flow (.json)
                 </button>
                 <button type="button" className="secondary-button" onClick={handleExportPython}>
-                  Export .py
+                  Export Python (.py)
                 </button>
                 <button type="button" className="secondary-button" onClick={handleExportServeApp} title="Export an AgentOS server app (FastAPI) that serves this flow's agents/teams/workflows as an API.">
                   Export Server App
                 </button>
-                <button type="button" className="secondary-button" onClick={handleUndo} disabled={historyPast.length === 0} title="Undo (Ctrl/Cmd+Z)">
-                  Undo
-                </button>
-                <button type="button" className="secondary-button" onClick={handleRedo} disabled={historyFuture.length === 0} title="Redo (Ctrl/Cmd+Y)">
-                  Redo
-                </button>
               </div>
             </details>
+            <datalist id="saved-flow-names">
+              {savedFlows.map((flow) => (
+                <option key={flow.name} value={flow.name} />
+              ))}
+            </datalist>
           </div>
-        </div>
-        <div className="run-cta">
-          <button type="button" className="primary-button run-button" onClick={handleRun} disabled={isRunning || isRunningSavedFlow}>
-            {isRunning ? "Running..." : "Run"}
-          </button>
-        </div>
 
-        <div className="flow-actions" role="toolbar" aria-label="Flow actions">
-          <input
-            className="flow-name-input"
-            value={flowName}
-            onChange={(event) => setFlowName(event.target.value)}
-            list="saved-flow-names"
-            placeholder="flow_name"
-          />
-          <button type="button" className="secondary-button save-button" onClick={handleSaveFlow} disabled={isSavingFlow}>
-            {isSavingFlow ? "Saving..." : "Save Flow"}
-          </button>
-          <button type="button" className="secondary-button" onClick={() => handleOpenIntegrationModal()}>
-            Integration
-          </button>
-          <datalist id="saved-flow-names">
-            {savedFlows.map((flow) => (
-              <option key={flow.name} value={flow.name} />
-            ))}
-          </datalist>
-        </div>
-
-        <div className="canvas-controls" role="toolbar" aria-label="Canvas view controls">
-          <button type="button" className="secondary-button" onClick={handleToggleTheme} title="Toggle dark/light theme">
-            Theme: {themeMode === "dark" ? "Dark" : "Light"}
-          </button>
-          <div className="zoom-control" role="group" aria-label="Zoom controls">
-            <button type="button" className="secondary-button" onClick={handleZoomOut} disabled={canvasZoom <= MIN_CANVAS_ZOOM}>
-              Zoom -
-            </button>
-            <button type="button" className="secondary-button canvas-zoom-readout" onClick={handleZoomReset} title="Reset zoom to 100%">
-              {Math.round(canvasZoom * 100)}%
-            </button>
-            <button type="button" className="secondary-button" onClick={handleZoomIn} disabled={canvasZoom >= MAX_CANVAS_ZOOM}>
-              Zoom +
+          <div className="canvas-toolbar-group canvas-toolbar-view">
+            <div className="segmented" role="group" aria-label="History">
+              <button type="button" className="icon-button" onClick={handleUndo} disabled={historyPast.length === 0} title="Undo (Ctrl/Cmd+Z)" aria-label="Undo">
+                <svg viewBox="0 0 24 24" aria-hidden="true">
+                  <path d="M9 7 4 12l5 5M4.5 12H14a6 6 0 0 1 0 12h-1" transform="translate(0 -3)" />
+                </svg>
+              </button>
+              <button type="button" className="icon-button" onClick={handleRedo} disabled={historyFuture.length === 0} title="Redo (Ctrl/Cmd+Y)" aria-label="Redo">
+                <svg viewBox="0 0 24 24" aria-hidden="true">
+                  <path d="m15 7 5 5-5 5M19.5 12H10a6 6 0 0 0 0 12h1" transform="translate(0 -3)" />
+                </svg>
+              </button>
+            </div>
+            <div className="segmented zoom-control" role="group" aria-label="Zoom">
+              <button type="button" className="icon-button" onClick={handleZoomOut} disabled={canvasZoom <= MIN_CANVAS_ZOOM} title="Zoom out" aria-label="Zoom out">
+                <svg viewBox="0 0 24 24" aria-hidden="true">
+                  <path d="M6 12h12" />
+                </svg>
+              </button>
+              <button type="button" className="icon-button canvas-zoom-readout" onClick={handleZoomReset} title="Reset zoom to 100%">
+                {Math.round(canvasZoom * 100)}%
+              </button>
+              <button type="button" className="icon-button" onClick={handleZoomIn} disabled={canvasZoom >= MAX_CANVAS_ZOOM} title="Zoom in" aria-label="Zoom in">
+                <svg viewBox="0 0 24 24" aria-hidden="true">
+                  <path d="M6 12h12M12 6v12" />
+                </svg>
+              </button>
+            </div>
+            <ThemePicker value={themeId} onChange={setThemeId} placement="bottom-end" />
+            <button type="button" className="primary-button run-button" onClick={handleRun} disabled={isRunning || isRunningSavedFlow}>
+              <svg viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M8 5.5v13l10-6.5z" />
+              </svg>
+              {isRunning ? "Running…" : "Run"}
             </button>
           </div>
-        </div>
+        </header>
 
         <div className="canvas-footer-left">
           <span className="muted small-note">
@@ -10830,6 +10843,7 @@ export default function App() {
                 left: `${node.position.x}px`,
                 top: `${node.position.y}px`,
                 borderColor: selectedNodeId === node.id ? visual.color : undefined,
+                ["--node-accent" as string]: visual.color,
               }}
               onClick={() => setSelectedNodeId(node.id)}
               onClickCapture={() => setSelectedEdgeId(null)}

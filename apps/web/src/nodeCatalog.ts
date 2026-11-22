@@ -1,4 +1,5 @@
 import { buildProviderConfig } from "./providerCatalog";
+import { accentVar } from "./themes";
 import { NodeData, NodeType } from "./types";
 
 export interface NodeDefinition {
@@ -13,16 +14,17 @@ export interface NodeDefinition {
   createData: (index: number) => NodeData;
 }
 
+// Theme-aware: each slot resolves to a CSS variable set by the active theme (see themes.ts).
 const AGNO_NODE_COLORS = {
-  primary: "#ff4017",
-  ember: "#ff562f",
-  coral: "#ff6a45",
-  salmon: "#ff8d75",
-  peach: "#ffb19d",
-  copper: "#ff9d6b",
-  clay: "#c98772",
-  sand: "#d5cfce",
-  dune: "#a6a09f",
+  primary: accentVar("primary"),
+  ember: accentVar("ember"),
+  coral: accentVar("coral"),
+  salmon: accentVar("salmon"),
+  peach: accentVar("peach"),
+  copper: accentVar("copper"),
+  clay: accentVar("clay"),
+  sand: accentVar("sand"),
+  dune: accentVar("dune"),
 } as const;
 
 export const NODE_CATALOG: Record<NodeType, NodeDefinition> = {

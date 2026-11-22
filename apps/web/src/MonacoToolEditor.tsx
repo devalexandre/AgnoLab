@@ -1,7 +1,8 @@
-import { useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import Editor, { loader, type Monaco } from "@monaco-editor/react";
 import * as monaco from "monaco-editor";
 import EditorWorker from "monaco-editor/esm/vs/editor/editor.worker?worker";
+import { THEME_CHANGE_EVENT, THEMES, getThemeDefinition, monacoThemeName, type ThemeDefinition, type ThemeId } from "./themes";
 
 // Use the bundled monaco-editor instead of loading it from the jsDelivr CDN at
 // runtime, so the editor works offline and under a strict CSP. Python only needs
@@ -12,7 +13,53 @@ if (typeof window !== "undefined") {
 }
 
 const COMPLETION_PROVIDER_ID = "agnolab-python";
-const MONACO_THEME_ID = "agnolab-agno-dark";
+
+function buildMonacoTheme(theme: ThemeDefinition): monaco.editor.IStandaloneThemeData {
+  const palette = theme.monaco;
+  return {
+    base: palette.base,
+    inherit: true,
+    rules: [
+      { token: "comment", foreground: palette.comment, fontStyle: "italic" },
+      { token: "keyword", foreground: palette.keyword },
+      { token: "string", foreground: palette.string },
+      { token: "number", foreground: palette.number },
+      { token: "type.identifier", foreground: palette.type },
+      { token: "delimiter", foreground: palette.delimiter },
+      { token: "identifier", foreground: palette.foreground.replace("#", "") },
+      { token: "operator", foreground: palette.operator },
+    ],
+    colors: {
+      "editor.background": palette.background,
+      "editor.foreground": palette.foreground,
+      "editorLineNumber.foreground": palette.lineNumber,
+      "editorLineNumber.activeForeground": palette.lineNumberActive,
+      "editorCursor.foreground": palette.cursor,
+      "editor.selectionBackground": palette.selection,
+      "editor.inactiveSelectionBackground": palette.lineHighlight,
+      "editor.lineHighlightBackground": palette.lineHighlight,
+      "editor.findMatchHighlightBackground": palette.selection,
+      "editorBracketMatch.background": palette.selection,
+      "editorBracketMatch.border": palette.cursor,
+      "focusBorder": theme.tokens.primary,
+    },
+  };
+}
+
+function currentThemeId(): ThemeId {
+  return getThemeDefinition(document.documentElement.getAttribute("data-theme")).id;
+}
+
+/** Tracks the app theme so the editor re-themes live when the user switches. */
+function useAppThemeId(): ThemeId {
+  const [themeId, setThemeId] = useState<ThemeId>(() => currentThemeId());
+  useEffect(() => {
+    const handle = (event: Event) => setThemeId((event as CustomEvent<ThemeId>).detail);
+    window.addEventListener(THEME_CHANGE_EVENT, handle);
+    return () => window.removeEventListener(THEME_CHANGE_EVENT, handle);
+  }, []);
+  return themeId;
+}
 
 export interface MonacoToolEditorProps {
   value: string;
@@ -30,40 +77,12 @@ export default function MonacoToolEditor({
   language = "python",
 }: MonacoToolEditorProps) {
   const completionRegisteredRef = useRef(false);
+  const monacoThemeId = monacoThemeName(useAppThemeId());
 
   function handleBeforeMount(monaco: Monaco) {
-    monaco.editor.defineTheme(MONACO_THEME_ID, {
-      base: "vs-dark",
-      inherit: true,
-      rules: [
-        { token: "comment", foreground: "777170", fontStyle: "italic" },
-        { token: "keyword", foreground: "FF8D75" },
-        { token: "string", foreground: "FFB19D" },
-        { token: "number", foreground: "FF6A45" },
-        { token: "type.identifier", foreground: "F5EFEE" },
-        { token: "delimiter", foreground: "D5CFCE" },
-        { token: "identifier", foreground: "F5EFEE" },
-        { token: "operator", foreground: "FF562F" },
-      ],
-      colors: {
-        "editor.background": "#111113",
-        "editor.foreground": "#F5EFEE",
-        "editorWhitespace.foreground": "#463F3F",
-        "editorIndentGuide.background1": "#2D2726",
-        "editorIndentGuide.activeBackground1": "#575150",
-        "editorLineNumber.foreground": "#777170",
-        "editorLineNumber.activeForeground": "#D5CFCE",
-        "editorCursor.foreground": "#FF4017",
-        "editor.selectionBackground": "#3A201A",
-        "editor.inactiveSelectionBackground": "#281714",
-        "editor.lineHighlightBackground": "#1E1817",
-        "editor.findMatchBackground": "#5C2C1E",
-        "editor.findMatchHighlightBackground": "#3A201A",
-        "editorBracketMatch.background": "#3A201A",
-        "editorBracketMatch.border": "#FF8D75",
-        "focusBorder": "#FF4017",
-      },
-    });
+    for (const theme of THEMES) {
+      monaco.editor.defineTheme(monacoThemeName(theme.id), buildMonacoTheme(theme));
+    }
 
     if (!completionRegisteredRef.current) {
       monaco.languages.registerCompletionItemProvider("python", {
@@ -128,12 +147,12 @@ export default function MonacoToolEditor({
       completionRegisteredRef.current = true;
     }
 
-    monaco.editor.setTheme(MONACO_THEME_ID);
+    monaco.editor.setTheme(monacoThemeId);
   }
 
   function handleMount(monacoEditorInstance: unknown, monaco: Monaco) {
     void monacoEditorInstance;
-    monaco.editor.setTheme(MONACO_THEME_ID);
+    monaco.editor.setTheme(monacoThemeId);
   }
 
   return (
@@ -146,7 +165,7 @@ export default function MonacoToolEditor({
         beforeMount={handleBeforeMount}
         onMount={handleMount}
         onChange={onChange ? (nextValue) => onChange(nextValue ?? "") : undefined}
-        theme={MONACO_THEME_ID}
+        theme={monacoThemeId}
         options={{
           automaticLayout: true,
           minimap: { enabled: false },

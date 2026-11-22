@@ -1,5 +1,6 @@
 import type { ReactNode } from "react";
 import type { BuiltInToolDefinition } from "./toolCatalog";
+import { accentVar } from "./themes";
 
 export interface ToolIconProps {
   toolKey?: string;
@@ -327,24 +328,24 @@ export function ToolIcon({ toolKey, category }: ToolIconProps) {
 export function toolIconColor(tool: Pick<BuiltInToolDefinition, "category" | "key">): string {
   switch (tool.category) {
     case "Search":
-      return "#ff8d75";
+      return accentVar("salmon");
     case "Finance":
-      return "#ffb19d";
+      return accentVar("peach");
     case "Database":
-      return "#d5cfce";
+      return accentVar("sand");
     case "Web Scraping":
-      return "#ff6a45";
+      return accentVar("coral");
     case "Research":
-      return "#ff9d6b";
+      return accentVar("copper");
     case "Productivity":
-      return "#c98772";
+      return accentVar("clay");
     case "Developer":
-      return "#ff4017";
+      return accentVar("primary");
     case "AI & Media":
-      return "#ff562f";
+      return accentVar("ember");
     case "Utility":
-      return "#a6a09f";
+      return accentVar("dune");
     default:
-      return "#ff4017";
+      return accentVar("primary");
   }
 }
