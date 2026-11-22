@@ -52,6 +52,7 @@ from .models import (
     ListFlowRuntimeStatusesResponse,
     ListFlowsResponse,
     ListQueueSubscriberStatusesResponse,
+    ListScheduleStatusesResponse,
     ListSkillPathsResponse,
     NodeType,
     QueueSubscriberStatus,
@@ -66,6 +67,7 @@ from .models import (
 from .provider_catalog import known_provider_credential_env_names
 from .queue_subscriber import QueueSubscriberManager, extract_queue_subscriber_configs
 from .sample_graph import build_sample_graph, get_canvas_template, list_canvas_templates
+from .schedule_runner import ScheduleConfig, ScheduleManager
 from .whatsapp_gateway import (
     DEFAULT_WHATSAPP_GATEWAY_SECRET_KEY,
     WhatsappGatewayClient,
@@ -138,11 +140,13 @@ async def lifespan(_app: FastAPI):
         )
     email_listener_manager.start()
     queue_subscriber_manager.start()
+    schedule_manager.start()
     try:
         yield
     finally:
         email_listener_manager.stop()
         queue_subscriber_manager.stop()
+        schedule_manager.stop()
 
 
 app = FastAPI(
@@ -281,6 +285,9 @@ app.add_middleware(
 
 email_listener_manager = EmailListenerManager(
     trigger_flow=lambda flow_name, email_event: run_saved_flow_from_email_event(flow_name, email_event),
+)
+schedule_manager = ScheduleManager(
+    trigger_flow=lambda flow_name, config: run_saved_flow_from_schedule(flow_name, config),
 )
 queue_subscriber_manager = QueueSubscriberManager(
     trigger_flow=lambda flow_name, node_id, payload_text, payload_metadata: run_saved_flow_from_queue_event(
@@ -511,6 +518,11 @@ def list_flow_runtime_statuses(flow_name: str | None = None) -> ListFlowRuntimeS
     return ListFlowRuntimeStatusesResponse(statuses=_list_flow_runtime_statuses(flow_name))
 
 
+@app.get("/api/integrations/schedules", response_model=ListScheduleStatusesResponse)
+def list_schedule_statuses(flow_name: str | None = None) -> ListScheduleStatusesResponse:
+    return ListScheduleStatusesResponse(schedules=schedule_manager.list_statuses(flow_name))
+
+
 @app.get("/api/integrations/email/listeners", response_model=ListEmailListenerStatusesResponse)
 def list_email_listener_statuses(flow_name: str | None = None) -> ListEmailListenerStatusesResponse:
     return ListEmailListenerStatusesResponse(listeners=email_listener_manager.list_statuses(flow_name))
@@ -573,6 +585,7 @@ def save_flow(request: SaveFlowRequest) -> SaveFlowResponse:
 
     email_listener_manager.sync_saved_flows()
     queue_subscriber_manager.sync_saved_flows()
+    schedule_manager.sync_saved_flows()
 
     return SaveFlowResponse(
         name=record.name,
@@ -601,6 +614,7 @@ def delete_flow(name: str) -> dict[str, str]:
 
     email_listener_manager.sync_saved_flows()
     queue_subscriber_manager.sync_saved_flows()
+    schedule_manager.sync_saved_flows()
 
     return {"name": normalize_flow_name(name), "status": "deleted"}
 
@@ -1623,6 +1637,28 @@ def run_saved_flow_from_email_event(flow_name: str, email_event: dict[str, str])
         debug=False,
         merge_metadata=True,
         runtime_source="email_listener",
+        track_runtime_activity=True,
+    )
+    summary = run_result.clean_stdout or run_result.stderr or run_result.stdout
+    return run_result.success, summary or None
+
+
+def run_saved_flow_from_schedule(flow_name: str, config: ScheduleConfig) -> tuple[bool, str | None]:
+    record = load_flow_record(flow_name)
+    if record is None:
+        return False, f"Flow not found: {flow_name}"
+
+    run_result = run_saved_flow_record(
+        record,
+        input_text=config.input_text or None,
+        input_metadata={
+            "_agnolab_schedule": {"node_id": config.node_id, "cron": config.cron, "timezone": config.timezone},
+            "schedule_source": "cron",
+        },
+        input_files=None,
+        debug=False,
+        merge_metadata=True,
+        runtime_source="schedule",
         track_runtime_activity=True,
     )
     summary = run_result.clean_stdout or run_result.stderr or run_result.stdout

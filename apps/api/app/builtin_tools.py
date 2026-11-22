@@ -5,6 +5,31 @@ import json
 from importlib import import_module
 from typing import Any
 
+# Built-in tool locations that moved or were wrong in older catalogs. Saved flows store the
+# import path and class name on the node, so they are resolved here rather than only fixed in
+# the frontend catalog. Agno 3.x removed the flat Google modules (now `agno.tools.google.*`).
+LEGACY_BUILTIN_TOOL_IMPORTS: dict[tuple[str, str], tuple[str, str]] = {
+    ("agno.tools.google_bigquery", "BigQueryTools"): ("agno.tools.google.bigquery", "GoogleBigQueryTools"),
+    ("agno.tools.google_bigquery", "GoogleBigQueryTools"): ("agno.tools.google.bigquery", "GoogleBigQueryTools"),
+    ("agno.tools.googlecalendar", "GoogleCalendarTools"): ("agno.tools.google.calendar", "GoogleCalendarTools"),
+    ("agno.tools.googlesheets", "GoogleSheetsTools"): ("agno.tools.google.sheets", "GoogleSheetsTools"),
+    ("agno.tools.google_drive", "GoogleDriveTools"): ("agno.tools.google.drive", "GoogleDriveTools"),
+    ("agno.tools.google_maps", "GoogleMapsTools"): ("agno.tools.google.maps", "GoogleMapTools"),
+    ("agno.tools.google_maps", "GoogleMapTools"): ("agno.tools.google.maps", "GoogleMapTools"),
+    ("agno.tools.gmail", "GmailTools"): ("agno.tools.google.gmail", "GmailTools"),
+    ("agno.tools.crawl4ai", "Crawl4AITools"): ("agno.tools.crawl4ai", "Crawl4aiTools"),
+    ("agno.tools.jina", "JinaTools"): ("agno.tools.jina", "JinaReaderTools"),
+    ("agno.tools.lumalab", "LumaLabsTools"): ("agno.tools.lumalab", "LumaLabTools"),
+    ("agno.tools.models_labs", "ModelsLabsTools"): ("agno.tools.models_labs", "ModelsLabTools"),
+    ("agno.tools.searxng", "SearxngTools"): ("agno.tools.searxng", "Searxng"),
+}
+
+
+def resolve_builtin_tool_import(import_path: str, class_name: str) -> tuple[str, str]:
+    """Map a stored (import path, class name) onto its current location in Agno."""
+    key = (str(import_path or "").strip(), str(class_name or "").strip())
+    return LEGACY_BUILTIN_TOOL_IMPORTS.get(key, key)
+
 
 def parse_builtin_tool_config(config_raw: str | None) -> tuple[dict[str, Any], str | None]:
     normalized = str(config_raw or "").strip()
@@ -25,6 +50,7 @@ def parse_builtin_tool_config(config_raw: str | None) -> tuple[dict[str, Any], s
 def instantiate_builtin_tool(import_path: str, class_name: str, config_raw: str | None = None) -> tuple[Any | None, str | None]:
     if not import_path.strip() or not class_name.strip():
         return None, "Built-in tool import path and class name are required."
+    import_path, class_name = resolve_builtin_tool_import(import_path, class_name)
 
     config, config_error = parse_builtin_tool_config(config_raw)
     if config_error:

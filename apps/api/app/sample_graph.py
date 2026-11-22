@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from .models import CanvasGraph, CanvasTemplateSummary, GraphEdge, GraphNode, NodeData, Position, ProjectMeta
+from .models import CanvasGraph, CanvasTemplateSummary, GraphEdge, GraphNode, NodeData, NodeType, Position, ProjectMeta
 from .provider_catalog import build_provider_config
 
 
@@ -538,6 +538,26 @@ def _workflow_step_node(
     )
 
 
+def _workflow_control_node(
+    node_id: str,
+    node_type: str,
+    *,
+    x: float,
+    y: float,
+    name: str,
+    description: str,
+    order: int,
+    **extras: object,
+) -> GraphNode:
+    """A Parallel / Loop / Router / Branch node (see app/workflow_control.py)."""
+    return GraphNode(
+        id=node_id,
+        type=NodeType(node_type),
+        position=Position(x=x, y=y),
+        data=NodeData(name=name, description=description, extras={"stepOrder": order, **extras}),
+    )
+
+
 def _workflow_node(
     node_id: str,
     *,
@@ -657,6 +677,13 @@ CANVAS_TEMPLATES: list[CanvasTemplateSummary] = [
         default_flow_name="workflow_hitl_review",
     ),
     CanvasTemplateSummary(
+        id="workflow-control-flow",
+        name="Workflow Control Flow",
+        description="Router, Parallel, Loop and an if/else Branch in one Agno workflow: triage, parallel research, draft refinement and escalation.",
+        category="workflow",
+        default_flow_name="workflow_control_flow",
+    ),
+    CanvasTemplateSummary(
         id="whatsapp-interface-custom-env",
         name="WhatsApp Interface Custom Envs",
         description="Shows a WhatsApp Interface node using custom environment variable property names for runtime secrets.",
@@ -674,6 +701,8 @@ def get_canvas_template(template_id: str) -> CanvasGraph | None:
     normalized_template_id = template_id.strip().lower()
     if normalized_template_id == "base-agent":
         return build_base_graph()
+    if normalized_template_id == "workflow-control-flow":
+        return build_workflow_control_flow_graph()
     if normalized_template_id == "team-support-desk":
         return build_team_graph()
     if normalized_template_id == "workflow-team-handoff":
@@ -1481,3 +1510,88 @@ def build_whatsapp_interface_custom_env_graph() -> CanvasGraph:
             GraphEdge(id="edge_agent_output", source="agent_1", target="output_1"),
         ],
     )
+
+
+def build_workflow_control_flow_graph() -> CanvasGraph:
+    """Router, Parallel, Loop and Branch (if/else) inside one Agno workflow."""
+    agents = [
+        ("billing", "Billing Agent", "Resolve billing and invoice questions precisely.", 60),
+        ("support", "Support Agent", "Troubleshoot product problems step by step.", 220),
+        ("market", "Market Researcher", "List the business impact and customer context of the request.", 420),
+        ("tech", "Tech Researcher", "List the technical causes and fixes that apply to the request.", 580),
+        ("writer", "Draft Writer", "Write or improve a reply from the previous steps. End with APPROVED when it is ready to send.", 780),
+        ("escalation", "Escalation Agent", "Write a short escalation note for an on-call engineer.", 980),
+        ("reply", "Reply Agent", "Write the final customer-facing reply.", 1140),
+    ]
+    nodes: list[GraphNode] = [
+        _input_node(
+            "input_1",
+            x=60,
+            y=600,
+            name="Customer Request",
+            text="Urgent: my invoice was charged twice and the app crashes when I open billing.",
+            source="workflow_control_flow",
+        )
+    ]
+    edges: list[GraphEdge] = [GraphEdge(id="edge_input_workflow", source="input_1", target="workflow_1")]
+    for order, (key, name, instructions, y) in enumerate(agents, start=1):
+        nodes.append(_agent_node(f"agent_{key}", x=360, y=y, name=name, instructions=instructions, description=instructions))
+        nodes.append(
+            _workflow_step_node(f"step_{key}", x=640, y=y, name=name.replace(" Agent", "") + " Step", description=instructions, order=order)
+        )
+        edges.append(GraphEdge(id=f"edge_agent_{key}", source=f"agent_{key}", target=f"step_{key}"))
+
+    controls = [
+        _workflow_control_node(
+            "router_1",
+            "workflow_router",
+            x=920,
+            y=140,
+            name="Triage",
+            description="Send invoice questions to billing, everything else to support.",
+            order=1,
+            selector="'Billing Step' if 'invoice' in text.lower() or 'charge' in text.lower() else 'Support Step'",
+        ),
+        _workflow_control_node(
+            "parallel_1", "workflow_parallel", x=920, y=500, name="Research", description="Market and tech research at the same time.", order=2
+        ),
+        _workflow_control_node(
+            "loop_1",
+            "workflow_loop",
+            x=920,
+            y=780,
+            name="Refine Draft",
+            description="Rewrite the draft until the writer marks it APPROVED (at most 3 passes).",
+            order=3,
+            maxIterations=3,
+            endCondition="'APPROVED' in last",
+            forwardIterationOutput=True,
+        ),
+        _workflow_control_node(
+            "branch_1",
+            "workflow_branch",
+            x=920,
+            y=1060,
+            name="Escalate?",
+            description="Urgent requests get an escalation note; the rest get a customer reply.",
+            order=4,
+            evaluator="'urgent' in text.lower()",
+        ),
+    ]
+    nodes.extend(controls)
+    for step, control in [
+        ("billing", "router_1"),
+        ("support", "router_1"),
+        ("market", "parallel_1"),
+        ("tech", "parallel_1"),
+        ("writer", "loop_1"),
+        ("escalation", "branch_1"),
+    ]:
+        edges.append(GraphEdge(id=f"edge_{step}_{control}", source=f"step_{step}", target=control))
+    edges.append(GraphEdge(id="edge_reply_branch_else", source="step_reply", target="branch_1", target_handle="else"))
+    nodes.append(_workflow_node("workflow_1", x=1200, y=600, name="Support Desk Workflow", description="Routes, researches, drafts and decides."))
+    nodes.append(_output_node("output_1", x=1480, y=600, name="Console Output"))
+    for control in ["router_1", "parallel_1", "loop_1", "branch_1"]:
+        edges.append(GraphEdge(id=f"edge_{control}_workflow", source=control, target="workflow_1"))
+    edges.append(GraphEdge(id="edge_workflow_output", source="workflow_1", target="output_1"))
+    return CanvasGraph(project=ProjectMeta(name="Workflow Control Flow"), nodes=nodes, edges=edges)

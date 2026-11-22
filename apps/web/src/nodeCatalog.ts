@@ -1,4 +1,5 @@
 import { buildProviderConfig } from "./providerCatalog";
+import { accentVar } from "./themes";
 import { NodeData, NodeType } from "./types";
 
 export interface NodeDefinition {
@@ -13,17 +14,24 @@ export interface NodeDefinition {
   createData: (index: number) => NodeData;
 }
 
+// Theme-aware: each slot resolves to a CSS variable set by the active theme (see themes.ts).
 const AGNO_NODE_COLORS = {
-  primary: "#ff4017",
-  ember: "#ff562f",
-  coral: "#ff6a45",
-  salmon: "#ff8d75",
-  peach: "#ffb19d",
-  copper: "#ff9d6b",
-  clay: "#c98772",
-  sand: "#d5cfce",
-  dune: "#a6a09f",
+  primary: accentVar("primary"),
+  ember: accentVar("ember"),
+  coral: accentVar("coral"),
+  salmon: accentVar("salmon"),
+  peach: accentVar("peach"),
+  copper: accentVar("copper"),
+  clay: accentVar("clay"),
+  sand: accentVar("sand"),
+  dune: accentVar("dune"),
 } as const;
+
+/** Workflow control-flow nodes; they sit in a workflow's step list like a Workflow Step. */
+export const WORKFLOW_CONTROL_TYPES: NodeType[] = ["workflow_parallel", "workflow_loop", "workflow_router", "workflow_branch"];
+
+/** Port id for the else side of a Branch node (matches the backend's ELSE_HANDLE). */
+export const BRANCH_ELSE_HANDLE = "else";
 
 export const NODE_CATALOG: Record<NodeType, NodeDefinition> = {
   input: {
@@ -697,7 +705,7 @@ export const NODE_CATALOG: Record<NodeType, NodeDefinition> = {
     description: "Ordered workflow step that wraps an Agent, Team, or Tool executor.",
     color: AGNO_NODE_COLORS.copper,
     receivesFrom: ["agent", "team", "tool"],
-    sendsTo: ["workflow"],
+    sendsTo: ["workflow", ...WORKFLOW_CONTROL_TYPES],
     createData: (index) => ({
       name: `Workflow Step ${index}`,
       description: "Sequential workflow step.",
@@ -712,8 +720,68 @@ export const NODE_CATALOG: Record<NodeType, NodeDefinition> = {
         requiresUserInput: false,
         userInputMessage: "",
         userInputSchema: "",
+        requiresOutputReview: false,
+        outputReviewMessage: "",
+        reviewTimeout: "" as number | "",
+        onTimeout: "cancel",
         onError: "skip",
       },
+    }),
+  },
+  workflow_parallel: {
+    type: "workflow_parallel",
+    label: "Parallel",
+    category: "Logic",
+    description: "Runs every connected step at the same time (Agno Parallel). Connects into a Workflow like a step.",
+    color: AGNO_NODE_COLORS.coral,
+    receivesFrom: ["workflow_step", ...WORKFLOW_CONTROL_TYPES],
+    sendsTo: ["workflow", ...WORKFLOW_CONTROL_TYPES],
+    createData: (index) => ({
+      name: `Parallel ${index}`,
+      description: "",
+      extras: { stepOrder: index },
+    }),
+  },
+  workflow_loop: {
+    type: "workflow_loop",
+    label: "Loop",
+    category: "Logic",
+    description: "Repeats its connected steps until an end condition holds or the iteration limit is reached (Agno Loop).",
+    color: AGNO_NODE_COLORS.salmon,
+    receivesFrom: ["workflow_step", ...WORKFLOW_CONTROL_TYPES],
+    sendsTo: ["workflow", ...WORKFLOW_CONTROL_TYPES],
+    createData: (index) => ({
+      name: `Loop ${index}`,
+      description: "",
+      extras: { stepOrder: index, maxIterations: 3, endCondition: "", forwardIterationOutput: false },
+    }),
+  },
+  workflow_router: {
+    type: "workflow_router",
+    label: "Router",
+    category: "Logic",
+    description: "Picks which connected step runs, using a rule that returns the step name (Agno Router).",
+    color: AGNO_NODE_COLORS.peach,
+    receivesFrom: ["workflow_step", ...WORKFLOW_CONTROL_TYPES],
+    sendsTo: ["workflow", ...WORKFLOW_CONTROL_TYPES],
+    createData: (index) => ({
+      name: `Router ${index}`,
+      description: "",
+      extras: { stepOrder: index, selector: "" },
+    }),
+  },
+  workflow_branch: {
+    type: "workflow_branch",
+    label: "Branch (if / else)",
+    category: "Logic",
+    description: "Runs the steps on its if port when the rule is true, otherwise the steps on its else port (Agno Condition).",
+    color: AGNO_NODE_COLORS.clay,
+    receivesFrom: ["workflow_step", ...WORKFLOW_CONTROL_TYPES],
+    sendsTo: ["workflow", ...WORKFLOW_CONTROL_TYPES],
+    createData: (index) => ({
+      name: `Branch ${index}`,
+      description: "",
+      extras: { stepOrder: index, evaluator: "" },
     }),
   },
   workflow: {
@@ -722,7 +790,7 @@ export const NODE_CATALOG: Record<NodeType, NodeDefinition> = {
     category: "Core",
     description: "Sequential workflow root that orchestrates ordered steps.",
     color: AGNO_NODE_COLORS.ember,
-    receivesFrom: ["input", "database", "workflow_step"],
+    receivesFrom: ["input", "database", "workflow_step", ...WORKFLOW_CONTROL_TYPES],
     sendsTo: [
       "output",
       "output_api",

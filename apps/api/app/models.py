@@ -24,6 +24,10 @@ class NodeType(StrEnum):
     TEAM = "team"
     WORKFLOW = "workflow"
     WORKFLOW_STEP = "workflow_step"
+    WORKFLOW_PARALLEL = "workflow_parallel"
+    WORKFLOW_LOOP = "workflow_loop"
+    WORKFLOW_ROUTER = "workflow_router"
+    WORKFLOW_BRANCH = "workflow_branch"
     TOOL = "tool"
     SKILLS = "skills"
     INTERFACE = "interface"
@@ -176,6 +180,25 @@ class EmailListenerStatus(BaseModel):
     last_processed_message_key: str | None = None
     last_error: str | None = None
     last_result: str | None = None
+
+
+class ScheduleStatus(BaseModel):
+    flow_name: str
+    node_id: str
+    node_name: str
+    cron: str
+    timezone: str = "UTC"
+    enabled: bool = True
+    status: str = "scheduled"
+    next_run_at: str | None = None
+    last_run_at: str | None = None
+    run_count: int = 0
+    last_result: str | None = None
+    last_error: str | None = None
+
+
+class ListScheduleStatusesResponse(BaseModel):
+    schedules: list[ScheduleStatus] = Field(default_factory=list)
 
 
 class ListEmailListenerStatusesResponse(BaseModel):

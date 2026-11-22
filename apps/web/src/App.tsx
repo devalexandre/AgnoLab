@@ -1,13 +1,7 @@
-import { type ChangeEvent, type MouseEvent as ReactMouseEvent, type WheelEvent as ReactWheelEvent, Suspense, lazy, useEffect, useMemo, useRef, useState } from "react";
-import { API_BASE, deleteFlowByName, fetchCanvasTemplate, fetchDefaultGraph, fetchFlowByName, fetchQueueSubscriberStatus, fetchWhatsappSessionStatus, listBuiltInToolFunctions, listCanvasTemplates, listFlowRuntimeStatuses, listFlows, listOllamaModels, listSkillPaths, previewCode, runFlowByName, runGraph, saveFlow, startQueueSubscriber, startWhatsappSession, stopQueueSubscriber, stopWhatsappSession } from "./api";
+import { type ChangeEvent, type DragEvent as ReactDragEvent, Suspense, lazy, useEffect, useMemo, useRef, useState } from "react";
+import { deleteFlowByName, fetchCanvasTemplate, fetchDefaultGraph, fetchFlowByName, fetchQueueSubscriberStatus, fetchWhatsappSessionStatus, listBuiltInToolFunctions, listCanvasTemplates, listFlowRuntimeStatuses, listFlows, listOllamaModels, listSkillPaths, previewCode, runFlowByName, runGraph, saveFlow, startQueueSubscriber, startWhatsappSession, stopQueueSubscriber, stopWhatsappSession } from "./api";
 import { AGENT_FIELDS, AGENT_FIELD_GROUPS, AGNO_MODEL_PROVIDER_OPTIONS, type AgentFieldDefinition } from "./agentConfig";
-import {
-  buildFlowDraftRouteKey,
-  clearFlowDraftFromStorage,
-  type FlowDraftStorageRecord,
-  loadFlowDraftFromStorage,
-  saveFlowDraftToStorage,
-} from "./flowDraftStorage";
+import { buildFlowDraftRouteKey, clearFlowDraftFromStorage, loadFlowDraftFromStorage, saveFlowDraftToStorage } from "./flowDraftStorage";
 import {
   buildIntegrationSnippet,
   buildWebhookCurlCommand,
@@ -15,26 +9,18 @@ import {
   type IntegrationLanguage,
 } from "./integrationSnippets";
 import {
-  NODE_MIN_HEIGHT,
   NODE_WIDTH,
-  centerGraphInCanvas,
   cloneGraph,
   createNodeId,
   createNodePosition,
-  organizeGraphNodes,
+  copySubgraph,
+  layoutGraphLayered,
+  pasteSubgraph,
+  removeFromGraph,
+  type GraphClipboard,
   updateNodeData,
 } from "./graph";
-import {
-  type HitlAutoApproveSelection,
-  buildInputMetadataFromExtras,
-  graphHasHitlConfirmationGate,
-  normalizeHitlAutoApproveSelection,
-  parseJsonObject,
-  prepareGraphWithResolvedInputMetadata,
-  shouldPromptHitlConfirmation,
-  shouldPromptHitlConfirmationFromRunResult,
-  stringifyJsonObject,
-} from "./hitl";
+import { buildInputMetadataFromExtras, graphHasHitlConfirmationGate, parseJsonObject, prepareGraphWithResolvedInputMetadata, shouldPromptHitlConfirmation, shouldPromptHitlConfirmationFromRunResult, stringifyJsonObject } from "./hitl";
 import {
   getAgentGroupNote,
   getTeamGroupNote,
@@ -42,17 +28,26 @@ import {
   shouldShowTeamField,
 } from "./agentFieldVisibility";
 import { deriveNodeRunBadges, parseDebugObservation } from "./debug";
-import {
-  buildBlankGraph,
-  createClientSecret,
-  createDefaultProjectRuntime,
-  getGraphAuthToken,
-  getGraphProjectRuntime,
-  normalizeImportedFlowPayload,
-} from "./flowNormalize";
-import { MAX_CANVAS_ZOOM, MIN_CANVAS_ZOOM, clampCanvasZoom, isCanvasBackgroundTarget } from "./canvas";
+import { buildBlankGraph, createDefaultProjectRuntime, getGraphAuthToken, getGraphProjectRuntime, normalizeImportedFlowPayload } from "./flowNormalize";
+import FlowCanvas, { LIBRARY_DRAG_MIME, MAX_FLOW_ZOOM, MIN_FLOW_ZOOM, type CanvasNodeView, type FlowCanvasHandle } from "./FlowCanvas";
 import { MarkdownRenderer } from "./markdown";
 import type { MonacoToolEditorProps } from "./MonacoToolEditor";
+import CommandPalette, { type PaletteCommand } from "./CommandPalette";
+import ThemePicker from "./ThemePicker";
+import { renderInspectorPropertyLabel } from "./inspector/fields";
+import WorkflowControlInspector from "./inspector/WorkflowControlInspector";
+import DatabaseInspector from "./inspector/DatabaseInspector";
+import InputInspector from "./inspector/InputInspector";
+import InterfaceInspector from "./inspector/InterfaceInspector";
+import KnowledgeInspector from "./inspector/KnowledgeInspector";
+import LearningMachineInspector from "./inspector/LearningMachineInspector";
+import OutputApiInspector from "./inspector/OutputApiInspector";
+import SkillsInspector from "./inspector/SkillsInspector";
+import ToolInspector from "./inspector/ToolInspector";
+import VectorDbInspector from "./inspector/VectorDbInspector";
+import WorkflowInspector from "./inspector/WorkflowInspector";
+import WorkflowStepInspector from "./inspector/WorkflowStepInspector";
+import { THEMES, applyTheme, getThemeDefinition, loadInitialThemeId, type ThemeId } from "./themes";
 import {
   buildFlowPath,
   buildPersistedFlowSnapshot,
@@ -60,7 +55,7 @@ import {
   getTemplateIdFromSearch,
 } from "./routing";
 import { extractAgentResponse, sanitizeGeneratedCode } from "./runOutput";
-import { downloadAsFile, fieldValueAsString, isObjectRecord, slugifyFlowName } from "./utils";
+import { downloadAsFile, fieldValueAsString, slugifyFlowName } from "./utils";
 
 // Lazy-load the Monaco editor so its (large, bundled) chunk is only fetched when an
 // editor is actually opened, keeping the initial app bundle small.
@@ -73,2164 +68,16 @@ function MonacoToolEditor(props: MonacoToolEditorProps) {
     </Suspense>
   );
 }
-import { NODE_CATALOG, NODE_CATEGORIES, canConnect, listNodeTypes } from "./nodeCatalog";
-import { buildProviderConfig, getProviderDefinition, normalizeProviderId } from "./providerCatalog";
+import { BRANCH_ELSE_HANDLE, NODE_CATALOG, NODE_CATEGORIES, WORKFLOW_CONTROL_TYPES, canConnect, listNodeTypes } from "./nodeCatalog";
+import { getProviderDefinition, normalizeProviderId } from "./providerCatalog";
 import { TEAM_FIELDS, TEAM_FIELD_GROUPS } from "./teamConfig";
 import { STARTER_TOOLS } from "./starterTools";
-import { BUILT_IN_TOOLS, BUILT_IN_TOOL_CATEGORIES, getBuiltInTool, type BuiltInToolDefinition } from "./toolCatalog";
+import { BUILT_IN_TOOLS, BUILT_IN_TOOL_CATEGORIES, type BuiltInToolDefinition } from "./toolCatalog";
 import { ToolIcon, toolIconColor } from "./toolIcons";
-import { BuiltInToolFunctionOption, CanvasGraph, CanvasTemplateSummary, FlowRuntimeStatus, FlowSummary, GraphEdge, GraphNode, NodeData, NodeType, Position, ProjectRuntimeConfig, ProjectRuntimeEnvVar, QueueSubscriberStatus, RunResult, SaveFlowResponse, SavedUserTool, SkillPathOption, StarterToolTemplate, WhatsappSessionStatus } from "./types";
-
-const MY_TOOLS_STORAGE_KEY = "agnolab.my_tools";
-const FLOW_AUTOSAVE_DELAY_MS = 1200;
-const CANVAS_WORLD_MIN = -4000;
-const CANVAS_WORLD_MAX = 8000;
-const CANVAS_ZOOM_STEP = 0.1;
-const HISTORY_MAX_ENTRIES = 80;
-const MINIMAP_WIDTH = 220;
-const MINIMAP_HEIGHT = 140;
-const DEFAULT_SECTION_OPEN = false;
-const FLOW_INPUT_FILE_ACCEPT = [
-  ".pdf",
-  "application/pdf",
-  ".csv",
-  "text/csv",
-  ".json",
-  "application/json",
-  ".md",
-  ".markdown",
-  "text/markdown",
-  "text/x-markdown",
-  ".txt",
-  ".text",
-  "text/plain",
-  ".doc",
-  ".docx",
-  "application/msword",
-  "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-  ".pptx",
-  "application/vnd.openxmlformats-officedocument.presentationml.presentation",
-  ".xls",
-  ".xlsx",
-  "application/vnd.ms-excel",
-  "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-  ".tsv",
-  ".xml",
-  ".yaml",
-  ".yml",
-  ".png",
-  ".jpg",
-  ".jpeg",
-  ".gif",
-  ".webp",
-  "image/*",
-  ".mp3",
-  ".wav",
-  ".ogg",
-  ".m4a",
-  "audio/*",
-  ".mp4",
-  ".mov",
-  ".avi",
-  ".webm",
-  "video/*",
-].join(",");
-const FLOW_INPUT_FILE_SUPPORT_NOTE =
-  "Input accepts docs, images, audio, and video. Knowledge ingestion only indexes supported document formats and skips pure multimodal media files.";
-
-interface DragState {
-  nodeId: string;
-  offsetX: number;
-  offsetY: number;
-}
-
-interface CanvasPanState {
-  startX: number;
-  startY: number;
-  originX: number;
-  originY: number;
-}
-
-interface PointerPosition {
-  x: number;
-  y: number;
-}
-
-interface ChatDraft {
-  text: string;
-  metadata: string;
-  fileAlias: string;
-  fileName: string;
-  fileMimeType: string;
-  fileEncoding: string;
-  fileBase64: string;
-  fileContent: string;
-}
-
-interface ChatMessage {
-  role: "user" | "assistant";
-  text: string;
-  attachmentName?: string;
-}
-
-interface LibraryFeatureCard {
-  key: string;
-  label: string;
-  description: string;
-  helper?: string;
-  badge?: string;
-}
-
-interface IntegrationLibraryItem extends LibraryFeatureCard {
-  status: "available" | "planned";
-}
-
-interface ManagerLibraryItem {
-  key: "memory_manager" | "session_summary_manager" | "compression_manager";
-  label: string;
-  description: string;
-  helper: string;
-}
-
-interface InterfaceLibraryItem {
-  key: "whatsapp" | "telegram" | "slack" | "a2a" | "ag_ui" | "all";
-  label: string;
-  description: string;
-  helper: string;
-  badge?: string;
-}
-
-interface InterfacePresetOption {
-  key: InterfacePresetKey;
-  label: string;
-}
-
-interface LibrarySearchResult {
-  key: string;
-  label: string;
-  description: string;
-  badge?: string;
-  color: string;
-  icon: JSX.Element;
-  onSelect: () => void;
-}
-
-interface SavedFlowIntegrationModalState {
-  name: string;
-  authToken?: string | null;
-}
-
-interface WebhookCurlModalState {
-  title: string;
-  endpoint: string;
-  command: string;
-}
-
-interface WhatsappSessionModalState {
-  flowName: string;
-  nodeId: string;
-  nodeName: string;
-  session?: WhatsappSessionStatus | null;
-}
-
-type QueueNodeType =
-  | "rabbitmq_input"
-  | "rabbitmq_output"
-  | "kafka_input"
-  | "kafka_output"
-  | "redis_input"
-  | "redis_output"
-  | "nats_input"
-  | "nats_output"
-  | "sqs_input"
-  | "sqs_output"
-  | "pubsub_input"
-  | "pubsub_output";
-
-const QUEUE_INPUT_NODE_TYPES = new Set<QueueNodeType>([
-  "rabbitmq_input",
-  "kafka_input",
-  "redis_input",
-  "nats_input",
-  "sqs_input",
-  "pubsub_input",
-]);
-
-function isQueueInputNodeType(type: NodeType): type is QueueNodeType {
-  return QUEUE_INPUT_NODE_TYPES.has(type as QueueNodeType);
-}
-
-function isQueueNodeType(type: NodeType): type is QueueNodeType {
-  return (
-    type === "rabbitmq_input"
-    || type === "rabbitmq_output"
-    || type === "kafka_input"
-    || type === "kafka_output"
-    || type === "redis_input"
-    || type === "redis_output"
-    || type === "nats_input"
-    || type === "nats_output"
-    || type === "sqs_input"
-    || type === "sqs_output"
-    || type === "pubsub_input"
-    || type === "pubsub_output"
-  );
-}
-
-function matchesLibrarySearch(query: string, ...parts: Array<string | undefined | null>): boolean {
-  if (!query) {
-    return true;
-  }
-  return parts.some((part) => (part ?? "").toLowerCase().includes(query));
-}
-
-const VECTOR_DB_LIBRARY_ITEMS: LibraryFeatureCard[] = [
-  {
-    key: "pgvector",
-    label: "PgVector",
-    description: "PostgreSQL extension for vector similarity search.",
-    helper: "from agno.vectordb.pgvector import PgVector",
-    badge: "Production",
-  },
-  {
-    key: "qdrant",
-    label: "Qdrant",
-    description: "High-performance vector database with strong filtering support.",
-    helper: "from agno.vectordb.qdrant import Qdrant",
-    badge: "Filtering",
-  },
-  {
-    key: "chroma",
-    label: "Chroma",
-    description: "Local development vector store for prototyping and experiments.",
-    helper: "from agno.vectordb.chroma import ChromaDb",
-    badge: "Local",
-  },
-  {
-    key: "pinecone",
-    label: "Pinecone",
-    description: "Managed serverless vector database for production retrieval workloads.",
-    helper: "from agno.vectordb.pineconedb import PineconeDb",
-    badge: "Managed",
-  },
-  {
-    key: "lancedb",
-    label: "LanceDB",
-    description: "Embedded vector store for local-first and serverless workflows.",
-    helper: "from agno.vectordb.lancedb import LanceDb",
-    badge: "Embedded",
-  },
-  {
-    key: "weaviate",
-    label: "Weaviate",
-    description: "Hybrid search vector database with GraphQL support.",
-    helper: "from agno.vectordb.weaviate import Weaviate",
-    badge: "Hybrid",
-  },
-];
-
-const KNOWLEDGE_LIBRARY_ITEMS: LibraryFeatureCard[] = [
-  {
-    key: "knowledge-base",
-    label: "Knowledge Base",
-    description: "Knowledge gives agents access to files, URLs, raw text, and domain-specific content at runtime.",
-    helper: "Knowledge(vector_db=...) + Agent(knowledge=knowledge, search_knowledge=True)",
-    badge: "Core",
-  },
-  {
-    key: "contents-db",
-    label: "Contents DB",
-    description: "Optional content tracking layer for visibility, deletion, metadata updates, and filtering.",
-    helper: "Knowledge(vector_db=..., contents_db=PostgresDb(...) )",
-    badge: "Optional",
-  },
-];
-
-const LEARNING_LIBRARY_ITEMS: LibraryFeatureCard[] = [
-  {
-    key: "learning-machine",
-    label: "Learning Machine",
-    description: "Centralizes user profile, memory, session context, learned knowledge, and decision history in a reusable Agno resource.",
-    helper: "LearningMachine(db=..., knowledge=..., user_memory=True, session_context=True)",
-    badge: "Core",
-  },
-];
-
-const SKILLS_LIBRARY_ITEMS: LibraryFeatureCard[] = [
-  {
-    key: "local-skills",
-    label: "Local Skills",
-    description: "Loads a single Agno skill folder or a directory containing multiple skill folders.",
-    helper: "Skills(loaders=[LocalSkills(path=..., validate=True)])",
-    badge: "Agent",
-  },
-];
-
-const DATABASE_LIBRARY_ITEMS: LibraryFeatureCard[] = [
-  {
-    key: "sqlite-db",
-    label: "SqliteDb",
-    description: "Recommended for development and quick local persistence.",
-    helper: "from agno.db.sqlite import SqliteDb",
-    badge: "Dev",
-  },
-  {
-    key: "postgres-db",
-    label: "PostgresDb",
-    description: "Recommended by Agno for production session, context, memory, and knowledge storage.",
-    helper: "from agno.db.postgres import PostgresDb",
-    badge: "Prod",
-  },
-  {
-    key: "mongo-db",
-    label: "MongoDb",
-    description: "Supported backend for content and persistence use cases.",
-    helper: "from agno.db.mongo import MongoDb",
-    badge: "Supported",
-  },
-  {
-    key: "async-postgres-db",
-    label: "AsyncPostgresDb",
-    description: "Async database backend for async Agno applications.",
-    helper: "from agno.db.postgres import AsyncPostgresDb",
-    badge: "Async",
-  },
-];
-
-const MANAGER_LIBRARY_ITEMS: ManagerLibraryItem[] = [
-  {
-    key: "memory_manager",
-    label: "Memory Manager",
-    description: "Controls how memories are extracted, optimized, and written for the agent.",
-    helper: "from agno.memory import MemoryManager",
-  },
-  {
-    key: "session_summary_manager",
-    label: "Session Summary Manager",
-    description: "Builds concise summaries for long session history and summary-based context.",
-    helper: "from agno.session.summary import SessionSummaryManager",
-  },
-  {
-    key: "compression_manager",
-    label: "Compression Manager",
-    description: "Compresses tool results to keep context usage smaller over long runs.",
-    helper: "from agno.compression.manager import CompressionManager",
-  },
-];
-
-const INTERFACE_LIBRARY_ITEMS: InterfaceLibraryItem[] = [
-  {
-    key: "whatsapp",
-    label: "WhatsApp",
-    description: "Serve Agent/Team via WhatsApp webhook.",
-    helper: 'from agno.os.interfaces.whatsapp import Whatsapp\nWhatsapp(agent=agent, phone_number_id=os.getenv("WHATSAPP_PHONE_NUMBER_ID"), access_token=os.getenv("WHATSAPP_ACCESS_TOKEN"), verify_token=os.getenv("WHATSAPP_VERIFY_TOKEN"))',
-    badge: "Template",
-  },
-  {
-    key: "telegram",
-    label: "Telegram",
-    description: "Serve Agent/Team via Telegram bot updates.",
-    helper: 'from agno.os.interfaces.telegram import Telegram\nTelegram(agent=agent, token=os.getenv("TELEGRAM_BOT_TOKEN"))',
-  },
-  {
-    key: "slack",
-    label: "Slack",
-    description: "Serve Agent/Team via Slack events.",
-    helper: 'from agno.os.interfaces.slack import Slack\nSlack(agent=agent, token=os.getenv("SLACK_BOT_TOKEN"), signing_secret=os.getenv("SLACK_SIGNING_SECRET"))',
-  },
-  {
-    key: "a2a",
-    label: "A2A",
-    description: "Expose Agent/Team over Agent-to-Agent interface.",
-    helper: "from agno.os.interfaces.a2a import A2A\nA2A(agents=[agent])",
-  },
-  {
-    key: "ag_ui",
-    label: "AG-UI",
-    description: "Interface for AG-UI clients.",
-    helper: "from agno.os.interfaces.agui import AGUI\nAGUI(agent=agent)",
-  },
-  {
-    key: "all",
-    label: "All Interfaces",
-    description: "Register multiple interfaces at once.",
-    helper: "Use multiple interface nodes connected to the same Agent/Team.",
-    badge: "Bundle",
-  },
-];
-
-const INTEGRATION_INPUT_LIBRARY_ITEMS: IntegrationLibraryItem[] = [
-  {
-    key: "email-inbox",
-    label: "Email Inbox Input",
-    description: "Starts a background inbox monitor after save and runs the flow with the newest email that matches the configured filters.",
-    helper: "Supports IMAP/POP, host, port, security, mailbox, unread-only, subject, sender, recipient, and body keyword filters.",
-    badge: "IMAP/POP",
-    status: "available",
-  },
-  {
-    key: "webhook-input",
-    label: "Webhook Input",
-    description: "Accept inbound HTTP requests as flow triggers with headers, payload parsing, and optional shared-secret validation.",
-    helper: "Useful for Stripe, GitHub, WhatsApp, and custom app callbacks.",
-    badge: "HTTP",
-    status: "available",
-  },
-  {
-    key: "whatsapp-input",
-    label: "WhatsApp Input",
-    description: "Connect a WhatsApp session with QR scan, listen to incoming messages, and feed each matching message into the flow.",
-    helper: "Uses a WPPConnect gateway session plus webhook callbacks for real-time trigger and auto-reply.",
-    badge: "QR + Listen",
-    status: "available",
-  },
-  {
-    key: "queue-input",
-    label: "Queue Input",
-    description: "Consume messages from SQS, RabbitMQ, Kafka, or Redis streams and map them to flow input.",
-    helper: "Designed for background jobs and event-driven pipelines.",
-    badge: "Planned",
-    status: "planned",
-  },
-  {
-    key: "form-input",
-    label: "Form Submission Input",
-    description: "Receive structured form fields and uploaded files from a multipart or URL-encoded form endpoint.",
-    helper: "Good fit for intake workflows, onboarding, and support requests.",
-    badge: "FormData",
-    status: "available",
-  },
-];
-
-const INTEGRATION_OUTPUT_LIBRARY_ITEMS: IntegrationLibraryItem[] = [
-  {
-    key: "api-output",
-    label: "API Output",
-    description: "POST the final result to an external API with custom headers and payload placeholders.",
-    helper: 'Supports metadata placeholders like "tenant": $tenant in Additional Payload JSON.',
-    badge: "POST",
-    status: "available",
-  },
-  {
-    key: "smtp-output",
-    label: "Email Send Output",
-    description: "Send an email summary, reply, or alert when the flow finishes.",
-    helper: "Supports SMTP, recipients, template placeholders, and optional forwarding of input files as attachments.",
-    badge: "SMTP",
-    status: "available",
-  },
-  {
-    key: "chat-output",
-    label: "Chat Message Output",
-    description: "Push a completion message to Slack, Discord, Telegram, or a generic webhook endpoint.",
-    helper: "Useful for approvals, alerts, and operational updates.",
-    badge: "Chat",
-    status: "available",
-  },
-  {
-    key: "sheet-output",
-    label: "Spreadsheet Output",
-    description: "Append structured rows to a local CSV spreadsheet file after each run.",
-    helper: "Great for ops logs, CRM updates, and lightweight audit trails.",
-    badge: "CSV",
-    status: "available",
-  },
-];
-
-const AGNO_OUTPUT_FORMAT_OPTIONS = [
-  { value: "text", label: "Text" },
-  { value: "markdown", label: "Markdown" },
-  { value: "json", label: "JSON" },
-  { value: "yaml", label: "YAML" },
-  { value: "xml", label: "XML" },
-  { value: "csv", label: "CSV" },
-  { value: "html", label: "HTML" },
-] as const;
-
-type VectorDbPresetKey = "pgvector" | "qdrant" | "chroma" | "pinecone" | "lancedb" | "weaviate";
-type DatabasePresetKey = "sqlite-db" | "postgres-db" | "mongo-db" | "async-postgres-db";
-type InterfacePresetKey = "whatsapp" | "telegram" | "slack" | "a2a" | "ag_ui" | "all";
-const INTERFACE_PRESET_OPTIONS: InterfacePresetOption[] = INTERFACE_LIBRARY_ITEMS.map((item) => ({
-  key: item.key,
-  label: item.label,
-}));
-type KnowledgeReaderKey = "auto" | "pdf" | "csv" | "field_labeled_csv" | "excel" | "docx" | "pptx" | "json" | "markdown" | "text";
-
-const DATABASE_DEPENDENT_AGENT_FIELDS = new Set([
-  "db",
-  "overwrite_db_session_state",
-  "search_session_history",
-  "num_history_sessions",
-  "add_history_to_context",
-  "num_history_runs",
-  "num_history_messages",
-  "read_chat_history",
-  "read_tool_call_history",
-  "store_history_messages",
-  "memory_manager",
-  "enable_agentic_memory",
-  "update_memory_on_run",
-  "add_memories_to_context",
-  "enable_session_summaries",
-  "add_session_summary_to_context",
-  "session_summary_manager",
-  "compress_tool_results",
-  "learning",
-]);
-
-const KNOWLEDGE_DEPENDENT_AGENT_FIELDS = new Set([
-  "knowledge",
-  "knowledge_filters",
-  "enable_agentic_knowledge_filters",
-  "add_knowledge_to_context",
-  "knowledge_retriever",
-  "references_format",
-  "search_knowledge",
-  "update_knowledge",
-]);
-
-const COMPONENT_SELECT_AGENT_FIELDS = new Set([
-  "db",
-  "knowledge",
-  "skills",
-  "learning_machine",
-  "memory_manager",
-  "session_summary_manager",
-  "compression_manager",
-]);
-
-const DATABASE_DEPENDENT_TEAM_FIELDS = new Set([
-  "db",
-  "overwrite_db_session_state",
-  "search_session_history",
-  "num_history_sessions",
-  "add_history_to_context",
-  "num_history_runs",
-  "num_history_messages",
-  "read_chat_history",
-  "store_history_messages",
-  "memory_manager",
-  "enable_agentic_memory",
-  "update_memory_on_run",
-  "add_memories_to_context",
-  "enable_session_summaries",
-  "add_session_summary_to_context",
-  "session_summary_manager",
-  "compress_tool_results",
-  "learning",
-]);
-
-const KNOWLEDGE_DEPENDENT_TEAM_FIELDS = new Set([
-  "knowledge",
-  "knowledge_filters",
-  "enable_agentic_knowledge_filters",
-  "add_knowledge_to_context",
-  "knowledge_retriever",
-  "references_format",
-  "search_knowledge",
-  "update_knowledge",
-]);
-
-const COMPONENT_SELECT_TEAM_FIELDS = new Set([
-  "db",
-  "knowledge",
-  "learning_machine",
-  "memory_manager",
-  "session_summary_manager",
-  "compression_manager",
-]);
-
-const KNOWLEDGE_READER_OPTIONS: Array<{ key: KnowledgeReaderKey; label: string; description: string }> = [
-  { key: "auto", label: "Auto Detect", description: "Use Agno's default reader selection based on file extension and MIME type." },
-  { key: "pdf", label: "PDF Reader", description: "For PDF documents with optional page splitting and password support." },
-  { key: "csv", label: "CSV Reader", description: "For standard CSV files and tabular ingestion." },
-  { key: "field_labeled_csv", label: "Field-Labeled CSV", description: "Turns CSV rows into labeled text for better retrieval context." },
-  { key: "excel", label: "Excel Reader", description: "For `.xlsx` and `.xls` workbooks." },
-  { key: "docx", label: "Word Reader", description: "For `.doc` and `.docx` documents." },
-  { key: "pptx", label: "PowerPoint Reader", description: "For `.pptx` slide decks." },
-  { key: "json", label: "JSON Reader", description: "For JSON files and structured payloads." },
-  { key: "markdown", label: "Markdown Reader", description: "For `.md` and `.markdown` files." },
-  { key: "text", label: "Text Reader", description: "For plain text ingestion or forcing text mode." },
-];
-
-function getAgentConfig(data: NodeData): Record<string, unknown> {
-  return (data.extras?.agentConfig as Record<string, unknown> | undefined) ?? {};
-}
-
-function updateAgentConfig(data: NodeData, key: string, value: unknown): NodeData {
-  return {
-    ...data,
-    extras: {
-      ...(data.extras ?? {}),
-      agentConfig: {
-        ...getAgentConfig(data),
-        [key]: value,
-      },
-    },
-  };
-}
-
-function getTeamConfig(data: NodeData): Record<string, unknown> {
-  return (data.extras?.teamConfig as Record<string, unknown> | undefined) ?? {};
-}
-
-function updateTeamConfig(data: NodeData, key: string, value: unknown): NodeData {
-  return {
-    ...data,
-    extras: {
-      ...(data.extras ?? {}),
-      teamConfig: {
-        ...getTeamConfig(data),
-        [key]: value,
-      },
-    },
-  };
-}
-
-function getWorkflowConfig(data: NodeData): Record<string, unknown> {
-  return (data.extras?.workflowConfig as Record<string, unknown> | undefined) ?? {};
-}
-
-function updateWorkflowConfig(data: NodeData, key: string, value: unknown): NodeData {
-  return {
-    ...data,
-    extras: {
-      ...(data.extras ?? {}),
-      workflowConfig: {
-        ...getWorkflowConfig(data),
-        [key]: value,
-      },
-    },
-  };
-}
-
-function getProviderConfig(data: NodeData): Record<string, unknown> {
-  return (data.extras?.providerConfig as Record<string, unknown> | undefined) ?? {};
-}
-
-function updateProviderConfig(data: NodeData, key: string, value: unknown): NodeData {
-  return {
-    ...data,
-    extras: {
-      ...(data.extras ?? {}),
-      providerConfig: {
-        ...getProviderConfig(data),
-        [key]: value,
-      },
-    },
-  };
-}
-
-function applyProviderPreset(data: NodeData, providerPresetId: string): NodeData {
-  const normalizedPreset = providerPresetId.trim().toLowerCase();
-  if (!normalizedPreset) {
-    return updateProviderConfig(data, "provider_profile", "");
-  }
-
-  const providerDefinition = getProviderDefinition(normalizedPreset);
-  if (!providerDefinition) {
-    return updateProviderConfig(data, "provider_profile", normalizedPreset);
-  }
-
-  const nextProviderConfig = {
-    ...buildProviderConfig(providerDefinition.id),
-    ...getProviderConfig(data),
-    provider_profile: providerDefinition.id,
-    provider_api_key_env: providerDefinition.key,
-    provider_api_key: "",
-    provider_base_url_env: providerDefinition.baseUrlEnv ?? "",
-    provider_base_url: providerDefinition.url,
-    provider_execution_timeout_seconds: providerDefinition.supportsLocalModels ? "120" : "",
-  };
-
-  return {
-    ...data,
-    provider: providerDefinition.id,
-    model: providerDefinition.model,
-    extras: {
-      ...(data.extras ?? {}),
-      providerConfig: nextProviderConfig,
-    },
-  };
-}
-
-function updateToolConfig(data: NodeData, patch: Record<string, unknown>): NodeData {
-  return {
-    ...data,
-    extras: {
-      ...(data.extras ?? {}),
-      ...patch,
-    },
-  };
-}
-
-function createBuiltInToolData(tool: BuiltInToolDefinition, index: number): NodeData {
-  return {
-    name: tool.label,
-    description: tool.description,
-    extras: {
-      toolMode: "builtin",
-      builtinToolKey: tool.key,
-      builtinImportPath: tool.importPath,
-      builtinClassName: tool.className,
-      builtinConfig: tool.configTemplate ?? "",
-      builtinWorkflowFunction: "",
-      builtinWorkflowExecutorArgs: "",
-      functionName: `tool_${index}`,
-      functionCode: `def tool_${index}(value: str) -> str:\n    return value\n`,
-    },
-  };
-}
-
-function createSavedToolNodeData(tool: SavedUserTool): NodeData {
-  return {
-    name: tool.name,
-    description: tool.description,
-    extras: {
-      toolMode: "function",
-      functionName: tool.functionName,
-      functionCode: tool.functionCode,
-    },
-  };
-}
-
-function createStarterToolNodeData(tool: StarterToolTemplate): NodeData {
-  return {
-    name: tool.name,
-    description: tool.description,
-    extras: {
-      toolMode: "function",
-      functionName: tool.functionName,
-      functionCode: tool.functionCode,
-    },
-  };
-}
-
-function toPythonString(value: string): string {
-  return JSON.stringify(value);
-}
-
-function buildSqliteDbFilePath(directory: string, dbName: string): string {
-  const normalizedDirectory = fieldValueAsString(directory).trim().replace(/[\\/]+$/, "");
-  const normalizedName = fieldValueAsString(dbName).trim() || "agno";
-  return normalizedDirectory ? `${normalizedDirectory}/${normalizedName}.db` : `${normalizedName}.db`;
-}
-
-function getDefaultVectorDbExtras(vectorPreset: VectorDbPresetKey): Record<string, unknown> {
-  switch (vectorPreset) {
-    case "pgvector":
-      return {
-        vectorTableName: "documents",
-        vectorDbUrl: "postgresql+psycopg://ai:ai@localhost:5532/ai",
-      };
-    case "qdrant":
-      return {
-        vectorCollection: "documents",
-        vectorUrl: "http://localhost:6333",
-      };
-    case "chroma":
-      return {
-        vectorCollection: "documents",
-        vectorPath: "tmp/chroma",
-      };
-    case "pinecone":
-      return {
-        vectorName: "documents",
-        vectorDimension: "1536",
-        vectorMetric: "cosine",
-      };
-    case "lancedb":
-      return {
-        vectorUri: "tmp/lancedb",
-        vectorTableName: "documents",
-      };
-    case "weaviate":
-      return {
-        vectorCollection: "documents",
-        vectorUrl: "http://localhost:8080",
-      };
-    default:
-      return {
-        vectorTableName: "documents",
-        vectorDbUrl: "postgresql+psycopg://ai:ai@localhost:5532/ai",
-      };
-  }
-}
-
-function buildVectorDbExpressionFromExtras(vectorPreset: VectorDbPresetKey, extras: Record<string, unknown> | undefined): string {
-  const safeExtras = {
-    ...getDefaultVectorDbExtras(vectorPreset),
-    ...(extras ?? {}),
-  };
-
-  switch (vectorPreset) {
-    case "pgvector": {
-      const tableName = fieldValueAsString(safeExtras.vectorTableName) || "documents";
-      const dbUrl = fieldValueAsString(safeExtras.vectorDbUrl) || "postgresql+psycopg://ai:ai@localhost:5532/ai";
-      return `PgVector(table_name=${toPythonString(tableName)}, db_url=${toPythonString(dbUrl)})`;
-    }
-    case "qdrant": {
-      const collection = fieldValueAsString(safeExtras.vectorCollection) || "documents";
-      const url = fieldValueAsString(safeExtras.vectorUrl) || "http://localhost:6333";
-      return `Qdrant(collection=${toPythonString(collection)}, url=${toPythonString(url)})`;
-    }
-    case "chroma": {
-      const collection = fieldValueAsString(safeExtras.vectorCollection) || "documents";
-      const path = fieldValueAsString(safeExtras.vectorPath) || "tmp/chroma";
-      return `ChromaDb(collection=${toPythonString(collection)}, path=${toPythonString(path)})`;
-    }
-    case "pinecone": {
-      const name = fieldValueAsString(safeExtras.vectorName) || "documents";
-      const dimension = Number(fieldValueAsString(safeExtras.vectorDimension) || "1536");
-      const metric = fieldValueAsString(safeExtras.vectorMetric) || "cosine";
-      return `PineconeDb(name=${toPythonString(name)}, dimension=${Number.isFinite(dimension) ? dimension : 1536}, metric=${toPythonString(metric)})`;
-    }
-    case "lancedb": {
-      const uri = fieldValueAsString(safeExtras.vectorUri) || "tmp/lancedb";
-      const tableName = fieldValueAsString(safeExtras.vectorTableName) || "documents";
-      return `LanceDb(uri=${toPythonString(uri)}, table_name=${toPythonString(tableName)})`;
-    }
-    case "weaviate": {
-      const collection = fieldValueAsString(safeExtras.vectorCollection) || "documents";
-      const url = fieldValueAsString(safeExtras.vectorUrl) || "http://localhost:8080";
-      return `Weaviate(collection=${toPythonString(collection)}, url=${toPythonString(url)})`;
-    }
-    default:
-      return 'PgVector(table_name="documents", db_url="postgresql+psycopg://ai:ai@localhost:5532/ai")';
-  }
-}
-
-function escapeRegExp(value: string): string {
-  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
-
-function parsePythonStringKwarg(expression: string, key: string): string | null {
-  const match = expression.match(new RegExp(`\\b${escapeRegExp(key)}\\s*=\\s*(\"(?:[^\"\\\\]|\\\\.)*\"|'(?:[^'\\\\]|\\\\.)*')`));
-  if (!match) {
-    return null;
-  }
-  const raw = match[1];
-  return raw.slice(1, -1).replace(/\\\\/g, "\\").replace(/\\"/g, "\"").replace(/\\'/g, "'");
-}
-
-function parsePythonNumberKwarg(expression: string, key: string): string | null {
-  const match = expression.match(new RegExp(`\\b${escapeRegExp(key)}\\s*=\\s*(-?\\d+(?:\\.\\d+)?)`));
-  return match?.[1] ?? null;
-}
-
-function resolveVectorDbConfig(vectorPreset: VectorDbPresetKey, extras: Record<string, unknown> | undefined): Record<string, unknown> {
-  const safeExtras = extras ?? {};
-  const defaults = getDefaultVectorDbExtras(vectorPreset);
-  const currentExpression = fieldValueAsString(safeExtras.vectorExpression);
-  const resolveString = (fieldKey: string, kwargKey: string) =>
-    fieldValueAsString(safeExtras[fieldKey]) || parsePythonStringKwarg(currentExpression, kwargKey) || fieldValueAsString(defaults[fieldKey]);
-  const resolveNumber = (fieldKey: string, kwargKey: string) =>
-    fieldValueAsString(safeExtras[fieldKey]) || parsePythonNumberKwarg(currentExpression, kwargKey) || fieldValueAsString(defaults[fieldKey]);
-
-  switch (vectorPreset) {
-    case "pgvector":
-      return {
-        vectorTableName: resolveString("vectorTableName", "table_name"),
-        vectorDbUrl: resolveString("vectorDbUrl", "db_url"),
-      };
-    case "qdrant":
-      return {
-        vectorCollection: resolveString("vectorCollection", "collection"),
-        vectorUrl: resolveString("vectorUrl", "url"),
-      };
-    case "chroma":
-      return {
-        vectorCollection: resolveString("vectorCollection", "collection"),
-        vectorPath: resolveString("vectorPath", "path"),
-      };
-    case "pinecone":
-      return {
-        vectorName: resolveString("vectorName", "name"),
-        vectorDimension: resolveNumber("vectorDimension", "dimension"),
-        vectorMetric: resolveString("vectorMetric", "metric"),
-      };
-    case "lancedb":
-      return {
-        vectorUri: resolveString("vectorUri", "uri"),
-        vectorTableName: resolveString("vectorTableName", "table_name"),
-      };
-    case "weaviate":
-      return {
-        vectorCollection: resolveString("vectorCollection", "collection"),
-        vectorUrl: resolveString("vectorUrl", "url"),
-      };
-    default:
-      return getDefaultVectorDbExtras("pgvector");
-  }
-}
-
-function hasStructuredVectorDbConfig(vectorPreset: VectorDbPresetKey, extras: Record<string, unknown> | undefined): boolean {
-  const safeExtras = extras ?? {};
-  switch (vectorPreset) {
-    case "pgvector":
-      return safeExtras.vectorTableName !== undefined || safeExtras.vectorDbUrl !== undefined;
-    case "qdrant":
-    case "weaviate":
-      return safeExtras.vectorCollection !== undefined || safeExtras.vectorUrl !== undefined;
-    case "chroma":
-      return safeExtras.vectorCollection !== undefined || safeExtras.vectorPath !== undefined;
-    case "pinecone":
-      return safeExtras.vectorName !== undefined || safeExtras.vectorDimension !== undefined || safeExtras.vectorMetric !== undefined;
-    case "lancedb":
-      return safeExtras.vectorUri !== undefined || safeExtras.vectorTableName !== undefined;
-    default:
-      return false;
-  }
-}
-
-function getDefaultKnowledgeExtras(variant: "knowledge" | "knowledge_contents"): Record<string, unknown> {
-  return {
-    knowledgeName: "",
-    knowledgeDescription: "",
-    knowledgeMaxResults: "10",
-    knowledgeIsolateVectorSearch: false,
-    knowledgeReader: "auto",
-    knowledgeSplitOnPages: true,
-    knowledgePassword: "",
-    knowledgeExcelSheets: "",
-    knowledgeCsvChunkTitle: "",
-    knowledgeCsvFieldNames: "",
-    knowledgeCsvFormatHeaders: true,
-    knowledgeCsvSkipEmptyFields: true,
-    ingestAttachedFiles: true,
-    ingestInputText: false,
-    staticText: "",
-    staticUrls: "",
-    includeContentsDb: variant === "knowledge_contents",
-    contentsDbExpression: 'PostgresDb(db_url="postgresql://ai:ai@localhost:5532/ai")',
-  };
-}
-
-function getDefaultSkillsExtras(): Record<string, unknown> {
-  return {
-    skillsPath: "examples/skills/support-response-style",
-    skillsValidate: true,
-  };
-}
-
-function buildSkillsExpressionFromExtras(extras: Record<string, unknown> | undefined): string {
-  const safeExtras = {
-    ...getDefaultSkillsExtras(),
-    ...(extras ?? {}),
-  };
-  const path = fieldValueAsString(safeExtras.skillsPath).trim();
-  const validate = safeExtras.skillsValidate !== false;
-  return `Skills(loaders=[LocalSkills(path=${toPythonString(path)}, validate=${validate ? "True" : "False"})])`;
-}
-
-function buildKnowledgeExpressionFromExtras(
-  extras: Record<string, unknown> | undefined,
-  vectorExpression?: string,
-  nodeName?: string,
-  nodeDescription?: string | null,
-): string {
-  const safeExtras = {
-    ...getDefaultKnowledgeExtras("knowledge"),
-    ...(extras ?? {}),
-  };
-  const args: string[] = [];
-  const knowledgeName = (nodeName || fieldValueAsString(safeExtras.knowledgeName)).trim();
-  const knowledgeDescription = (nodeDescription || fieldValueAsString(safeExtras.knowledgeDescription)).trim();
-  const maxResults = Number(fieldValueAsString(safeExtras.knowledgeMaxResults) || "10");
-  const isolateVectorSearch = Boolean(safeExtras.knowledgeIsolateVectorSearch);
-  const resolvedVectorExpression = vectorExpression || fieldValueAsString(safeExtras.vectorExpression) || buildVectorDbExpression("pgvector");
-
-  if (knowledgeName) {
-    args.push(`name=${toPythonString(knowledgeName)}`);
-  }
-  if (knowledgeDescription) {
-    args.push(`description=${toPythonString(knowledgeDescription)}`);
-  }
-  args.push(`vector_db=${resolvedVectorExpression}`);
-  if (Boolean(safeExtras.includeContentsDb)) {
-    const contentsExpression =
-      fieldValueAsString(safeExtras.contentsDbExpression).trim() || 'PostgresDb(db_url="postgresql://ai:ai@localhost:5532/ai")';
-    args.push(`contents_db=${contentsExpression}`);
-  }
-  args.push(`max_results=${Number.isFinite(maxResults) && maxResults > 0 ? Math.round(maxResults) : 10}`);
-  if (isolateVectorSearch) {
-    args.push("isolate_vector_search=True");
-  }
-
-  return `Knowledge(${args.join(", ")})`;
-}
-
-function buildKnowledgeExpression(vectorPreset: VectorDbPresetKey): string {
-  return buildKnowledgeExpressionFromExtras(
-    {
-      ...getDefaultKnowledgeExtras("knowledge"),
-      vectorExpression: buildVectorDbExpression(vectorPreset),
-    },
-    buildVectorDbExpression(vectorPreset),
-  );
-}
-
-function buildVectorDbExpression(vectorPreset: VectorDbPresetKey): string {
-  return buildVectorDbExpressionFromExtras(vectorPreset, getDefaultVectorDbExtras(vectorPreset));
-}
-
-function buildDatabaseExpression(preset: DatabasePresetKey): string {
-  switch (preset) {
-    case "sqlite-db":
-      return 'SqliteDb(db_file="tmp/agno.db")';
-    case "postgres-db":
-      return 'PostgresDb(db_url="postgresql://ai:ai@localhost:5532/ai")';
-    case "mongo-db":
-      return 'MongoDb(db_url="mongodb://localhost:27017/agno")';
-    case "async-postgres-db":
-      return 'AsyncPostgresDb(db_url="postgresql+psycopg_async://ai:ai@localhost:5532/ai")';
-    default:
-      return 'SqliteDb(db_file="tmp/agno.db")';
-  }
-}
-
-function buildDatabaseExpressionFromExtras(preset: DatabasePresetKey, extras: Record<string, unknown> | undefined): string {
-  const safeExtras = extras ?? {};
-
-  if (preset === "sqlite-db") {
-    const directory = fieldValueAsString(safeExtras.dbDirectory) || "tmp";
-    const dbName = fieldValueAsString(safeExtras.dbName) || "agno";
-    return `SqliteDb(db_file=${toPythonString(buildSqliteDbFilePath(directory, dbName))})`;
-  }
-
-  if (preset === "postgres-db" || preset === "async-postgres-db") {
-    const username = fieldValueAsString(safeExtras.dbUsername) || "ai";
-    const password = fieldValueAsString(safeExtras.dbPassword) || "ai";
-    const host = fieldValueAsString(safeExtras.dbHost) || "localhost";
-    const port = fieldValueAsString(safeExtras.dbPort) || "5532";
-    const dbName = fieldValueAsString(safeExtras.dbName) || "ai";
-    const scheme = preset === "async-postgres-db" ? "postgresql+psycopg_async" : "postgresql";
-    return `${preset === "async-postgres-db" ? "AsyncPostgresDb" : "PostgresDb"}(db_url=${toPythonString(`${scheme}://${username}:${password}@${host}:${port}/${dbName}`)})`;
-  }
-
-  if (preset === "mongo-db") {
-    const username = fieldValueAsString(safeExtras.dbUsername);
-    const password = fieldValueAsString(safeExtras.dbPassword);
-    const host = fieldValueAsString(safeExtras.dbHost) || "localhost";
-    const port = fieldValueAsString(safeExtras.dbPort) || "27017";
-    const dbName = fieldValueAsString(safeExtras.dbName) || "agno";
-    const auth = username ? `${username}${password ? `:${password}` : ""}@` : "";
-    return `MongoDb(db_url=${toPythonString(`mongodb://${auth}${host}:${port}/${dbName}`)})`;
-  }
-
-  return buildDatabaseExpression(preset);
-}
-
-function buildManagerExpressionFromExtras(
-  type: "memory_manager" | "session_summary_manager" | "compression_manager",
-  extras: Record<string, unknown> | undefined,
-): string {
-  const safeExtras = extras ?? {};
-
-  if (type === "memory_manager") {
-    const args: string[] = [];
-    const systemMessage = fieldValueAsString(safeExtras.systemMessage);
-    const memoryCaptureInstructions = fieldValueAsString(safeExtras.memoryCaptureInstructions);
-    const additionalInstructions = fieldValueAsString(safeExtras.additionalInstructions);
-    const debugMode = Boolean(safeExtras.debugMode);
-
-    if (systemMessage) {
-      args.push(`system_message=${toPythonString(systemMessage)}`);
-    }
-    if (memoryCaptureInstructions) {
-      args.push(`memory_capture_instructions=${toPythonString(memoryCaptureInstructions)}`);
-    }
-    if (additionalInstructions) {
-      args.push(`additional_instructions=${toPythonString(additionalInstructions)}`);
-    }
-    if (debugMode) {
-      args.push("debug_mode=True");
-    }
-
-    return `MemoryManager(${args.join(", ")})`;
-  }
-
-  if (type === "session_summary_manager") {
-    const args: string[] = [];
-    const sessionSummaryPrompt = fieldValueAsString(safeExtras.sessionSummaryPrompt);
-    const summaryRequestMessage = fieldValueAsString(safeExtras.summaryRequestMessage);
-
-    if (sessionSummaryPrompt) {
-      args.push(`session_summary_prompt=${toPythonString(sessionSummaryPrompt)}`);
-    }
-    if (summaryRequestMessage) {
-      args.push(`summary_request_message=${toPythonString(summaryRequestMessage)}`);
-    }
-
-    return `SessionSummaryManager(${args.join(", ")})`;
-  }
-
-  const args: string[] = [];
-  const compressToolResults = safeExtras.compressToolResults;
-  const compressToolResultsLimit = fieldValueAsString(safeExtras.compressToolResultsLimit);
-  const compressTokenLimit = fieldValueAsString(safeExtras.compressTokenLimit);
-  const compressToolCallInstructions = fieldValueAsString(safeExtras.compressToolCallInstructions);
-
-  if (compressToolResults === false) {
-    args.push("compress_tool_results=False");
-  }
-  if (compressToolResultsLimit) {
-    args.push(`compress_tool_results_limit=${Number(compressToolResultsLimit)}`);
-  }
-  if (compressTokenLimit) {
-    args.push(`compress_token_limit=${Number(compressTokenLimit)}`);
-  }
-  if (compressToolCallInstructions) {
-    args.push(`compress_tool_call_instructions=${toPythonString(compressToolCallInstructions)}`);
-  }
-
-  return `CompressionManager(${args.join(", ")})`;
-}
-
-function getDefaultLearningMachineExtras(): Record<string, unknown> {
-  return {
-    useLearningModel: false,
-    learningNamespace: "global",
-    learningDebugMode: false,
-    learningUserProfile: true,
-    learningUserMemory: true,
-    learningSessionContext: true,
-    learningEntityMemory: false,
-    learningLearnedKnowledge: true,
-    learningDecisionLog: true,
-  };
-}
-
-function buildLearningMachineExpressionFromExtras(
-  extras: Record<string, unknown> | undefined,
-  connectedDbExpression?: string,
-  connectedKnowledgeExpression?: string,
-  learningModelPreview?: string,
-): string {
-  const safeExtras = {
-    ...getDefaultLearningMachineExtras(),
-    ...(extras ?? {}),
-  };
-  const args: string[] = [];
-
-  if (connectedDbExpression) {
-    args.push(`db=${connectedDbExpression}`);
-  }
-  if (connectedKnowledgeExpression) {
-    args.push(`knowledge=${connectedKnowledgeExpression}`);
-  }
-  if (learningModelPreview) {
-    args.push(`model=${learningModelPreview}`);
-  }
-
-  const namespace = fieldValueAsString(safeExtras.learningNamespace).trim() || "global";
-  args.push(`namespace=${toPythonString(namespace)}`);
-
-  if (Boolean(safeExtras.learningUserProfile)) {
-    args.push("user_profile=True");
-  }
-  if (Boolean(safeExtras.learningUserMemory)) {
-    args.push("user_memory=True");
-  }
-  if (Boolean(safeExtras.learningSessionContext)) {
-    args.push("session_context=True");
-  }
-  if (Boolean(safeExtras.learningEntityMemory)) {
-    args.push("entity_memory=True");
-  }
-  if (Boolean(safeExtras.learningLearnedKnowledge)) {
-    args.push("learned_knowledge=True");
-  }
-  if (Boolean(safeExtras.learningDecisionLog)) {
-    args.push("decision_log=True");
-  }
-  if (Boolean(safeExtras.learningDebugMode)) {
-    args.push("debug_mode=True");
-  }
-
-  return `LearningMachine(${args.join(", ")})`;
-}
-
-function listSupportedTimeZones(): string[] {
-  const intlWithSupportedValues = Intl as unknown as {
-    supportedValuesOf?: (key: string) => string[];
-  };
-
-  if (typeof intlWithSupportedValues.supportedValuesOf === "function") {
-    return intlWithSupportedValues.supportedValuesOf("timeZone");
-  }
-
-  return [
-    "UTC",
-    "America/New_York",
-    "America/Chicago",
-    "America/Denver",
-    "America/Los_Angeles",
-    "America/Sao_Paulo",
-    "Europe/London",
-    "Europe/Paris",
-    "Europe/Berlin",
-    "Asia/Tokyo",
-    "Asia/Shanghai",
-    "Asia/Dubai",
-    "Australia/Sydney",
-  ];
-}
-
-function getDefaultInterfaceExtras(): Record<string, unknown> {
-  return {
-    interfacePreset: "whatsapp",
-    interfaceTargetType: "agent",
-    whatsappPhoneNumberIdEnv: "WHATSAPP_PHONE_NUMBER_ID",
-    whatsappAccessTokenEnv: "WHATSAPP_ACCESS_TOKEN",
-    whatsappVerifyTokenEnv: "WHATSAPP_VERIFY_TOKEN",
-    telegramTokenEnv: "TELEGRAM_BOT_TOKEN",
-    slackTokenEnv: "SLACK_BOT_TOKEN",
-    slackSigningSecretEnv: "SLACK_SIGNING_SECRET",
-  };
-}
-
-function resolveInterfaceEnvName(rawValue: unknown, fallback: string): string {
-  const candidate = fieldValueAsString(rawValue).trim();
-  return candidate || fallback;
-}
-
-function buildInterfaceExpression(
-  preset: InterfacePresetKey,
-  targetType: "agent" | "team" = "agent",
-  extras?: Record<string, unknown>,
-): string {
-  const targetRef = `<${targetType}>`;
-  const collectionTargetRef = targetType === "team" ? `[<team>]` : `[<agent>]`;
-  const safeExtras = extras ?? {};
-  const whatsappPhoneNumberIdEnv = resolveInterfaceEnvName(safeExtras.whatsappPhoneNumberIdEnv, "WHATSAPP_PHONE_NUMBER_ID");
-  const whatsappAccessTokenEnv = resolveInterfaceEnvName(safeExtras.whatsappAccessTokenEnv, "WHATSAPP_ACCESS_TOKEN");
-  const whatsappVerifyTokenEnv = resolveInterfaceEnvName(safeExtras.whatsappVerifyTokenEnv, "WHATSAPP_VERIFY_TOKEN");
-  const telegramTokenEnv = resolveInterfaceEnvName(safeExtras.telegramTokenEnv, "TELEGRAM_BOT_TOKEN");
-  const slackTokenEnv = resolveInterfaceEnvName(safeExtras.slackTokenEnv, "SLACK_BOT_TOKEN");
-  const slackSigningSecretEnv = resolveInterfaceEnvName(safeExtras.slackSigningSecretEnv, "SLACK_SIGNING_SECRET");
-
-  if (preset === "whatsapp") {
-    return `Whatsapp(${targetType}=${targetRef}, phone_number_id=os.getenv(${toPythonString(whatsappPhoneNumberIdEnv)}), access_token=os.getenv(${toPythonString(whatsappAccessTokenEnv)}), verify_token=os.getenv(${toPythonString(whatsappVerifyTokenEnv)}))`;
-  }
-
-  if (preset === "telegram") {
-    return `Telegram(${targetType}=${targetRef}, token=os.getenv(${toPythonString(telegramTokenEnv)}))`;
-  }
-
-  if (preset === "slack") {
-    return `Slack(${targetType}=${targetRef}, token=os.getenv(${toPythonString(slackTokenEnv)}), signing_secret=os.getenv(${toPythonString(slackSigningSecretEnv)}))`;
-  }
-
-  if (preset === "a2a") {
-    return `A2A(${targetType === "team" ? "teams" : "agents"}=${collectionTargetRef})`;
-  }
-
-  if (preset === "ag_ui") {
-    return `AGUI(${targetType}=${targetRef})`;
-  }
-
-  return [
-    `Whatsapp(${targetType}=${targetRef}, phone_number_id=os.getenv(${toPythonString(whatsappPhoneNumberIdEnv)}), access_token=os.getenv(${toPythonString(whatsappAccessTokenEnv)}), verify_token=os.getenv(${toPythonString(whatsappVerifyTokenEnv)}))`,
-    `Telegram(${targetType}=${targetRef}, token=os.getenv(${toPythonString(telegramTokenEnv)}))`,
-    `Slack(${targetType}=${targetRef}, token=os.getenv(${toPythonString(slackTokenEnv)}), signing_secret=os.getenv(${toPythonString(slackSigningSecretEnv)}))`,
-    `A2A(${targetType === "team" ? "teams" : "agents"}=${collectionTargetRef})`,
-    `AGUI(${targetType}=${targetRef})`,
-  ].join("\n");
-}
-
-function createInterfaceNodeData(preset: InterfacePresetKey): NodeData {
-  const item = INTERFACE_LIBRARY_ITEMS.find((candidate) => candidate.key === preset);
-  const name = item?.label ?? "Interface";
-  const description = item?.description ?? "AgentOS interface node.";
-  const targetType: "agent" | "team" = "agent";
-
-  const extras: Record<string, unknown> = {
-    ...getDefaultInterfaceExtras(),
-    interfacePreset: preset,
-    interfaceTargetType: targetType,
-  };
-  extras.interfaceExpression = buildInterfaceExpression(preset, targetType, extras);
-
-  return {
-    name,
-    description,
-    extras,
-  };
-}
-
-function createDatabaseNodeData(preset: DatabasePresetKey): NodeData {
-  const label = DATABASE_LIBRARY_ITEMS.find((item) => item.key === preset)?.label ?? "Database";
-  const extras: Record<string, unknown> = {
-    dbPreset: preset,
-  };
-
-  if (preset === "sqlite-db") {
-    extras.dbDirectory = "tmp";
-    extras.dbName = "agno";
-  } else if (preset === "mongo-db") {
-    extras.dbHost = "localhost";
-    extras.dbPort = "27017";
-    extras.dbName = "agno";
-    extras.dbUsername = "";
-    extras.dbPassword = "";
-  } else {
-    extras.dbHost = "localhost";
-    extras.dbPort = "5532";
-    extras.dbName = "ai";
-    extras.dbUsername = "ai";
-    extras.dbPassword = "ai";
-  }
-
-  extras.dbExpression = buildDatabaseExpressionFromExtras(preset, extras);
-
-  return {
-    name: label,
-    description: "Agent storage backend.",
-    extras,
-  };
-}
-
-function createVectorDbNodeData(preset: VectorDbPresetKey): NodeData {
-  const label = VECTOR_DB_LIBRARY_ITEMS.find((item) => item.key === preset)?.label ?? "Vector DB";
-  const extras: Record<string, unknown> = {
-    vectorPreset: preset,
-    ...getDefaultVectorDbExtras(preset),
-  };
-  extras.vectorExpression = buildVectorDbExpressionFromExtras(preset, extras);
-  return {
-    name: label,
-    description: "Vector store backend.",
-    extras,
-  };
-}
-
-function createKnowledgeNodeData(variant: "knowledge" | "knowledge_contents"): NodeData {
-  const extras: Record<string, unknown> = {
-    ...getDefaultKnowledgeExtras(variant),
-  };
-  extras.knowledgeExpression = buildKnowledgeExpressionFromExtras(
-    extras,
-    buildVectorDbExpression("pgvector"),
-    variant === "knowledge" ? "Knowledge" : "Knowledge + Contents DB",
-    "Knowledge resource for Agentic RAG.",
-  );
-  return {
-    name: variant === "knowledge" ? "Knowledge" : "Knowledge + Contents DB",
-    description: "Knowledge resource for Agentic RAG.",
-    extras,
-  };
-}
-
-function createSkillsNodeData(): NodeData {
-  const extras: Record<string, unknown> = {
-    ...getDefaultSkillsExtras(),
-  };
-  extras.skillsExpression = buildSkillsExpressionFromExtras(extras);
-  return {
-    name: "Skills",
-    description: "Local Agno skill pack for connected agents.",
-    extras,
-  };
-}
-
-function createLearningMachineNodeData(): NodeData {
-  const extras: Record<string, unknown> = {
-    ...getDefaultLearningMachineExtras(),
-    providerConfig: buildProviderConfig("openai"),
-  };
-  extras.learningMachineExpression = buildLearningMachineExpressionFromExtras(extras);
-  return {
-    name: "Learning Machine",
-    description: "Shared learning resource for Agno agents and teams.",
-    provider: "openai",
-    model: "gpt-4.1-mini",
-    extras,
-  };
-}
-
-function createEmailInputNodeData(index: number): NodeData {
-  return {
-    name: `Email Inbox ${index}`,
-    description: "Starts a background mailbox monitor after save and feeds the first matching email into the flow runtime.",
-    prompt: "",
-    extras: {
-      inputSource: "email",
-      inputMode: "text",
-      inputText: "",
-      attachedFileName: "",
-      attachedFileAlias: "",
-      attachedFileMimeType: "",
-      attachedFileEncoding: "base64",
-      attachedFileBase64: "",
-      attachedFileContent: "",
-      payloadJson: '{\n  "source": "email_inbox"\n}',
-      hitlAutoApprove: "",
-      hitlUserInputJson: "",
-      emailProtocol: "imap",
-      emailSecurity: "ssl",
-      emailHost: "",
-      emailPort: "993",
-      emailMailbox: "INBOX",
-      emailUsername: "",
-      emailPassword: "",
-      emailMaxMessages: "20",
-      emailUnreadOnly: true,
-      emailListenerEnabled: true,
-      emailPollIntervalSeconds: "15",
-      emailSubjectFilter: "",
-      emailFromFilter: "",
-      emailToFilter: "",
-      emailBodyKeywords: "",
-    },
-  };
-}
-
-function createWebhookInputNodeData(index: number): NodeData {
-  return {
-    name: `Webhook Input ${index}`,
-    description: "Accepts inbound HTTP requests and maps the payload into the flow runtime.",
-    prompt: "Webhook event received.",
-    extras: {
-      inputSource: "webhook",
-      inputMode: "text",
-      inputText: "Webhook event received.",
-      attachedFileName: "",
-      attachedFileAlias: "",
-      attachedFileMimeType: "",
-      attachedFileEncoding: "base64",
-      attachedFileBase64: "",
-      attachedFileContent: "",
-      payloadJson: '{\n  "source": "webhook"\n}',
-      hitlAutoApprove: "",
-      hitlUserInputJson: "",
-      webhookSecret: "",
-      webhookSecretHeader: "X-AgnoLab-Secret",
-      webhookTextField: "message",
-    },
-  };
-}
-
-function createWhatsappInputNodeData(index: number): NodeData {
-  return {
-    name: `WhatsApp Input ${index}`,
-    description: "Receives WhatsApp messages from a connected session and can auto-reply with the flow result.",
-    prompt: "WhatsApp message received.",
-    extras: {
-      inputSource: "whatsapp",
-      inputMode: "text",
-      inputText: "WhatsApp message received.",
-      attachedFileName: "",
-      attachedFileAlias: "",
-      attachedFileMimeType: "",
-      attachedFileEncoding: "base64",
-      attachedFileBase64: "",
-      attachedFileContent: "",
-      payloadJson: '{\n  "source": "whatsapp"\n}',
-      hitlAutoApprove: "",
-      hitlUserInputJson: "",
-      whatsappSessionId: `agnolab_whatsapp_${index}`,
-      whatsappWebhookSecret: createClientSecret("wa"),
-      whatsappIgnoreGroups: true,
-      whatsappSenderFilter: "",
-      whatsappBodyKeywords: "",
-      whatsappReplyEnabled: true,
-      whatsappReplyTemplate: "$result_text",
-    },
-  };
-}
-
-function createFormInputNodeData(index: number): NodeData {
-  return {
-    name: `Form Input ${index}`,
-    description: "Receives form submissions with fields and uploaded files, then runs the flow automatically.",
-    prompt: "New form submission received.",
-    extras: {
-      inputSource: "form",
-      inputMode: "mixed",
-      inputText: "New form submission received.",
-      attachedFileName: "",
-      attachedFileAlias: "",
-      attachedFileMimeType: "",
-      attachedFileEncoding: "base64",
-      attachedFileBase64: "",
-      attachedFileContent: "",
-      payloadJson: '{\n  "source": "form_submission"\n}',
-      hitlAutoApprove: "",
-      hitlUserInputJson: "",
-      formSecret: "",
-      formSecretHeader: "X-AgnoLab-Secret",
-      formSecretField: "_secret",
-      formTextField: "message",
-      formMetadataField: "metadata_json",
-      formPrimaryFileField: "",
-    },
-  };
-}
-
-function createEmailOutputNodeData(index: number): NodeData {
-  return {
-    name: `Email Send Output ${index}`,
-    output_format: "text",
-    extras: {
-      ...NODE_CATALOG.output_api.createData(index).extras,
-      outputMode: "email",
-    },
-  };
-}
-
-function createChatOutputNodeData(index: number): NodeData {
-  return {
-    name: `Chat Message Output ${index}`,
-    output_format: "json",
-    extras: {
-      ...NODE_CATALOG.output_api.createData(index).extras,
-      outputMode: "chat",
-    },
-  };
-}
-
-function createSpreadsheetOutputNodeData(index: number): NodeData {
-  return {
-    name: `Spreadsheet Output ${index}`,
-    output_format: "json",
-    extras: {
-      ...NODE_CATALOG.output_api.createData(index).extras,
-      outputMode: "spreadsheet",
-    },
-  };
-}
-
-function createManagerNodeData(type: "memory_manager" | "session_summary_manager" | "compression_manager"): NodeData {
-  const label = NODE_CATALOG[type].label;
-  const extras: Record<string, unknown> = {};
-  extras.useManagerModel = false;
-  extras.providerConfig = buildProviderConfig("openai");
-  if (type === "memory_manager") {
-    extras.systemMessage = "";
-    extras.memoryCaptureInstructions = "";
-    extras.additionalInstructions = "";
-    extras.debugMode = false;
-  } else if (type === "session_summary_manager") {
-    extras.sessionSummaryPrompt = "";
-    extras.summaryRequestMessage = "Provide the summary of the conversation.";
-  } else {
-    extras.compressToolResults = true;
-    extras.compressToolResultsLimit = "3";
-    extras.compressTokenLimit = "";
-    extras.compressToolCallInstructions = "";
-  }
-  extras.managerExpression = buildManagerExpressionFromExtras(type, extras);
-  return {
-    name: label,
-    description: NODE_CATALOG[type].description,
-    provider: "openai",
-    model: "gpt-4.1-mini",
-    extras,
-  };
-}
-
-
-function getToolMode(data: NodeData): "builtin" | "function" {
-  return (data.extras?.toolMode as "builtin" | "function" | undefined) ?? "builtin";
-}
-
-function getInputSource(data: NodeData): "manual" | "email" | "webhook" | "whatsapp" | "form" {
-  return (data.extras?.inputSource as "manual" | "email" | "webhook" | "whatsapp" | "form" | undefined) ?? "manual";
-}
-
-function getInputMode(data: NodeData): "text" | "file" | "mixed" {
-  return (data.extras?.inputMode as "text" | "file" | "mixed" | undefined) ?? "text";
-}
-
-function getOutputMode(data: NodeData): "api" | "email" | "chat" | "spreadsheet" {
-  return (data.extras?.outputMode as "api" | "email" | "chat" | "spreadsheet" | undefined) ?? "api";
-}
-
-function getChatProvider(data: NodeData): "slack" | "discord" | "telegram" | "generic" | "whatsapp" {
-  return (data.extras?.chatProvider as "slack" | "discord" | "telegram" | "generic" | "whatsapp" | undefined) ?? "slack";
-}
-
-function getEmailProtocol(data: NodeData): "imap" | "pop" {
-  return (data.extras?.emailProtocol as "imap" | "pop" | undefined) ?? "imap";
-}
-
-function getEmailSecurity(data: NodeData): "ssl" | "starttls" | "none" {
-  return (data.extras?.emailSecurity as "ssl" | "starttls" | "none" | undefined) ?? "ssl";
-}
-
-function getDefaultEmailPort(protocol: "imap" | "pop", security: "ssl" | "starttls" | "none"): string {
-  if (protocol === "pop") {
-    return security === "ssl" ? "995" : "110";
-  }
-  return security === "ssl" ? "993" : "143";
-}
-
-
-function arrayBufferToBase64(buffer: ArrayBuffer): string {
-  let binary = "";
-  const bytes = new Uint8Array(buffer);
-  const chunkSize = 0x8000;
-
-  for (let index = 0; index < bytes.length; index += chunkSize) {
-    const chunk = bytes.subarray(index, index + chunkSize);
-    binary += String.fromCharCode(...chunk);
-  }
-
-  return btoa(binary);
-}
-
-function getInputText(data: NodeData): string {
-  return fieldValueAsString(data.extras?.inputText ?? data.prompt);
-}
-
-function getAttachedFileName(data: NodeData): string {
-  return fieldValueAsString(data.extras?.attachedFileName);
-}
-
-function updateInputNodePayload(graph: CanvasGraph, payload: ChatDraft): CanvasGraph {
-  const inputNode = graph.nodes.find((node) => node.type === "input");
-  if (!inputNode) {
-    return graph;
-  }
-
-  const currentExtras = inputNode.data.extras ?? {};
-  const inputSource = getInputSource(inputNode.data);
-  const inputMode = getInputMode(inputNode.data);
-  if (inputSource === "email") {
-    const nextExtras = {
-      ...currentExtras,
-      payloadJson: payload.metadata,
-    };
-
-    return {
-      ...graph,
-      nodes: graph.nodes.map((node) =>
-        node.id === inputNode.id
-          ? {
-              ...node,
-              data: {
-                ...node.data,
-                extras: nextExtras,
-              },
-            }
-          : node,
-      ),
-    };
-  }
-  const nextText = inputMode === "file" ? getInputText(inputNode.data) : payload.text;
-  const nextPrompt = inputMode === "file" ? inputNode.data.prompt : payload.text;
-
-  const nextExtras = {
-    ...currentExtras,
-    inputText: nextText,
-    payloadJson: payload.metadata,
-    attachedFileName: payload.fileName,
-    attachedFileAlias: payload.fileAlias || payload.fileName,
-    attachedFileMimeType: payload.fileMimeType,
-    attachedFileEncoding: payload.fileEncoding || "base64",
-    attachedFileBase64: payload.fileBase64,
-    attachedFileContent: payload.fileContent,
-  };
-
-  return {
-    ...graph,
-    nodes: graph.nodes.map((node) =>
-      node.id === inputNode.id
-        ? {
-            ...node,
-            data: {
-              ...node.data,
-              prompt: nextPrompt,
-              extras: nextExtras,
-            },
-          }
-        : node,
-    ),
-  };
-}
-
-function getPrimaryInputNode(graph: CanvasGraph | null): { id: string; data: NodeData } | null {
-  if (!graph) {
-    return null;
-  }
-  const node = graph.nodes.find((candidate) => candidate.type === "input");
-  if (!node) {
-    return null;
-  }
-  return { id: node.id, data: node.data };
-}
-
-function getCanvasNodeLabel(data: NodeData, type: keyof typeof NODE_CATALOG): string {
-  if (type === "tool") {
-    const mode = getToolMode(data);
-    if (mode === "builtin") {
-      return fieldValueAsString(data.extras?.builtinClassName) || "Built-in Tool";
-    }
-    return "Function Tool";
-  }
-
-  return NODE_CATALOG[type].label;
-}
-
-function getCanvasNodeMeta(node: { type: keyof typeof NODE_CATALOG; data: NodeData }): string {
-  if (
-    node.type === "rabbitmq_input"
-    || node.type === "rabbitmq_output"
-    || node.type === "kafka_input"
-    || node.type === "kafka_output"
-    || node.type === "redis_input"
-    || node.type === "redis_output"
-    || node.type === "nats_input"
-    || node.type === "nats_output"
-    || node.type === "sqs_input"
-    || node.type === "sqs_output"
-    || node.type === "pubsub_input"
-    || node.type === "pubsub_output"
-  ) {
-    const provider = fieldValueAsString(node.data.extras?.queueProvider).trim().toLowerCase();
-
-    if (provider === "rabbitmq") {
-      const queue = fieldValueAsString(node.data.extras?.rabbitmqQueue).trim() || "queue not configured";
-      return `RabbitMQ · ${queue}`;
-    }
-    if (provider === "kafka") {
-      const topic = fieldValueAsString(node.data.extras?.kafkaTopic).trim() || "topic not configured";
-      return `Kafka · ${topic}`;
-    }
-    if (provider === "redis") {
-      const channel = fieldValueAsString(node.data.extras?.redisChannel).trim() || "channel not configured";
-      return `Redis · ${channel}`;
-    }
-    if (provider === "nats") {
-      const subject = fieldValueAsString(node.data.extras?.natsSubject).trim() || "subject not configured";
-      return `NATS · ${subject}`;
-    }
-    if (provider === "sqs") {
-      const queueUrl = fieldValueAsString(node.data.extras?.sqsQueueUrl).trim() || "queue URL not configured";
-      return `SQS · ${queueUrl}`;
-    }
-    if (provider === "pubsub") {
-      const name = node.type.endsWith("_input")
-        ? fieldValueAsString(node.data.extras?.pubsubSubscription).trim()
-        : fieldValueAsString(node.data.extras?.pubsubTopic).trim();
-      return `Pub/Sub · ${name || "resource not configured"}`;
-    }
-
-    return "Queue endpoint";
-  }
-
-  if (node.type === "database") {
-    return fieldValueAsString(node.data.extras?.dbPreset) || "Database backend";
-  }
-
-  if (node.type === "vector_db") {
-    return fieldValueAsString(node.data.extras?.vectorPreset) || "Vector store";
-  }
-
-  if (node.type === "knowledge") {
-    return Boolean(node.data.extras?.includeContentsDb) ? "Knowledge + Contents DB" : "Knowledge base";
-  }
-
-  if (node.type === "skills") {
-    const rawPath = fieldValueAsString(node.data.extras?.skillsPath).trim();
-    const label = rawPath ? rawPath.split(/[\\/]/).filter(Boolean).pop() || rawPath : "No path configured";
-    return `${label} · ${node.data.extras?.skillsValidate === false ? "no validation" : "validated"}`;
-  }
-
-  if (node.type === "interface") {
-    const preset = fieldValueAsString(node.data.extras?.interfacePreset).trim() || "whatsapp";
-    const targetType = fieldValueAsString(node.data.extras?.interfaceTargetType).trim() || "agent";
-    return `${preset.toUpperCase()} · ${targetType}`;
-  }
-
-  if (node.type === "learning_machine") {
-    const namespace = fieldValueAsString(node.data.extras?.learningNamespace) || "global";
-    const enabledStores = [
-      node.data.extras?.learningUserProfile,
-      node.data.extras?.learningUserMemory,
-      node.data.extras?.learningSessionContext,
-      node.data.extras?.learningEntityMemory,
-      node.data.extras?.learningLearnedKnowledge,
-      node.data.extras?.learningDecisionLog,
-    ].filter(Boolean).length;
-    return `${namespace} · ${enabledStores} stores`;
-  }
-
-  if (node.type === "memory_manager" || node.type === "session_summary_manager" || node.type === "compression_manager") {
-    return fieldValueAsString(node.data.extras?.managerExpression) || "Manager component";
-  }
-
-  if (node.type === "agent") {
-    const providerConfig = getProviderConfig(node.data);
-    const provider = fieldValueAsString(node.data.provider) || fieldValueAsString(providerConfig.provider_profile);
-    if (provider && node.data.model) {
-      return `${provider}:${node.data.model}`;
-    }
-  }
-
-  if (node.type === "team") {
-    const providerConfig = getProviderConfig(node.data);
-    const provider = fieldValueAsString(node.data.provider) || fieldValueAsString(providerConfig.provider_profile);
-    if (provider && node.data.model) {
-      return `${provider}:${node.data.model}`;
-    }
-  }
-
-  if (node.type === "workflow") {
-    const workflowConfig = getWorkflowConfig(node.data);
-    const historyRuns = fieldValueAsString(workflowConfig.num_history_runs) || "3";
-    return `Sequential workflow · ${historyRuns} history`;
-  }
-
-  if (node.type === "workflow_step") {
-    const stepOrder = fieldValueAsString(node.data.extras?.stepOrder) || "1";
-    return `Step ${stepOrder}`;
-  }
-
-  if (node.type === "input") {
-    const inputSource = getInputSource(node.data);
-    if (inputSource === "email") {
-      const protocol = getEmailProtocol(node.data).toUpperCase();
-      const host = fieldValueAsString(node.data.extras?.emailHost).trim();
-      const subjectFilter = fieldValueAsString(node.data.extras?.emailSubjectFilter).trim();
-      if (host && subjectFilter) {
-        return `${protocol} · ${host} · ${subjectFilter}`;
-      }
-      if (host) {
-        return `${protocol} · ${host}`;
-      }
-      return `${protocol} inbox`;
-    }
-
-    if (inputSource === "webhook") {
-      const textField = fieldValueAsString(node.data.extras?.webhookTextField).trim() || "message";
-      return `Webhook · ${textField}`;
-    }
-
-    if (inputSource === "whatsapp") {
-      const sessionId = fieldValueAsString(node.data.extras?.whatsappSessionId).trim() || "session not configured";
-      const senderFilter = fieldValueAsString(node.data.extras?.whatsappSenderFilter).trim();
-      return senderFilter ? `WhatsApp · ${sessionId} · ${senderFilter}` : `WhatsApp · ${sessionId}`;
-    }
-
-    if (inputSource === "form") {
-      const textField = fieldValueAsString(node.data.extras?.formTextField).trim() || "message";
-      const fileField = fieldValueAsString(node.data.extras?.formPrimaryFileField).trim();
-      return fileField ? `Form · ${textField} · ${fileField}` : `Form · ${textField}`;
-    }
-
-    const inputMode = getInputMode(node.data);
-    const inputText = getInputText(node.data);
-    const attachedFileName = getAttachedFileName(node.data);
-
-    if (inputMode === "file" && attachedFileName) {
-      return `File: ${attachedFileName}`;
-    }
-
-    if (inputMode === "mixed" && attachedFileName) {
-      return inputText || `Text + file: ${attachedFileName}`;
-    }
-
-    return inputText || attachedFileName || "Configured in panel";
-  }
-
-  if (node.type === "output_api") {
-    const outputMode = getOutputMode(node.data);
-    if (outputMode === "email") {
-      const recipients = fieldValueAsString(node.data.extras?.emailTo).trim();
-      return recipients || "SMTP recipients not configured";
-    }
-    if (outputMode === "chat") {
-      const provider = getChatProvider(node.data);
-      if (provider === "telegram") {
-        const channel = fieldValueAsString(node.data.extras?.chatChannelId).trim();
-        return channel ? `Telegram · ${channel}` : "Telegram target not configured";
-      }
-      if (provider === "whatsapp") {
-        const sessionId = fieldValueAsString(node.data.extras?.chatWhatsappSessionId).trim();
-        const target = fieldValueAsString(node.data.extras?.chatChannelId).trim();
-        if (sessionId && target) {
-          return `WhatsApp · ${sessionId} · ${target}`;
-        }
-        if (sessionId) {
-          return `WhatsApp · ${sessionId}`;
-        }
-        return "WhatsApp target not configured";
-      }
-      const webhookUrl = fieldValueAsString(node.data.extras?.chatWebhookUrl).trim();
-      return webhookUrl || `${provider} webhook not configured`;
-    }
-    if (outputMode === "spreadsheet") {
-      const sheetFilePath = fieldValueAsString(node.data.extras?.sheetFilePath).trim();
-      return sheetFilePath || "CSV path not configured";
-    }
-    const apiUrl = fieldValueAsString(node.data.extras?.apiUrl).trim();
-    return apiUrl || "POST URL not configured";
-  }
-
-  return node.data.model || node.data.prompt || node.data.output_format || "Configured in panel";
-}
-
-function getNodeVisualIcon(node: { type: keyof typeof NODE_CATALOG; data: NodeData }) {
-  if (node.type === "tool" && getToolMode(node.data) === "builtin") {
-    const tool = getBuiltInTool(fieldValueAsString(node.data.extras?.builtinToolKey));
-    if (tool) {
-      return {
-        color: toolIconColor(tool),
-        icon: <ToolIcon toolKey={tool.key} category={tool.category} />,
-      };
-    }
-  }
-
-  return {
-    color: NODE_CATALOG[node.type].color,
-    icon: <NodeIcon type={node.type} />,
-  };
-}
-
-function parseFieldValue(field: AgentFieldDefinition, rawValue: string, checked: boolean): unknown {
-  if (field.type === "checkbox") {
-    return checked;
-  }
-
-  if (field.type === "number") {
-    return rawValue === "" ? undefined : Number(rawValue);
-  }
-
-  return rawValue;
-}
-
-function renderInspectorPropertyLabel(label: string, helper: string, required = false) {
-  return (
-    <span className="field-label-row">
-      <span>
-        {label}
-        {required ? <span className="required-mark">*</span> : null}
-      </span>
-      <div className="property-help">
-        <button type="button" className="help-button" onClick={(event) => event.preventDefault()}>
-          ?
-        </button>
-        <div className="help-tooltip">
-          <strong>{label}</strong>
-          <p>{helper}</p>
-        </div>
-      </div>
-    </span>
-  );
-}
-
-function NodeIcon({ type }: { type: keyof typeof NODE_CATALOG }) {
-  if (type === "input") {
-    return (
-      <svg viewBox="0 0 24 24" aria-hidden="true">
-        <path d="M4 12h10" />
-        <path d="M10 6l6 6-6 6" />
-      </svg>
-    );
-  }
-
-  if (
-    type === "rabbitmq_input"
-    || type === "kafka_input"
-    || type === "redis_input"
-    || type === "nats_input"
-    || type === "sqs_input"
-    || type === "pubsub_input"
-  ) {
-    return (
-      <svg viewBox="0 0 24 24" aria-hidden="true">
-        <rect x="4" y="6" width="16" height="12" rx="2" />
-        <path d="M6 12h8" />
-        <path d="M12 9l4 3-4 3" />
-      </svg>
-    );
-  }
-
-  if (
-    type === "rabbitmq_output"
-    || type === "kafka_output"
-    || type === "redis_output"
-    || type === "nats_output"
-    || type === "sqs_output"
-    || type === "pubsub_output"
-  ) {
-    return (
-      <svg viewBox="0 0 24 24" aria-hidden="true">
-        <rect x="4" y="6" width="16" height="12" rx="2" />
-        <path d="M10 9l-4 3 4 3" />
-        <path d="M10 12h8" />
-      </svg>
-    );
-  }
-
-  if (type === "agent") {
-    return (
-      <svg viewBox="0 0 24 24" aria-hidden="true">
-        <circle cx="12" cy="8" r="3.5" />
-        <path d="M6.5 19c1.2-3 3.1-4.5 5.5-4.5S16.3 16 17.5 19" />
-      </svg>
-    );
-  }
-
-  if (type === "database") {
-    return (
-      <svg viewBox="0 0 24 24" aria-hidden="true">
-        <ellipse cx="12" cy="6.5" rx="6.5" ry="2.5" />
-        <path d="M5.5 6.5v8c0 1.4 2.9 2.5 6.5 2.5s6.5-1.1 6.5-2.5v-8" />
-        <path d="M5.5 10.5c0 1.4 2.9 2.5 6.5 2.5s6.5-1.1 6.5-2.5" />
-      </svg>
-    );
-  }
-
-  if (type === "vector_db") {
-    return (
-      <svg viewBox="0 0 24 24" aria-hidden="true">
-        <ellipse cx="12" cy="6.5" rx="6.5" ry="2.5" />
-        <path d="M5.5 6.5v8c0 1.4 2.9 2.5 6.5 2.5s6.5-1.1 6.5-2.5v-8" />
-        <path d="M8 12h8" />
-        <path d="M12 10v4" />
-      </svg>
-    );
-  }
-
-  if (type === "knowledge") {
-    return (
-      <svg viewBox="0 0 24 24" aria-hidden="true">
-        <path d="M6 5h12v14H6z" />
-        <path d="M9 9h6" />
-        <path d="M9 13h6" />
-        <path d="M9 17h4" />
-      </svg>
-    );
-  }
-
-  if (type === "skills") {
-    return (
-      <svg viewBox="0 0 24 24" aria-hidden="true">
-        <path d="M7 7h10v10H7z" />
-        <path d="M10 10h4" />
-        <path d="M10 14h4" />
-        <path d="M5 12h2" />
-        <path d="M17 12h2" />
-      </svg>
-    );
-  }
-
-  if (type === "interface") {
-    return (
-      <svg viewBox="0 0 24 24" aria-hidden="true">
-        <rect x="4" y="5" width="16" height="12" rx="2" />
-        <path d="M8 9h8" />
-        <path d="M12 17v3" />
-        <path d="M9 20h6" />
-      </svg>
-    );
-  }
-
-  if (type === "learning_machine") {
-    return (
-      <svg viewBox="0 0 24 24" aria-hidden="true">
-        <circle cx="8" cy="8" r="2.25" />
-        <circle cx="16" cy="8" r="2.25" />
-        <circle cx="12" cy="16" r="2.25" />
-        <path d="M9.8 9.2l1.4 4.2" />
-        <path d="M14.2 9.2l-1.4 4.2" />
-        <path d="M10.2 8h3.6" />
-      </svg>
-    );
-  }
-
-  if (type === "memory_manager") {
-    return (
-      <svg viewBox="0 0 24 24" aria-hidden="true">
-        <rect x="5" y="6" width="14" height="12" rx="2" />
-        <path d="M9 10h6" />
-        <path d="M12 10v4" />
-        <path d="M10 14h4" />
-      </svg>
-    );
-  }
-
-  if (type === "session_summary_manager") {
-    return (
-      <svg viewBox="0 0 24 24" aria-hidden="true">
-        <path d="M7 5h10v12H7z" />
-        <path d="M10 9h4" />
-        <path d="M9 13h6" />
-        <path d="M12 17v2" />
-      </svg>
-    );
-  }
-
-  if (type === "compression_manager") {
-    return (
-      <svg viewBox="0 0 24 24" aria-hidden="true">
-        <rect x="5" y="6" width="14" height="12" rx="2" />
-        <path d="M9 10h6" />
-        <path d="M9 14h4" />
-        <path d="M17 9l-2 3 2 3" />
-      </svg>
-    );
-  }
-
-  if (type === "team") {
-    return (
-      <svg viewBox="0 0 24 24" aria-hidden="true">
-        <circle cx="8" cy="9" r="2.5" />
-        <circle cx="16" cy="9" r="2.5" />
-        <path d="M4.5 18c.9-2.4 2.3-3.6 3.5-3.6S10.6 15.6 11.5 18" />
-        <path d="M12.5 18c.9-2.4 2.3-3.6 3.5-3.6s2.6 1.2 3.5 3.6" />
-      </svg>
-    );
-  }
-
-  if (type === "workflow") {
-    return (
-      <svg viewBox="0 0 24 24" aria-hidden="true">
-        <rect x="4.5" y="5" width="15" height="14" rx="2" />
-        <path d="M8 9h8" />
-        <path d="M8 12h5" />
-        <path d="M8 15h8" />
-      </svg>
-    );
-  }
-
-  if (type === "workflow_step") {
-    return (
-      <svg viewBox="0 0 24 24" aria-hidden="true">
-        <circle cx="7.5" cy="12" r="2" />
-        <rect x="11" y="8" width="8" height="8" rx="1.5" />
-        <path d="M9.5 12H11" />
-      </svg>
-    );
-  }
-
-  if (type === "condition") {
-    return (
-      <svg viewBox="0 0 24 24" aria-hidden="true">
-        <path d="M12 3l8 9-8 9-8-9 8-9z" />
-      </svg>
-    );
-  }
-
-  if (type === "tool") {
-    return (
-      <svg viewBox="0 0 24 24" aria-hidden="true">
-        <path d="M14.5 5.5a4 4 0 0 0-5 5L5 15l4 4 4.5-4.5a4 4 0 0 0 5-5l-2.5 2.5-3-3L14.5 5.5z" />
-      </svg>
-    );
-  }
-
-  return (
-    <svg viewBox="0 0 24 24" aria-hidden="true">
-      <rect x="5" y="6" width="14" height="12" rx="2" />
-      <path d="M9 10h6" />
-      <path d="M9 14h4" />
-    </svg>
-  );
-}
+import { BuiltInToolFunctionOption, CanvasGraph, CanvasTemplateSummary, FlowRuntimeStatus, FlowSummary, GraphNode, NodeData, Position, ProjectRuntimeConfig, ProjectRuntimeEnvVar, QueueSubscriberStatus, RunResult, SaveFlowResponse, SavedUserTool, SkillPathOption, StarterToolTemplate, WhatsappSessionStatus } from "./types";
+import { AGNO_OUTPUT_FORMAT_OPTIONS, COMPONENT_SELECT_AGENT_FIELDS, COMPONENT_SELECT_TEAM_FIELDS, ChatDraft, ChatMessage, DATABASE_DEPENDENT_AGENT_FIELDS, DATABASE_DEPENDENT_TEAM_FIELDS, DATABASE_LIBRARY_ITEMS, DEFAULT_SECTION_OPEN, DatabasePresetKey, FLOW_AUTOSAVE_DELAY_MS, FLOW_INPUT_FILE_ACCEPT, HISTORY_MAX_ENTRIES, INTEGRATION_INPUT_LIBRARY_ITEMS, INTEGRATION_OUTPUT_LIBRARY_ITEMS, INTERFACE_LIBRARY_ITEMS, InterfacePresetKey, KNOWLEDGE_DEPENDENT_AGENT_FIELDS, KNOWLEDGE_DEPENDENT_TEAM_FIELDS, KNOWLEDGE_LIBRARY_ITEMS, LEARNING_LIBRARY_ITEMS, LibrarySearchResult, MANAGER_LIBRARY_ITEMS, MY_TOOLS_STORAGE_KEY, SKILLS_LIBRARY_ITEMS, SavedFlowIntegrationModalState, VECTOR_DB_LIBRARY_ITEMS, VectorDbPresetKey, WebhookCurlModalState, WhatsappSessionModalState, isQueueInputNodeType, isQueueNodeType, matchesLibrarySearch } from "./editorConstants";
+import { applyProviderPreset, arrayBufferToBase64, buildManagerExpressionFromExtras, buildSkillsExpressionFromExtras, createBuiltInToolData, createChatOutputNodeData, createDatabaseNodeData, createEmailInputNodeData, createEmailOutputNodeData, createFormInputNodeData, createInterfaceNodeData, createKnowledgeNodeData, createLearningMachineNodeData, createManagerNodeData, createSavedToolNodeData, createScheduleInputNodeData, createSkillsNodeData, createSpreadsheetOutputNodeData, createStarterToolNodeData, createVectorDbNodeData, createWebhookInputNodeData, createWhatsappInputNodeData, getAgentConfig, getCanvasNodeLabel, getCanvasNodeMeta, getInputMode, getInputSource, getInputText, getNodeVisualIcon, getPrimaryInputNode, getProviderConfig, getTeamConfig, getToolMode, listSupportedTimeZones, parseFieldValue, updateAgentConfig, updateInputNodePayload, updateProviderConfig, updateTeamConfig, updateToolConfig } from "./nodeData";
+import { NodeIcon } from "./NodeIcon";
 
 export default function App() {
   const chatFileInputRef = useRef<HTMLInputElement | null>(null);
@@ -2238,7 +85,6 @@ export default function App() {
   const chatHistoryRef = useRef<HTMLDivElement | null>(null);
   const canvasRef = useRef<HTMLElement | null>(null);
   const hasAutoCenteredRef = useRef(false);
-  const ignoreCanvasClickRef = useRef(false);
   const pendingImportedGraphRef = useRef<CanvasGraph | null>(null);
   const pendingImportedFlowNameRef = useRef("imported_flow");
   const hitlRunConfirmResolverRef = useRef<((approved: boolean) => void) | null>(null);
@@ -2249,32 +95,30 @@ export default function App() {
   const [graph, setGraph] = useState<CanvasGraph | null>(null);
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
   const [selectedEdgeId, setSelectedEdgeId] = useState<string | null>(null);
+  // Multi-selection on the canvas; selectedNodeId stays the "primary" node shown in the inspector.
+  const [selectedNodeIds, setSelectedNodeIds] = useState<string[]>([]);
+  const [toasts, setToasts] = useState<Array<{ id: number; message: string; tone: "info" | "success" | "error" }>>([]);
+  const [isCommandPaletteOpen, setIsCommandPaletteOpen] = useState(false);
+  const flowCanvasRef = useRef<FlowCanvasHandle | null>(null);
+  const graphClipboardRef = useRef<GraphClipboard | null>(null);
+  const pendingDropPositionRef = useRef<Position | null>(null);
+  const draggedLibraryItemRef = useRef<HTMLButtonElement | null>(null);
+  const toastIdRef = useRef(0);
   const [code, setCode] = useState("");
   const [warnings, setWarnings] = useState<string[]>([]);
   const [runResult, setRunResult] = useState<RunResult | null>(null);
   const [runError, setRunError] = useState<string | null>(null);
   const [isRunning, setIsRunning] = useState(false);
-  const [pendingConnectionSourceId, setPendingConnectionSourceId] = useState<string | null>(null);
   const [connectionMessage, setConnectionMessage] = useState<string | null>(null);
   const [activeRightTab, setActiveRightTab] = useState<"properties" | "code" | "runtime">("properties");
-  const [dragState, setDragState] = useState<DragState | null>(null);
-  const [canvasPanState, setCanvasPanState] = useState<CanvasPanState | null>(null);
-  const [canvasOffset, setCanvasOffset] = useState<PointerPosition>({ x: 0, y: 0 });
   const [canvasZoom, setCanvasZoom] = useState(1);
   const [editingFunctionNodeId, setEditingFunctionNodeId] = useState<string | null>(null);
   const [myTools, setMyTools] = useState<SavedUserTool[]>([]);
-  const [connectionPointer, setConnectionPointer] = useState<PointerPosition | null>(null);
   const [openSections, setOpenSections] = useState<Record<string, boolean>>({});
   const [librarySearchInput, setLibrarySearchInput] = useState("");
   const [outputResponseOnly, setOutputResponseOnly] = useState(false);
   const [flowName, setFlowName] = useState("support_agent_flow");
-  const [themeMode, setThemeMode] = useState<"dark" | "light">(() => {
-    const persisted = window.localStorage.getItem("agnolab.theme");
-    if (persisted === "dark" || persisted === "light") {
-      return persisted;
-    }
-    return window.matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark";
-  });
+  const [themeId, setThemeId] = useState<ThemeId>(() => loadInitialThemeId());
   const [savedFlows, setSavedFlows] = useState<FlowSummary[]>([]);
   const [runByNameInputText, setRunByNameInputText] = useState("");
   const [runByNameMetadata, setRunByNameMetadata] = useState("{}\n");
@@ -2348,9 +192,32 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    document.documentElement.setAttribute("data-theme", themeMode);
-    window.localStorage.setItem("agnolab.theme", themeMode);
-  }, [themeMode]);
+    applyTheme(themeId);
+  }, [themeId]);
+
+  // Status messages from anywhere in the app surface as transient toasts.
+  useEffect(() => {
+    if (!connectionMessage) {
+      return;
+    }
+    const tone = /fail|error|cannot|invalid|not allowed|could not|unable/i.test(connectionMessage)
+      ? "error"
+      : /saved|connected|copied|pasted|exported|imported|arranged|applied|added/i.test(connectionMessage)
+        ? "success"
+        : "info";
+    pushToast(connectionMessage, tone);
+    setConnectionMessage(null);
+  }, [connectionMessage]);
+
+  // Keep the canvas multi-selection in step when other UI picks the primary node.
+  useEffect(() => {
+    setSelectedNodeIds((current) => {
+      if (!selectedNodeId) {
+        return current.length === 0 ? current : [];
+      }
+      return current.includes(selectedNodeId) ? current : [selectedNodeId];
+    });
+  }, [selectedNodeId]);
 
   useEffect(() => {
     setHistoryPast([]);
@@ -2569,12 +436,7 @@ export default function App() {
       setGraph(null);
       setSelectedNodeId(null);
       setSelectedEdgeId(null);
-      setPendingConnectionSourceId(null);
-      setConnectionPointer(null);
-      setCanvasPanState(null);
-      setCanvasOffset({ x: 0, y: 0 });
       setCanvasZoom(1);
-      ignoreCanvasClickRef.current = false;
       pendingImportedGraphRef.current = null;
       pendingImportedFlowNameRef.current = "imported_flow";
       return;
@@ -2603,10 +465,7 @@ export default function App() {
               return;
             }
             hasAutoCenteredRef.current = false;
-            setCanvasPanState(null);
-            setCanvasOffset({ x: 0, y: 0 });
             setCanvasZoom(1);
-            ignoreCanvasClickRef.current = false;
             lastPersistedFlowSnapshotRef.current = buildPersistedFlowSnapshot(importedFlowName || slugifyFlowName(importedGraph.project.name) || "imported_flow", importedGraph);
             setGraph(importedGraph);
             setFlowName(importedFlowName || slugifyFlowName(importedGraph.project.name) || "imported_flow");
@@ -2623,10 +482,7 @@ export default function App() {
               return;
             }
             hasAutoCenteredRef.current = false;
-            setCanvasPanState(null);
-            setCanvasOffset({ x: 0, y: 0 });
             setCanvasZoom(1);
-            ignoreCanvasClickRef.current = false;
             lastPersistedFlowSnapshotRef.current = buildPersistedFlowSnapshot(localDraft.flowName || "new_flow", localDraft.graph);
             setGraph(localDraft.graph);
             setFlowName(localDraft.flowName || "new_flow");
@@ -2642,10 +498,7 @@ export default function App() {
             return;
           }
           hasAutoCenteredRef.current = false;
-          setCanvasPanState(null);
-          setCanvasOffset({ x: 0, y: 0 });
           setCanvasZoom(1);
-          ignoreCanvasClickRef.current = false;
           lastPersistedFlowSnapshotRef.current = buildPersistedFlowSnapshot(slugifyFlowName(defaultGraph.project.name) || "new_flow", defaultGraph);
           setGraph(defaultGraph);
           setFlowName(slugifyFlowName(defaultGraph.project.name) || "new_flow");
@@ -2662,10 +515,7 @@ export default function App() {
               return;
             }
             hasAutoCenteredRef.current = false;
-            setCanvasPanState(null);
-            setCanvasOffset({ x: 0, y: 0 });
             setCanvasZoom(1);
-            ignoreCanvasClickRef.current = false;
             lastPersistedFlowSnapshotRef.current = buildPersistedFlowSnapshot(localDraft.flowName || "blank_flow", localDraft.graph);
             setGraph(localDraft.graph);
             setFlowName(localDraft.flowName || "blank_flow");
@@ -2679,10 +529,7 @@ export default function App() {
             return;
           }
           hasAutoCenteredRef.current = false;
-          setCanvasPanState(null);
-          setCanvasOffset({ x: 0, y: 0 });
           setCanvasZoom(1);
-          ignoreCanvasClickRef.current = false;
           const blankGraph = buildBlankGraph();
           lastPersistedFlowSnapshotRef.current = buildPersistedFlowSnapshot("blank_flow", blankGraph);
           setGraph(blankGraph);
@@ -2701,10 +548,7 @@ export default function App() {
         const nextGraph = localDraft?.graph ?? record.graph;
         const nextFlowName = localDraft?.flowName || slugifyFlowName(record.name) || record.name;
         hasAutoCenteredRef.current = false;
-        setCanvasPanState(null);
-        setCanvasOffset({ x: 0, y: 0 });
         setCanvasZoom(1);
-        ignoreCanvasClickRef.current = false;
         lastPersistedFlowSnapshotRef.current = buildPersistedFlowSnapshot(slugifyFlowName(record.name) || record.name, record.graph);
         setGraph(nextGraph);
         setFlowName(nextFlowName);
@@ -2865,104 +709,14 @@ export default function App() {
   }, [graph]);
 
   useEffect(() => {
-    if (!graph || !canvasRef.current || hasAutoCenteredRef.current) {
+    if (!graph || hasAutoCenteredRef.current || graph.nodes.length === 0) {
       return;
     }
-
-    const rect = canvasRef.current.getBoundingClientRect();
-    if (rect.width < 100 || rect.height < 100) {
-      return;
-    }
-
     hasAutoCenteredRef.current = true;
-    setGraph(centerGraphInCanvas(graph, rect.width, rect.height));
+    // Wait a frame so React Flow has measured the freshly loaded nodes.
+    const frame = window.requestAnimationFrame(() => flowCanvasRef.current?.fitView());
+    return () => window.cancelAnimationFrame(frame);
   }, [graph]);
-
-  useEffect(() => {
-    if (!dragState || !graph || !canvasRef.current) {
-      return;
-    }
-
-    const handleMouseMove = (event: MouseEvent) => {
-      const canvasRect = canvasRef.current?.getBoundingClientRect();
-      if (!canvasRect) {
-        return;
-      }
-
-      const nextX = Math.max(
-        CANVAS_WORLD_MIN,
-        Math.min(CANVAS_WORLD_MAX, (event.clientX - canvasRect.left - canvasOffset.x) / canvasZoom - dragState.offsetX),
-      );
-      const nextY = Math.max(
-        CANVAS_WORLD_MIN,
-        Math.min(CANVAS_WORLD_MAX, (event.clientY - canvasRect.top - canvasOffset.y) / canvasZoom - dragState.offsetY),
-      );
-
-      setGraph((currentGraph) => {
-        if (!currentGraph) {
-          return currentGraph;
-        }
-
-        return {
-          ...currentGraph,
-          nodes: currentGraph.nodes.map((node) =>
-            node.id === dragState.nodeId
-              ? {
-                  ...node,
-                  position: {
-                    x: nextX,
-                    y: nextY,
-                  },
-                }
-              : node,
-          ),
-        };
-      });
-    };
-
-    const handleMouseUp = () => {
-      setDragState(null);
-    };
-
-    window.addEventListener("mousemove", handleMouseMove);
-    window.addEventListener("mouseup", handleMouseUp);
-
-    return () => {
-      window.removeEventListener("mousemove", handleMouseMove);
-      window.removeEventListener("mouseup", handleMouseUp);
-    };
-  }, [canvasOffset.x, canvasOffset.y, canvasZoom, dragState, graph]);
-
-  useEffect(() => {
-    if (!canvasPanState) {
-      return;
-    }
-
-    const handleMouseMove = (event: MouseEvent) => {
-      const deltaX = event.clientX - canvasPanState.startX;
-      const deltaY = event.clientY - canvasPanState.startY;
-      if (Math.abs(deltaX) > 2 || Math.abs(deltaY) > 2) {
-        ignoreCanvasClickRef.current = true;
-      }
-
-      setCanvasOffset({
-        x: canvasPanState.originX + deltaX,
-        y: canvasPanState.originY + deltaY,
-      });
-    };
-
-    const handleMouseUp = () => {
-      setCanvasPanState(null);
-    };
-
-    window.addEventListener("mousemove", handleMouseMove);
-    window.addEventListener("mouseup", handleMouseUp);
-
-    return () => {
-      window.removeEventListener("mousemove", handleMouseMove);
-      window.removeEventListener("mouseup", handleMouseUp);
-    };
-  }, [canvasPanState]);
 
   useEffect(() => {
     const handleKeyDown = (event: KeyboardEvent) => {
@@ -2994,17 +748,60 @@ export default function App() {
         return;
       }
 
-      if (!selectedNodeId && !selectedEdgeId) {
+      const mod = event.ctrlKey || event.metaKey;
+      const key = event.key.toLowerCase();
+
+      if (mod && key === "k") {
+        event.preventDefault();
+        setIsCommandPaletteOpen((current) => !current);
         return;
       }
 
-      if (event.key === "Delete" || event.key === "Backspace") {
+      // Canvas shortcuts stay out of the way while a modal is open or text is selected.
+      if (isCommandPaletteOpen || document.querySelector(".modal-backdrop")) {
+        return;
+      }
+      const hasTextSelection = Boolean(window.getSelection()?.toString());
+
+      if (mod && key === "c" && !hasTextSelection) {
+        if (handleCopySelection()) event.preventDefault();
+        return;
+      }
+      if (mod && key === "v") {
+        if (handlePasteClipboard()) event.preventDefault();
+        return;
+      }
+      if (mod && key === "d") {
         event.preventDefault();
-        if (selectedEdgeId) {
-          deleteSelectedEdge();
-          return;
+        handleDuplicateSelection();
+        return;
+      }
+      if (mod && key === "a" && !hasTextSelection) {
+        event.preventDefault();
+        handleSelectAllNodes();
+        return;
+      }
+      if (event.shiftKey && event.code === "Digit1") {
+        event.preventDefault();
+        handleFitView();
+        return;
+      }
+      if (event.shiftKey && key === "l") {
+        event.preventDefault();
+        handleAutoLayout();
+        return;
+      }
+      if (event.key === "Escape" && (selectedNodeIds.length > 0 || selectedEdgeId)) {
+        setSelectedNodeId(null);
+        setSelectedNodeIds([]);
+        setSelectedEdgeId(null);
+      }
+      if (event.key === "Delete" || event.key === "Backspace") {
+        const nodeIds = currentSelectionIds();
+        if (nodeIds.length > 0 || selectedEdgeId) {
+          event.preventDefault();
+          handleCanvasDelete(nodeIds, nodeIds.length === 0 && selectedEdgeId ? [selectedEdgeId] : []);
         }
-        deleteSelectedNode();
       }
     };
 
@@ -3012,7 +809,7 @@ export default function App() {
     return () => {
       window.removeEventListener("keydown", handleKeyDown);
     };
-  }, [selectedNodeId, selectedEdgeId, graph, pendingConnectionSourceId, editingFunctionNodeId, historyPast.length, historyFuture.length]);
+  });
 
   const selectedNode = graph?.nodes.find((node) => node.id === selectedNodeId) ?? null;
   const selectedEdge = graph?.edges.find((edge) => edge.id === selectedEdgeId) ?? null;
@@ -3023,57 +820,6 @@ export default function App() {
     () => Object.fromEntries((graph?.nodes ?? []).map((node) => [node.id, node])),
     [graph],
   );
-  const minimapModel = useMemo(() => {
-    if (!graph || graph.nodes.length === 0) {
-      return null;
-    }
-
-    const padding = 120;
-    const minX = Math.min(...graph.nodes.map((node) => node.position.x)) - padding;
-    const minY = Math.min(...graph.nodes.map((node) => node.position.y)) - padding;
-    const maxX = Math.max(...graph.nodes.map((node) => node.position.x + NODE_WIDTH)) + padding;
-    const maxY = Math.max(...graph.nodes.map((node) => node.position.y + NODE_MIN_HEIGHT)) + padding;
-    const worldWidth = Math.max(1, maxX - minX);
-    const worldHeight = Math.max(1, maxY - minY);
-
-    const scale = Math.min(MINIMAP_WIDTH / worldWidth, MINIMAP_HEIGHT / worldHeight);
-    if (!Number.isFinite(scale) || scale <= 0) {
-      return null;
-    }
-    const contentWidth = worldWidth * scale;
-    const contentHeight = worldHeight * scale;
-    const contentOffsetX = (MINIMAP_WIDTH - contentWidth) / 2;
-    const contentOffsetY = (MINIMAP_HEIGHT - contentHeight) / 2;
-
-    const nodes = graph.nodes.map((node) => ({
-      id: node.id,
-      x: Math.max(0, Math.min(MINIMAP_WIDTH - 6, contentOffsetX + (node.position.x - minX) * scale)),
-      y: Math.max(0, Math.min(MINIMAP_HEIGHT - 4, contentOffsetY + (node.position.y - minY) * scale)),
-      width: Math.max(6, Math.min(MINIMAP_WIDTH, NODE_WIDTH * scale)),
-      height: Math.max(4, Math.min(MINIMAP_HEIGHT, NODE_MIN_HEIGHT * scale)),
-      selected: node.id === selectedNodeId,
-    }));
-
-    const viewportWidth = (canvasRef.current?.clientWidth ?? 1) / canvasZoom;
-    const viewportHeight = (canvasRef.current?.clientHeight ?? 1) / canvasZoom;
-    const viewportWorldX = -canvasOffset.x / canvasZoom;
-    const viewportWorldY = -canvasOffset.y / canvasZoom;
-
-    return {
-      minX,
-      minY,
-      scale,
-      contentOffsetX,
-      contentOffsetY,
-      nodes,
-      viewport: {
-        x: Math.max(0, Math.min(MINIMAP_WIDTH - 12, contentOffsetX + (viewportWorldX - minX) * scale)),
-        y: Math.max(0, Math.min(MINIMAP_HEIGHT - 8, contentOffsetY + (viewportWorldY - minY) * scale)),
-        width: Math.max(12, viewportWidth * scale),
-        height: Math.max(8, viewportHeight * scale),
-      },
-    };
-  }, [graph, selectedNodeId, canvasOffset.x, canvasOffset.y, canvasZoom]);
 
   useEffect(() => {
     if (!selectedQueueNode || !isQueueInputNodeType(selectedQueueNode.type)) {
@@ -3226,6 +972,44 @@ export default function App() {
   const displayedCode = useMemo(() => sanitizeGeneratedCode(code), [code]);
   const debugObservation = useMemo(() => parseDebugObservation(runResult), [runResult]);
   const nodeRunBadges = useMemo(() => deriveNodeRunBadges(graph, debugObservation), [graph, debugObservation]);
+
+  const canvasNodeViews = useMemo<CanvasNodeView[]>(
+    () =>
+      (graph?.nodes ?? []).map((node) => {
+        const definition = NODE_CATALOG[node.type];
+        const visual = getNodeVisualIcon(node);
+        return {
+          id: node.id,
+          type: node.type,
+          position: node.position,
+          typeLabel: getCanvasNodeLabel(node.data, node.type),
+          name: node.data.name,
+          meta:
+            node.type === "output" && outputResponseOnly
+              ? "Response only view"
+              : node.type === "output"
+                ? "Double-click for clean response"
+                : getCanvasNodeMeta(node),
+          icon: visual.icon,
+          color: visual.color,
+          runBadge: nodeRunBadges[node.id],
+          hasInputs: definition.receivesFrom.length > 0,
+          targetHandles:
+            node.type === "workflow_branch"
+              ? [
+                  { id: null, label: "if" },
+                  { id: BRANCH_ELSE_HANDLE, label: "else" },
+                ]
+              : undefined,
+          hasOutputs: definition.sendsTo.length > 0,
+          receivesFromLabel: listNodeTypes(definition.receivesFrom),
+          sendsToLabel: listNodeTypes(definition.sendsTo),
+          helpTitle: definition.label,
+          helpDescription: definition.description,
+        };
+      }),
+    [graph, nodeRunBadges, outputResponseOnly],
+  );
   const displayedStdout = useMemo(() => {
     if (outputResponseOnly && runResult?.clean_stdout) {
       return runResult.clean_stdout;
@@ -3239,7 +1023,6 @@ export default function App() {
     }
     return extractAgentResponse(runResult.stdout);
   }, [runResult, outputResponseOnly]);
-  const pendingSourceNode = pendingConnectionSourceId ? nodeMap[pendingConnectionSourceId] : null;
   const inputNode = useMemo(() => getPrimaryInputNode(graph), [graph]);
   const inputSource = useMemo(() => (inputNode ? getInputSource(inputNode.data) : "manual"), [inputNode]);
   const inputMode = useMemo(() => (inputNode ? getInputMode(inputNode.data) : "text"), [inputNode]);
@@ -3397,15 +1180,15 @@ export default function App() {
     }
 
     const definition = NODE_CATALOG[type];
+    // One id for both the new node and the selection (ids are random, so it must not be
+    // generated twice).
     const nodeId = createNodeId(graph, type);
-    const nextIndex = graph.nodes.filter((node) => node.type === type).length + 1;
 
     setGraph((currentGraph) => {
       if (!currentGraph) {
         return currentGraph;
       }
 
-      const safeNodeId = createNodeId(currentGraph, type);
       const safeNextIndex = currentGraph.nodes.filter((node) => node.type === type).length + 1;
 
       return {
@@ -3413,9 +1196,9 @@ export default function App() {
         nodes: [
           ...currentGraph.nodes,
           {
-            id: safeNodeId,
+            id: nodeId,
             type,
-            position: createNodePosition(currentGraph),
+            position: nextNodePosition(currentGraph),
             data: definition.createData(safeNextIndex),
           },
         ],
@@ -3438,7 +1221,7 @@ export default function App() {
         return currentGraph;
       }
 
-      const safeNodeId = createNodeId(currentGraph, "input");
+      const safeNodeId = nodeId; // same id the node is selected by
       const nextIndex = currentGraph.nodes.filter((node) => node.type === "input").length + 1;
 
       return {
@@ -3448,7 +1231,7 @@ export default function App() {
           {
             id: safeNodeId,
             type: "input",
-            position: createNodePosition(currentGraph),
+            position: nextNodePosition(currentGraph),
             data: createData(nextIndex),
           },
         ],
@@ -3487,7 +1270,7 @@ export default function App() {
         return currentGraph;
       }
 
-      const safeNodeId = createNodeId(currentGraph, "output_api");
+      const safeNodeId = nodeId; // same id the node is selected by
       const nextIndex = currentGraph.nodes.filter((node) => node.type === "output_api").length + 1;
 
       return {
@@ -3497,7 +1280,7 @@ export default function App() {
           {
             id: safeNodeId,
             type: "output_api",
-            position: createNodePosition(currentGraph),
+            position: nextNodePosition(currentGraph),
             data: createData(nextIndex),
           },
         ],
@@ -3532,6 +1315,10 @@ export default function App() {
     }
     if (itemKey === "whatsapp-input") {
       addWhatsappInputNode();
+      return;
+    }
+    if (itemKey === "schedule-input") {
+      addConfiguredInputNode(createScheduleInputNodeData, "Schedule input added. Save the flow to start the schedule.");
       return;
     }
     if (itemKey === "form-input") {
@@ -3569,7 +1356,7 @@ export default function App() {
         return currentGraph;
       }
 
-      const safeNodeId = createNodeId(currentGraph, "tool");
+      const safeNodeId = nodeId; // same id the node is selected by
       const nextIndex = currentGraph.nodes.filter((node) => node.type === "tool").length + 1;
 
       return {
@@ -3579,7 +1366,7 @@ export default function App() {
           {
             id: safeNodeId,
             type: "tool",
-            position: createNodePosition(currentGraph),
+            position: nextNodePosition(currentGraph),
             data: createBuiltInToolData(tool, nextIndex),
           },
         ],
@@ -3602,7 +1389,7 @@ export default function App() {
         return currentGraph;
       }
 
-      const safeNodeId = createNodeId(currentGraph, "tool");
+      const safeNodeId = nodeId; // same id the node is selected by
 
       return {
         ...currentGraph,
@@ -3611,7 +1398,7 @@ export default function App() {
           {
             id: safeNodeId,
             type: "tool",
-            position: createNodePosition(currentGraph),
+            position: nextNodePosition(currentGraph),
             data: createSavedToolNodeData(tool),
           },
         ],
@@ -3634,7 +1421,7 @@ export default function App() {
         return currentGraph;
       }
 
-      const safeNodeId = createNodeId(currentGraph, "tool");
+      const safeNodeId = nodeId; // same id the node is selected by
 
       return {
         ...currentGraph,
@@ -3643,7 +1430,7 @@ export default function App() {
           {
             id: safeNodeId,
             type: "tool",
-            position: createNodePosition(currentGraph),
+            position: nextNodePosition(currentGraph),
             data: createStarterToolNodeData(tool),
           },
         ],
@@ -3670,7 +1457,7 @@ export default function App() {
         return currentGraph;
       }
 
-      const safeNodeId = createNodeId(currentGraph, type);
+      const safeNodeId = nodeId; // same id the node is selected by
       return {
         ...currentGraph,
         nodes: [
@@ -3678,7 +1465,7 @@ export default function App() {
           {
             id: safeNodeId,
             type,
-            position: createNodePosition(currentGraph),
+            position: nextNodePosition(currentGraph),
             data,
           },
         ],
@@ -3828,9 +1615,6 @@ export default function App() {
     if (editingFunctionNodeId === selectedNode.id) {
       setEditingFunctionNodeId(null);
     }
-    if (pendingConnectionSourceId === selectedNode.id) {
-      setPendingConnectionSourceId(null);
-    }
     setConnectionMessage(`${selectedNode.data.name} removed from canvas.`);
     setSelectedNodeId(null);
     setSelectedEdgeId(null);
@@ -3855,108 +1639,228 @@ export default function App() {
     setSelectedEdgeId(null);
   }
 
-  function startConnection(nodeId: string) {
+
+
+  function pushToast(message: string, tone: "info" | "success" | "error" = "info") {
+    toastIdRef.current += 1;
+    const id = toastIdRef.current;
+    setToasts((current) => [...current.slice(-3), { id, message, tone }]);
+    window.setTimeout(() => setToasts((current) => current.filter((toast) => toast.id !== id)), tone === "error" ? 7000 : 3800);
+  }
+
+  function dismissToast(id: number) {
+    setToasts((current) => current.filter((toast) => toast.id !== id));
+  }
+
+  /** Where a new node goes: the drop point if it came from a drag, else the visible center. */
+  function nextNodePosition(currentGraph: CanvasGraph): Position {
+    if (pendingDropPositionRef.current) {
+      return pendingDropPositionRef.current;
+    }
+    const center = flowCanvasRef.current?.getViewportCenter();
+    if (!center) {
+      return createNodePosition(currentGraph);
+    }
+    // Stagger so consecutive adds don't stack exactly on top of each other.
+    const stagger = (currentGraph.nodes.length % 6) * 24;
+    return { x: Math.round(center.x - NODE_WIDTH / 2 + stagger), y: Math.round(center.y - 40 + stagger) };
+  }
+
+  function canConnectNodeIds(sourceId: string, targetId: string): boolean {
+    const source = nodeMap[sourceId];
+    const target = nodeMap[targetId];
+    return Boolean(source && target && canConnect(source.type, target.type));
+  }
+
+  function connectNodes(sourceId: string, targetId: string, targetHandle: string | null = null) {
+    const sourceNode = nodeMap[sourceId];
+    const targetNode = nodeMap[targetId];
+    if (!graph || !sourceNode || !targetNode) {
+      return;
+    }
+    if (sourceNode.id === targetNode.id) {
+      setConnectionMessage("A component cannot be connected to itself.");
+      return;
+    }
+    if (!canConnect(sourceNode.type, targetNode.type)) {
+      setConnectionMessage(`${NODE_CATALOG[sourceNode.type].label} cannot connect to ${NODE_CATALOG[targetNode.type].label}.`);
+      return;
+    }
+    const edgeId = `edge_${sourceNode.id}_${targetNode.id}${targetHandle ? `_${targetHandle}` : ""}`;
+    setGraph((currentGraph) => {
+      if (
+        !currentGraph ||
+        currentGraph.edges.some(
+          (edge) => edge.source === sourceNode.id && edge.target === targetNode.id && (edge.target_handle ?? null) === targetHandle,
+        )
+      ) {
+        return currentGraph;
+      }
+      const edge = targetHandle
+        ? { id: edgeId, source: sourceNode.id, target: targetNode.id, target_handle: targetHandle }
+        : { id: edgeId, source: sourceNode.id, target: targetNode.id };
+      return { ...currentGraph, edges: [...currentGraph.edges, edge] };
+    });
+    setConnectionMessage(
+      `${sourceNode.data.name} connected to ${targetNode.data.name}${targetHandle ? ` (${targetHandle})` : ""}.`,
+    );
+  }
+
+  function handleNodesMoved(positions: Record<string, Position>) {
+    setGraph((currentGraph) =>
+      currentGraph
+        ? {
+            ...currentGraph,
+            nodes: currentGraph.nodes.map((node) => (positions[node.id] ? { ...node, position: positions[node.id] } : node)),
+          }
+        : currentGraph,
+    );
+  }
+
+  function handleCanvasSelectionChange(nodeIds: string[], edgeIds: string[]) {
+    setSelectedNodeIds(nodeIds);
+    setSelectedNodeId((current) => (current && nodeIds.includes(current) ? current : nodeIds[nodeIds.length - 1] ?? null));
+    setSelectedEdgeId(nodeIds.length === 0 ? edgeIds[0] ?? null : null);
+    if (nodeIds.length > 0 || edgeIds.length > 0) {
+      setActiveRightTab("properties");
+    }
+  }
+
+  function handleCanvasDelete(nodeIds: string[], edgeIds: string[]) {
+    if (!graph || (nodeIds.length === 0 && edgeIds.length === 0)) {
+      return;
+    }
+    setGraph((currentGraph) => (currentGraph ? removeFromGraph(currentGraph, nodeIds, edgeIds) : currentGraph));
+    if (editingFunctionNodeId && nodeIds.includes(editingFunctionNodeId)) {
+      setEditingFunctionNodeId(null);
+    }
+    setSelectedNodeId(null);
+    setSelectedNodeIds([]);
+    setSelectedEdgeId(null);
+    if (nodeIds.length === 1) {
+      setConnectionMessage(`${nodeMap[nodeIds[0]]?.data.name ?? "Node"} removed from canvas.`);
+    } else if (nodeIds.length > 1) {
+      setConnectionMessage(`${nodeIds.length} nodes removed from canvas.`);
+    } else {
+      setConnectionMessage(edgeIds.length === 1 ? "Connection removed from canvas." : `${edgeIds.length} connections removed.`);
+    }
+  }
+
+  function handleNodeDoubleClick(nodeId: string) {
     const node = nodeMap[nodeId];
     if (!node) {
       return;
     }
-
-    if (pendingConnectionSourceId === nodeId) {
-      setPendingConnectionSourceId(null);
-      setConnectionPointer(null);
-      setConnectionMessage("Connection canceled.");
+    if (node.type === "input") {
+      setSelectedNodeId(null);
+      setSelectedEdgeId(null);
+      setIsChatOpen((current) => !current);
       return;
     }
+    if (node.type === "output") {
+      setSelectedNodeId(node.id);
+      setActiveRightTab("code");
+      setOutputResponseOnly((current) => !current);
+    }
+  }
 
-    setSelectedNodeId(nodeId);
+  function handleLibraryDragStart(event: ReactDragEvent<HTMLElement>) {
+    const item = (event.target as HTMLElement).closest<HTMLButtonElement>("button.library-item, button.library-item-main");
+    if (!item || item.disabled) {
+      event.preventDefault();
+      return;
+    }
+    draggedLibraryItemRef.current = item;
+    event.dataTransfer.setData(LIBRARY_DRAG_MIME, item.textContent ?? "node");
+    event.dataTransfer.effectAllowed = "copy";
+  }
+
+  function handleLibraryItemDrop(position: Position) {
+    const item = draggedLibraryItemRef.current;
+    draggedLibraryItemRef.current = null;
+    if (!item) {
+      return;
+    }
+    // Library buttons add nodes through their click handlers; the drop point is picked up by
+    // nextNodePosition() while React processes the resulting state update.
+    pendingDropPositionRef.current = position;
+    item.click();
+    window.setTimeout(() => {
+      pendingDropPositionRef.current = null;
+    }, 0);
+  }
+
+  function handleZoomIn() {
+    flowCanvasRef.current?.zoomIn();
+  }
+
+  function handleZoomOut() {
+    flowCanvasRef.current?.zoomOut();
+  }
+
+  function handleZoomReset() {
+    flowCanvasRef.current?.resetZoom();
+  }
+
+  function handleFitView() {
+    flowCanvasRef.current?.fitView();
+  }
+
+  function handleAutoLayout() {
+    if (!graph || graph.nodes.length < 2) {
+      return;
+    }
+    setGraph(layoutGraphLayered(graph, (nodeId) => flowCanvasRef.current?.getNodeSize(nodeId)));
+    setConnectionMessage("Nodes arranged left to right by data flow.");
+    window.setTimeout(() => flowCanvasRef.current?.fitView(), 60);
+  }
+
+  function currentSelectionIds(): string[] {
+    if (selectedNodeIds.length > 0) return selectedNodeIds;
+    return selectedNodeId ? [selectedNodeId] : [];
+  }
+
+  function handleCopySelection(): boolean {
+    if (!graph) return false;
+    const clipboard = copySubgraph(graph, currentSelectionIds());
+    if (!clipboard) return false;
+    graphClipboardRef.current = clipboard;
+    setConnectionMessage(`Copied ${clipboard.nodes.length} node${clipboard.nodes.length === 1 ? "" : "s"}.`);
+    return true;
+  }
+
+  function pasteGraphClipboard(clipboard: GraphClipboard) {
+    if (!graph) return;
+    const result = pasteSubgraph(graph, clipboard);
+    setGraph(result.graph);
+    setSelectedNodeIds(result.pastedIds);
+    setSelectedNodeId(result.pastedIds[result.pastedIds.length - 1] ?? null);
     setSelectedEdgeId(null);
-    setPendingConnectionSourceId(nodeId);
-    setConnectionPointer({
-      x: node.position.x + NODE_WIDTH,
-      y: node.position.y + NODE_MIN_HEIGHT / 2,
-    });
-    setConnectionMessage(`Source selected: ${node.data.name}. Now click the destination input port.`);
+    // Paste again offsets from the new copy, not the original.
+    graphClipboardRef.current = copySubgraph(result.graph, result.pastedIds);
+    setConnectionMessage(`Pasted ${result.pastedIds.length} node${result.pastedIds.length === 1 ? "" : "s"}.`);
   }
 
-  function finishConnection(targetId: string) {
-    if (!graph || !pendingConnectionSourceId) {
-      return;
-    }
-
-    const sourceNode = nodeMap[pendingConnectionSourceId];
-    const targetNode = nodeMap[targetId];
-
-    if (!sourceNode || !targetNode) {
-      setPendingConnectionSourceId(null);
-      setConnectionPointer(null);
-      return;
-    }
-
-    if (sourceNode.id === targetNode.id) {
-      setConnectionMessage("A component cannot be connected to itself.");
-      setPendingConnectionSourceId(null);
-      setConnectionPointer(null);
-      return;
-    }
-
-    if (!canConnect(sourceNode.type, targetNode.type)) {
-      setConnectionMessage(
-        `${NODE_CATALOG[sourceNode.type].label} cannot connect to ${NODE_CATALOG[targetNode.type].label}.`,
-      );
-      setPendingConnectionSourceId(null);
-      setConnectionPointer(null);
-      return;
-    }
-
-    const alreadyExists = graph.edges.some(
-      (edge) => edge.source === sourceNode.id && edge.target === targetNode.id,
-    );
-
-    if (alreadyExists) {
-      setConnectionMessage("This connection already exists.");
-      setPendingConnectionSourceId(null);
-      setConnectionPointer(null);
-      return;
-    }
-
-    setGraph((currentGraph) => {
-      if (!currentGraph) {
-        return currentGraph;
-      }
-
-      const edgeAlreadyExists = currentGraph.edges.some(
-        (edge) => edge.source === sourceNode.id && edge.target === targetNode.id,
-      );
-      if (edgeAlreadyExists) {
-        return currentGraph;
-      }
-
-      return {
-        ...currentGraph,
-        edges: [
-          ...currentGraph.edges,
-          {
-            id: `edge_${sourceNode.id}_${targetNode.id}`,
-            source: sourceNode.id,
-            target: targetNode.id,
-          },
-        ],
-      };
-    });
-    setPendingConnectionSourceId(null);
-    setConnectionPointer(null);
-    setSelectedNodeId(null);
-    setSelectedEdgeId(`edge_${sourceNode.id}_${targetNode.id}`);
-    setConnectionMessage(`${sourceNode.data.name} connected to ${targetNode.data.name}.`);
+  function handlePasteClipboard(): boolean {
+    if (!graphClipboardRef.current) return false;
+    pasteGraphClipboard(graphClipboardRef.current);
+    return true;
   }
 
-  function selectEdge(edge: GraphEdge) {
-    setSelectedEdgeId(edge.id);
-    setSelectedNodeId(null);
-    setPendingConnectionSourceId(null);
-    setConnectionMessage(`Connection selected: ${nodeMap[edge.source]?.data.name ?? edge.source} -> ${nodeMap[edge.target]?.data.name ?? edge.target}.`);
-    setActiveRightTab("properties");
+  function handleDuplicateSelection() {
+    if (!graph) return;
+    const clipboard = copySubgraph(graph, currentSelectionIds());
+    if (clipboard) pasteGraphClipboard(clipboard);
   }
+
+  function handleSelectAllNodes() {
+    if (!graph) return;
+    const ids = graph.nodes.map((node) => node.id);
+    setSelectedNodeIds(ids);
+    setSelectedNodeId(ids[ids.length - 1] ?? null);
+    setSelectedEdgeId(null);
+  }
+
 
   function requestHitlRunConfirmation(message: string): Promise<boolean> {
     return new Promise((resolve) => {
@@ -4503,13 +2407,8 @@ export default function App() {
       pendingImportedFlowNameRef.current = imported.flowName;
       setSelectedNodeId(null);
       setSelectedEdgeId(null);
-      setPendingConnectionSourceId(null);
-      setConnectionPointer(null);
-      setCanvasPanState(null);
-      setCanvasOffset({ x: 0, y: 0 });
       setCanvasZoom(1);
       hasAutoCenteredRef.current = false;
-      ignoreCanvasClickRef.current = false;
 
       if (currentPath === importedFlowPath && currentSearch === "") {
         pendingImportedGraphRef.current = null;
@@ -4794,62 +2693,10 @@ export default function App() {
     }
   }
 
-  function getCanvasLocalPoint(clientX: number, clientY: number): PointerPosition | null {
-    const canvasRect = canvasRef.current?.getBoundingClientRect();
-    if (!canvasRect) {
-      return null;
-    }
 
-    return {
-      x: clientX - canvasRect.left,
-      y: clientY - canvasRect.top,
-    };
-  }
 
-  function applyCanvasZoom(nextZoom: number, anchor?: PointerPosition | null) {
-    const clampedZoom = clampCanvasZoom(nextZoom);
-    if (Math.abs(clampedZoom - canvasZoom) < 0.001) {
-      return;
-    }
 
-    const fallbackAnchor = canvasRef.current
-      ? {
-          x: canvasRef.current.clientWidth / 2,
-          y: canvasRef.current.clientHeight / 2,
-        }
-      : null;
-    const anchorPoint = anchor ?? fallbackAnchor;
 
-    if (!anchorPoint) {
-      setCanvasZoom(clampedZoom);
-      return;
-    }
-
-    const worldX = (anchorPoint.x - canvasOffset.x) / canvasZoom;
-    const worldY = (anchorPoint.y - canvasOffset.y) / canvasZoom;
-    setCanvasOffset({
-      x: anchorPoint.x - worldX * clampedZoom,
-      y: anchorPoint.y - worldY * clampedZoom,
-    });
-    setCanvasZoom(clampedZoom);
-  }
-
-  function handleZoomIn() {
-    applyCanvasZoom(canvasZoom + CANVAS_ZOOM_STEP);
-  }
-
-  function handleZoomOut() {
-    applyCanvasZoom(canvasZoom - CANVAS_ZOOM_STEP);
-  }
-
-  function handleZoomReset() {
-    setCanvasZoom(1);
-    setCanvasOffset({ x: 0, y: 0 });
-  }
-
-  function handleToggleTheme() {
-    setThemeMode((current) => (current === "dark" ? "light" : "dark"));
-  }
 
   function handleUndo() {
     if (!graph || historyPast.length === 0) {
@@ -4881,101 +2728,11 @@ export default function App() {
     setConnectionMessage("Redo applied.");
   }
 
-  function handleOrganizeNodes() {
-    if (!graph) {
-      return;
-    }
-    setGraph(organizeGraphNodes(graph));
-    setConnectionMessage("Nodes organized automatically.");
-  }
 
-  function handleMinimapClick(event: ReactMouseEvent<SVGSVGElement>) {
-    if (!minimapModel || !canvasRef.current) {
-      return;
-    }
 
-    const rect = event.currentTarget.getBoundingClientRect();
-    if (rect.width <= 0 || rect.height <= 0) {
-      return;
-    }
 
-    const minimapX = ((event.clientX - rect.left) / rect.width) * MINIMAP_WIDTH;
-    const minimapY = ((event.clientY - rect.top) / rect.height) * MINIMAP_HEIGHT;
-    const worldX = (minimapX - minimapModel.contentOffsetX) / minimapModel.scale + minimapModel.minX;
-    const worldY = (minimapY - minimapModel.contentOffsetY) / minimapModel.scale + minimapModel.minY;
 
-    setCanvasOffset({
-      x: canvasRef.current.clientWidth / 2 - worldX * canvasZoom,
-      y: canvasRef.current.clientHeight / 2 - worldY * canvasZoom,
-    });
-    ignoreCanvasClickRef.current = true;
-  }
 
-  function handleNodeMouseDown(nodeId: string, event: ReactMouseEvent<HTMLDivElement>) {
-    const target = event.target as HTMLElement;
-    if (target.closest("button")) {
-      return;
-    }
-
-    const canvasRect = canvasRef.current?.getBoundingClientRect();
-    const node = nodeMap[nodeId];
-    if (!canvasRect || !node) {
-      return;
-    }
-
-    setSelectedNodeId(nodeId);
-    setDragState({
-      nodeId,
-      offsetX: (event.clientX - canvasRect.left - canvasOffset.x) / canvasZoom - node.position.x,
-      offsetY: (event.clientY - canvasRect.top - canvasOffset.y) / canvasZoom - node.position.y,
-    });
-  }
-
-  function handleCanvasMouseDown(event: ReactMouseEvent<HTMLElement>) {
-    if (event.button !== 0 || pendingConnectionSourceId) {
-      return;
-    }
-
-    if (!isCanvasBackgroundTarget(event.target, event.currentTarget)) {
-      return;
-    }
-
-    ignoreCanvasClickRef.current = false;
-    setCanvasPanState({
-      startX: event.clientX,
-      startY: event.clientY,
-      originX: canvasOffset.x,
-      originY: canvasOffset.y,
-    });
-    event.preventDefault();
-  }
-
-  function handleCanvasWheel(event: ReactWheelEvent<HTMLElement>) {
-    if (!event.ctrlKey && !event.metaKey) {
-      return;
-    }
-
-    const anchor = getCanvasLocalPoint(event.clientX, event.clientY);
-    const direction = event.deltaY < 0 ? 1 : -1;
-    applyCanvasZoom(canvasZoom + direction * CANVAS_ZOOM_STEP, anchor);
-    event.preventDefault();
-  }
-
-  function handleCanvasPointerMove(event: ReactMouseEvent<HTMLElement>) {
-    if (!pendingConnectionSourceId) {
-      return;
-    }
-
-    const canvasRect = canvasRef.current?.getBoundingClientRect();
-    if (!canvasRect) {
-      return;
-    }
-
-    setConnectionPointer({
-      x: (event.clientX - canvasRect.left - canvasOffset.x) / canvasZoom,
-      y: (event.clientY - canvasRect.top - canvasOffset.y) / canvasZoom,
-    });
-  }
 
   function renderRequiredMark(field: { required?: boolean }) {
     if (!field.required) {
@@ -5843,2324 +3600,54 @@ export default function App() {
     }
 
     if (selectedNode.type === "database") {
-      const currentNode = selectedNode;
-      const currentGraph = graph;
-      if (!currentGraph) {
-        return null;
-      }
-      const currentPreset = fieldValueAsString(currentNode.data.extras?.dbPreset) as DatabasePresetKey;
-      const currentExtras = currentNode.data.extras ?? {};
-      const updateDatabaseConfig = (patch: Record<string, unknown>) =>
-        setGraph(
-          updateNodeData(currentGraph, currentNode.id, {
-            extras: {
-              ...currentExtras,
-              ...patch,
-              dbExpression: buildDatabaseExpressionFromExtras(currentPreset, {
-                ...currentExtras,
-                ...patch,
-              }),
-            },
-          }),
-        );
-
-      return (
-        <>
-          <label>
-            {renderInspectorPropertyLabel("Name", "Display name used in the canvas and in connected component selectors.", true)}
-            <input
-              value={currentNode.data.name}
-              onChange={(event) => setGraph(updateNodeData(currentGraph, currentNode.id, { name: event.target.value }))}
-            />
-          </label>
-          <label>
-            {renderInspectorPropertyLabel("Database Preset", "Defines the database backend type for this node. The backend type is fixed after creation.")}
-            <select value={currentPreset} disabled>
-              {DATABASE_LIBRARY_ITEMS.map((item) => (
-                <option key={item.key} value={item.key}>
-                  {item.label}
-                </option>
-              ))}
-            </select>
-          </label>
-          <p className="muted small-note">This preset is fixed by the component type. Create a new Database node to switch backends.</p>
-          {currentPreset === "sqlite-db" ? (
-            <>
-              <label>
-                {renderInspectorPropertyLabel("Directory Path", "Folder where the SQLite database file will be created or reused.")}
-                <input
-                  value={fieldValueAsString(currentExtras.dbDirectory)}
-                  onChange={(event) => updateDatabaseConfig({ dbDirectory: event.target.value })}
-                />
-              </label>
-              <label>
-                {renderInspectorPropertyLabel("Database Name", "File name used for the SQLite database, without the .db suffix.")}
-                <input
-                  value={fieldValueAsString(currentExtras.dbName)}
-                  onChange={(event) => updateDatabaseConfig({ dbName: event.target.value })}
-                />
-              </label>
-              <div className="info-note">
-                <p>SQLite file</p>
-                <p>{buildSqliteDbFilePath(fieldValueAsString(currentExtras.dbDirectory), fieldValueAsString(currentExtras.dbName))}</p>
-              </div>
-            </>
-          ) : (
-            <>
-              <label>
-                {renderInspectorPropertyLabel("Host", "Hostname or IP address of the database server.")}
-                <input
-                  value={fieldValueAsString(currentExtras.dbHost)}
-                  onChange={(event) => updateDatabaseConfig({ dbHost: event.target.value })}
-                />
-              </label>
-              <label>
-                {renderInspectorPropertyLabel("Port", "Port used by the database server.")}
-                <input
-                  value={fieldValueAsString(currentExtras.dbPort)}
-                  onChange={(event) => updateDatabaseConfig({ dbPort: event.target.value })}
-                />
-              </label>
-              <label>
-                {renderInspectorPropertyLabel("Database Name", "Logical database name to connect to on the server.")}
-                <input
-                  value={fieldValueAsString(currentExtras.dbName)}
-                  onChange={(event) => updateDatabaseConfig({ dbName: event.target.value })}
-                />
-              </label>
-              <label>
-                {renderInspectorPropertyLabel("Username", "Database user name used for the connection string.")}
-                <input
-                  value={fieldValueAsString(currentExtras.dbUsername)}
-                  onChange={(event) => updateDatabaseConfig({ dbUsername: event.target.value })}
-                />
-              </label>
-              <label>
-                {renderInspectorPropertyLabel("Password", "Database password used for the connection string.")}
-                <input
-                  type="password"
-                  value={fieldValueAsString(currentExtras.dbPassword)}
-                  onChange={(event) => updateDatabaseConfig({ dbPassword: event.target.value })}
-                />
-              </label>
-            </>
-          )}
-        </>
-      );
+      return <DatabaseInspector selectedNode={selectedNode} graph={graph} setGraph={setGraph} />;
     }
 
     if (selectedNode.type === "vector_db") {
-      const currentNode = selectedNode;
-      const currentGraph = graph;
-      if (!currentGraph) {
-        return null;
-      }
-      const currentPreset = fieldValueAsString(currentNode.data.extras?.vectorPreset) as VectorDbPresetKey;
-      const currentExtras = currentNode.data.extras ?? {};
-      const resolvedVectorConfig = resolveVectorDbConfig(currentPreset, currentExtras);
-      const generatedExpression = buildVectorDbExpressionFromExtras(currentPreset, resolvedVectorConfig);
-      const hasLegacyExpression =
-        !hasStructuredVectorDbConfig(currentPreset, currentExtras) &&
-        Boolean(fieldValueAsString(currentExtras.vectorExpression).trim()) &&
-        fieldValueAsString(currentExtras.vectorExpression).trim() !== generatedExpression;
-      const updateVectorDbConfig = (patch: Record<string, unknown>) => {
-        const nextExtras = {
-          ...currentExtras,
-          ...resolvedVectorConfig,
-          ...patch,
-        };
-        nextExtras.vectorExpression = buildVectorDbExpressionFromExtras(currentPreset, nextExtras);
-        setGraph(updateNodeData(currentGraph, currentNode.id, { extras: nextExtras }));
-      };
-
-      return (
-        <>
-          <label>
-            {renderInspectorPropertyLabel("Name", "Display name used in the canvas and in connected component selectors.", true)}
-            <input
-              value={currentNode.data.name}
-              onChange={(event) => setGraph(updateNodeData(currentGraph, currentNode.id, { name: event.target.value }))}
-            />
-          </label>
-          <label>
-            {renderInspectorPropertyLabel("Vector DB Preset", "Defines the vector store type for this node. The store type is fixed after creation.")}
-            <select value={currentPreset} disabled>
-              {VECTOR_DB_LIBRARY_ITEMS.map((item) => (
-                <option key={item.key} value={item.key}>
-                  {item.label}
-                </option>
-              ))}
-            </select>
-          </label>
-          <p className="muted small-note">This preset is fixed by the component type. Create a new Vector DB node to switch stores.</p>
-          {hasLegacyExpression ? (
-            <div className="info-note">
-              <p>Legacy expression detected</p>
-              <p>Editing the fields below will replace the previous custom expression with the generated configuration.</p>
-            </div>
-          ) : null}
-          {currentPreset === "pgvector" ? (
-            <>
-              <label>
-                {renderInspectorPropertyLabel("Table Name", "Table used to store the document embeddings in PostgreSQL.")}
-                <input
-                  value={fieldValueAsString(resolvedVectorConfig.vectorTableName)}
-                  onChange={(event) => updateVectorDbConfig({ vectorTableName: event.target.value })}
-                />
-              </label>
-              <label>
-                {renderInspectorPropertyLabel("Database URL", "Full PostgreSQL connection URL used by PgVector.")}
-                <input
-                  value={fieldValueAsString(resolvedVectorConfig.vectorDbUrl)}
-                  onChange={(event) => updateVectorDbConfig({ vectorDbUrl: event.target.value })}
-                />
-              </label>
-            </>
-          ) : null}
-          {currentPreset === "qdrant" ? (
-            <>
-              <label>
-                {renderInspectorPropertyLabel("Collection", "Qdrant collection name used to store the vectors.")}
-                <input
-                  value={fieldValueAsString(resolvedVectorConfig.vectorCollection)}
-                  onChange={(event) => updateVectorDbConfig({ vectorCollection: event.target.value })}
-                />
-              </label>
-              <label>
-                {renderInspectorPropertyLabel("URL", "Base URL of the Qdrant instance.")}
-                <input
-                  value={fieldValueAsString(resolvedVectorConfig.vectorUrl)}
-                  onChange={(event) => updateVectorDbConfig({ vectorUrl: event.target.value })}
-                />
-              </label>
-            </>
-          ) : null}
-          {currentPreset === "chroma" ? (
-            <>
-              <label>
-                {renderInspectorPropertyLabel("Collection", "Chroma collection name used to group the vectors.")}
-                <input
-                  value={fieldValueAsString(resolvedVectorConfig.vectorCollection)}
-                  onChange={(event) => updateVectorDbConfig({ vectorCollection: event.target.value })}
-                />
-              </label>
-              <label>
-                {renderInspectorPropertyLabel("Path", "Local path where Chroma persists its data.")}
-                <input
-                  value={fieldValueAsString(resolvedVectorConfig.vectorPath)}
-                  onChange={(event) => updateVectorDbConfig({ vectorPath: event.target.value })}
-                />
-              </label>
-            </>
-          ) : null}
-          {currentPreset === "pinecone" ? (
-            <>
-              <label>
-                {renderInspectorPropertyLabel("Index Name", "Pinecone index name used for vector storage.")}
-                <input
-                  value={fieldValueAsString(resolvedVectorConfig.vectorName)}
-                  onChange={(event) => updateVectorDbConfig({ vectorName: event.target.value })}
-                />
-              </label>
-              <label>
-                {renderInspectorPropertyLabel("Dimension", "Embedding dimension expected by the Pinecone index.")}
-                <input
-                  type="number"
-                  value={fieldValueAsString(resolvedVectorConfig.vectorDimension)}
-                  onChange={(event) => updateVectorDbConfig({ vectorDimension: event.target.value })}
-                />
-              </label>
-              <label>
-                {renderInspectorPropertyLabel("Metric", "Distance metric used by the Pinecone index.")}
-                <select
-                  value={fieldValueAsString(resolvedVectorConfig.vectorMetric)}
-                  onChange={(event) => updateVectorDbConfig({ vectorMetric: event.target.value })}
-                >
-                  <option value="cosine">cosine</option>
-                  <option value="dotproduct">dotproduct</option>
-                  <option value="euclidean">euclidean</option>
-                </select>
-              </label>
-            </>
-          ) : null}
-          {currentPreset === "lancedb" ? (
-            <>
-              <label>
-                {renderInspectorPropertyLabel("URI", "Filesystem path or URI used by LanceDB.")}
-                <input
-                  value={fieldValueAsString(resolvedVectorConfig.vectorUri)}
-                  onChange={(event) => updateVectorDbConfig({ vectorUri: event.target.value })}
-                />
-              </label>
-              <label>
-                {renderInspectorPropertyLabel("Table Name", "Table used by LanceDB to store vectors.")}
-                <input
-                  value={fieldValueAsString(resolvedVectorConfig.vectorTableName)}
-                  onChange={(event) => updateVectorDbConfig({ vectorTableName: event.target.value })}
-                />
-              </label>
-            </>
-          ) : null}
-          {currentPreset === "weaviate" ? (
-            <>
-              <label>
-                {renderInspectorPropertyLabel("Collection", "Weaviate collection name used to store the vectors.")}
-                <input
-                  value={fieldValueAsString(resolvedVectorConfig.vectorCollection)}
-                  onChange={(event) => updateVectorDbConfig({ vectorCollection: event.target.value })}
-                />
-              </label>
-              <label>
-                {renderInspectorPropertyLabel("URL", "Base URL of the Weaviate instance.")}
-                <input
-                  value={fieldValueAsString(resolvedVectorConfig.vectorUrl)}
-                  onChange={(event) => updateVectorDbConfig({ vectorUrl: event.target.value })}
-                />
-              </label>
-            </>
-          ) : null}
-          <label>
-            {renderInspectorPropertyLabel("Generated Vector DB Expression", "Preview of the Agno expression generated from the fields above.")}
-            <textarea className="code-input" value={generatedExpression} readOnly />
-          </label>
-        </>
-      );
+      return <VectorDbInspector selectedNode={selectedNode} graph={graph} setGraph={setGraph} />;
     }
 
     if (selectedNode.type === "knowledge") {
-      const currentNode = selectedNode;
-      const currentGraph = graph;
-      if (!currentGraph) {
-        return null;
-      }
-      const currentExtras = {
-        ...getDefaultKnowledgeExtras("knowledge"),
-        ...(currentNode.data.extras ?? {}),
-      };
-      const connectedVectorDb =
-        currentGraph.edges
-          .filter((edge) => edge.target === currentNode.id)
-          .map((edge) => nodeMap[edge.source])
-          .find((node): node is GraphNode => Boolean(node) && node.type === "vector_db") ?? null;
-      const connectedDatabase =
-        currentGraph.edges
-          .filter((edge) => edge.target === currentNode.id)
-          .map((edge) => nodeMap[edge.source])
-          .find((node): node is GraphNode => Boolean(node) && node.type === "database") ?? null;
-      const resolvedVectorExpression = connectedVectorDb
-        ? fieldValueAsString(connectedVectorDb.data.extras?.vectorExpression)
-        : buildVectorDbExpression("pgvector");
-      const generatedExpression = buildKnowledgeExpressionFromExtras(
-        currentExtras,
-        resolvedVectorExpression,
-        currentNode.data.name,
-        currentNode.data.description,
-      );
-      const hasLegacyExpression =
-        Boolean(fieldValueAsString(currentNode.data.extras?.knowledgeExpression).trim()) &&
-        fieldValueAsString(currentNode.data.extras?.knowledgeExpression).trim() !== generatedExpression &&
-        currentNode.data.extras?.knowledgeReader === undefined &&
-        currentNode.data.extras?.ingestAttachedFiles === undefined &&
-        currentNode.data.extras?.knowledgeMaxResults === undefined;
-      const updateKnowledgeConfig = (patch: Record<string, unknown>) => {
-        const nextExtras: Record<string, unknown> = {
-          ...currentExtras,
-          ...patch,
-        };
-        nextExtras.knowledgeExpression = buildKnowledgeExpressionFromExtras(
-          nextExtras,
-          resolvedVectorExpression,
-          currentNode.data.name,
-          currentNode.data.description,
-        );
-        setGraph(updateNodeData(currentGraph, currentNode.id, { extras: nextExtras }));
-      };
-      const selectedKnowledgeReader = fieldValueAsString(currentExtras.knowledgeReader || "auto") as KnowledgeReaderKey;
-
-      return (
-        <>
-          <label>
-            {renderInspectorPropertyLabel("Name", "Display name used in the canvas and in connected component selectors.", true)}
-            <input
-              value={currentNode.data.name}
-              onChange={(event) => setGraph(updateNodeData(graph, currentNode.id, { name: event.target.value }))}
-            />
-          </label>
-          <label>
-            {renderInspectorPropertyLabel("Description", "Optional description stored on the generated Knowledge object.")}
-            <textarea
-              value={fieldValueAsString(currentNode.data.description)}
-              onChange={(event) => setGraph(updateNodeData(currentGraph, currentNode.id, { description: event.target.value }))}
-            />
-          </label>
-          {connectedVectorDb ? (
-            <>
-              <label>
-                {renderInspectorPropertyLabel("Connected Vector DB", "Vector DB currently connected to this Knowledge node.")}
-                <select value={connectedVectorDb.data.name} disabled>
-                  <option value={connectedVectorDb.data.name}>{connectedVectorDb.data.name}</option>
-                </select>
-              </label>
-              <p className="muted small-note">Read-only because it is connected from {connectedVectorDb.data.name}.</p>
-            </>
-          ) : (
-            <div className="info-note">
-              <p>Connect a Vector DB node to control the knowledge storage visually.</p>
-            </div>
-          )}
-          {hasLegacyExpression ? (
-            <div className="info-note">
-              <p>Legacy expression detected</p>
-              <p>Editing the structured fields below will replace the previous custom Knowledge expression.</p>
-            </div>
-          ) : null}
-          <label>
-            {renderInspectorPropertyLabel("Max Results", "Default number of retrieved chunks returned by this Knowledge base.")}
-            <input
-              type="number"
-              min="1"
-              value={fieldValueAsString(currentExtras.knowledgeMaxResults)}
-              onChange={(event) => updateKnowledgeConfig({ knowledgeMaxResults: event.target.value })}
-            />
-          </label>
-          <label className="checkbox-field">
-            <input
-              type="checkbox"
-              checked={Boolean(currentExtras.knowledgeIsolateVectorSearch)}
-              onChange={(event) => updateKnowledgeConfig({ knowledgeIsolateVectorSearch: event.target.checked })}
-            />
-            {renderInspectorPropertyLabel("Isolate Vector Search", "Adds isolation metadata so this knowledge only searches its own linked content when multiple knowledge bases share the same vector DB.")}
-          </label>
-          <label className="checkbox-field">
-            <input
-              type="checkbox"
-              checked={Boolean(currentExtras.includeContentsDb)}
-              onChange={(event) => updateKnowledgeConfig({ includeContentsDb: event.target.checked })}
-            />
-            {renderInspectorPropertyLabel("Enable Contents DB", "Adds a contents database layer to the Knowledge node for tracking, filtering, and deletion workflows.")}
-          </label>
-          {Boolean(currentExtras.includeContentsDb) ? (
-            connectedDatabase ? (
-              <>
-                <label>
-                  {renderInspectorPropertyLabel("Connected Contents DB", "Database currently connected as the contents DB for this Knowledge node.")}
-                  <select value={connectedDatabase.data.name} disabled>
-                    <option value={connectedDatabase.data.name}>{connectedDatabase.data.name}</option>
-                  </select>
-                </label>
-                <p className="muted small-note">Read-only because it is connected from {connectedDatabase.data.name}.</p>
-              </>
-            ) : (
-              <label>
-                {renderInspectorPropertyLabel("Contents DB Expression", "Fallback contents DB expression used when there is no Database node connected.")}
-                <textarea
-                  className="code-input"
-                  value={fieldValueAsString(currentExtras.contentsDbExpression)}
-                  onChange={(event) => updateKnowledgeConfig({ contentsDbExpression: event.target.value })}
-                />
-              </label>
-            )
-          ) : null}
-          <label>
-            {renderInspectorPropertyLabel("Reader", "Choose how attached knowledge files should be parsed before indexing. Auto Detect follows Agno's default selection by extension and MIME type.")}
-            <select
-              value={selectedKnowledgeReader}
-              onChange={(event) => updateKnowledgeConfig({ knowledgeReader: event.target.value })}
-            >
-              {KNOWLEDGE_READER_OPTIONS.map((option) => (
-                <option key={option.key} value={option.key}>
-                  {option.label}
-                </option>
-              ))}
-            </select>
-          </label>
-          <p className="muted small-note">
-            {KNOWLEDGE_READER_OPTIONS.find((option) => option.key === selectedKnowledgeReader)?.description}
-          </p>
-          {selectedKnowledgeReader === "pdf" ? (
-            <>
-              <label className="checkbox-field">
-                <input
-                  type="checkbox"
-                  checked={currentExtras.knowledgeSplitOnPages !== false}
-                  onChange={(event) => updateKnowledgeConfig({ knowledgeSplitOnPages: event.target.checked })}
-                />
-                {renderInspectorPropertyLabel("Split PDF On Pages", "Keeps page boundaries when the PDF reader builds documents.")}
-              </label>
-              <label>
-                {renderInspectorPropertyLabel("PDF Password", "Optional password for protected PDF files.")}
-                <input
-                  type="password"
-                  value={fieldValueAsString(currentExtras.knowledgePassword)}
-                  onChange={(event) => updateKnowledgeConfig({ knowledgePassword: event.target.value })}
-                />
-              </label>
-            </>
-          ) : null}
-          {selectedKnowledgeReader === "excel" ? (
-            <label>
-              {renderInspectorPropertyLabel("Excel Sheets", "Optional comma-separated list of sheet names or 1-based indexes to ingest. Leave empty to include all sheets.")}
-              <input
-                value={fieldValueAsString(currentExtras.knowledgeExcelSheets)}
-                onChange={(event) => updateKnowledgeConfig({ knowledgeExcelSheets: event.target.value })}
-              />
-            </label>
-          ) : null}
-          {selectedKnowledgeReader === "field_labeled_csv" ? (
-            <>
-              <label>
-                {renderInspectorPropertyLabel("CSV Chunk Title", "Optional heading added before each field-labeled CSV row.")}
-                <input
-                  value={fieldValueAsString(currentExtras.knowledgeCsvChunkTitle)}
-                  onChange={(event) => updateKnowledgeConfig({ knowledgeCsvChunkTitle: event.target.value })}
-                />
-              </label>
-              <label>
-                {renderInspectorPropertyLabel("CSV Field Names", "Optional comma-separated field names used instead of the CSV headers.")}
-                <input
-                  value={fieldValueAsString(currentExtras.knowledgeCsvFieldNames)}
-                  onChange={(event) => updateKnowledgeConfig({ knowledgeCsvFieldNames: event.target.value })}
-                />
-              </label>
-              <label className="checkbox-field">
-                <input
-                  type="checkbox"
-                  checked={currentExtras.knowledgeCsvFormatHeaders !== false}
-                  onChange={(event) => updateKnowledgeConfig({ knowledgeCsvFormatHeaders: event.target.checked })}
-                />
-                {renderInspectorPropertyLabel("Format CSV Headers", "Turns raw CSV headers into friendlier labels when field-labeled CSV mode is used.")}
-              </label>
-              <label className="checkbox-field">
-                <input
-                  type="checkbox"
-                  checked={currentExtras.knowledgeCsvSkipEmptyFields !== false}
-                  onChange={(event) => updateKnowledgeConfig({ knowledgeCsvSkipEmptyFields: event.target.checked })}
-                />
-                {renderInspectorPropertyLabel("Skip Empty CSV Fields", "Skips blank values when building field-labeled CSV documents.")}
-              </label>
-            </>
-          ) : null}
-          <label className="checkbox-field">
-            <input
-              type="checkbox"
-              checked={currentExtras.ingestAttachedFiles !== false}
-              onChange={(event) => updateKnowledgeConfig({ ingestAttachedFiles: event.target.checked })}
-            />
-            {renderInspectorPropertyLabel("Ingest Attached Files", "Indexes supported attached files from the Input node into this Knowledge base before the Agent or Team runs.")}
-          </label>
-          <label className="checkbox-field">
-            <input
-              type="checkbox"
-              checked={Boolean(currentExtras.ingestInputText)}
-              onChange={(event) => updateKnowledgeConfig({ ingestInputText: event.target.checked })}
-            />
-            {renderInspectorPropertyLabel("Ingest Input Text", "Also indexes the plain text input as knowledge before runtime retrieval.")}
-          </label>
-          <label>
-            {renderInspectorPropertyLabel("Static Text", "Optional static text that should always be inserted into this Knowledge base at runtime.")}
-            <textarea
-              value={fieldValueAsString(currentExtras.staticText)}
-              onChange={(event) => updateKnowledgeConfig({ staticText: event.target.value })}
-            />
-          </label>
-          <label>
-            {renderInspectorPropertyLabel("Static URLs", "Optional URLs, one per line, that should be inserted into this Knowledge base at runtime.")}
-            <textarea
-              className="code-input"
-              value={fieldValueAsString(currentExtras.staticUrls)}
-              onChange={(event) => updateKnowledgeConfig({ staticUrls: event.target.value })}
-            />
-          </label>
-          <label>
-            {renderInspectorPropertyLabel("Generated Knowledge Expression", "Preview of the Agno Knowledge expression generated from the structured fields above.")}
-            <textarea className="code-input" value={generatedExpression} readOnly />
-          </label>
-        </>
-      );
+      return <KnowledgeInspector selectedNode={selectedNode} graph={graph} nodeMap={nodeMap} setGraph={setGraph} />;
     }
 
     if (selectedNode.type === "learning_machine") {
-      const currentNode = selectedNode;
-      const currentGraph = graph;
-      if (!currentGraph) {
-        return null;
-      }
-      const currentExtras = {
-        ...getDefaultLearningMachineExtras(),
-        ...(currentNode.data.extras ?? {}),
-      };
-      const connectedDatabase =
-        currentGraph.edges
-          .filter((edge) => edge.target === currentNode.id)
-          .map((edge) => nodeMap[edge.source])
-          .find((node): node is GraphNode => Boolean(node) && node.type === "database") ?? null;
-      const connectedKnowledge =
-        currentGraph.edges
-          .filter((edge) => edge.target === currentNode.id)
-          .map((edge) => nodeMap[edge.source])
-          .find((node): node is GraphNode => Boolean(node) && node.type === "knowledge") ?? null;
-      const connectedDbExpression = connectedDatabase ? fieldValueAsString(connectedDatabase.data.extras?.dbExpression) : undefined;
-      const connectedKnowledgeExpression = connectedKnowledge ? fieldValueAsString(connectedKnowledge.data.extras?.knowledgeExpression) : undefined;
-      const learningModelPreview = Boolean(currentExtras.useLearningModel)
-        ? toPythonString(`${fieldValueAsString(currentNode.data.provider) || "openai"}:${fieldValueAsString(currentNode.data.model) || "gpt-4.1-mini"}`)
-        : undefined;
-      const generatedExpression = buildLearningMachineExpressionFromExtras(
-        currentExtras,
-        connectedDbExpression,
-        connectedKnowledgeExpression,
-        learningModelPreview,
-      );
-      const updateLearningMachineConfig = (patch: Record<string, unknown>) => {
-        const nextExtras: Record<string, unknown> = {
-          ...currentExtras,
-          ...patch,
-        };
-        const nextLearningModelPreview = Boolean(nextExtras.useLearningModel)
-          ? toPythonString(`${fieldValueAsString(currentNode.data.provider) || "openai"}:${fieldValueAsString(currentNode.data.model) || "gpt-4.1-mini"}`)
-          : undefined;
-        nextExtras.learningMachineExpression = buildLearningMachineExpressionFromExtras(
-          nextExtras,
-          connectedDbExpression,
-          connectedKnowledgeExpression,
-          nextLearningModelPreview,
-        );
-        setGraph(updateNodeData(currentGraph, currentNode.id, { extras: nextExtras }));
-      };
-
-      return (
-        <>
-          <label>
-            {renderInspectorPropertyLabel("Name", "Display name used in the canvas and in connected component selectors.", true)}
-            <input
-              value={currentNode.data.name}
-              onChange={(event) => setGraph(updateNodeData(currentGraph, currentNode.id, { name: event.target.value }))}
-            />
-          </label>
-          <label>
-            {renderInspectorPropertyLabel("Description", "Optional description for the canvas and future docs/export surfaces.")}
-            <textarea
-              value={fieldValueAsString(currentNode.data.description)}
-              onChange={(event) => setGraph(updateNodeData(currentGraph, currentNode.id, { description: event.target.value }))}
-            />
-          </label>
-          {connectedDatabase ? (
-            <>
-              <label>
-                {renderInspectorPropertyLabel("Connected Database", "Database currently connected to this Learning Machine.")}
-                <select value={connectedDatabase.data.name} disabled>
-                  <option value={connectedDatabase.data.name}>{connectedDatabase.data.name}</option>
-                </select>
-              </label>
-              <p className="muted small-note">Read-only because it is connected from {connectedDatabase.data.name}.</p>
-            </>
-          ) : (
-            <div className="info-note">
-              <p>Connect a Database node if you want this Learning Machine to persist state outside the default runtime behavior.</p>
-            </div>
-          )}
-          {connectedKnowledge ? (
-            <>
-              <label>
-                {renderInspectorPropertyLabel("Connected Knowledge", "Knowledge resource currently connected to this Learning Machine.")}
-                <select value={connectedKnowledge.data.name} disabled>
-                  <option value={connectedKnowledge.data.name}>{connectedKnowledge.data.name}</option>
-                </select>
-              </label>
-              <p className="muted small-note">Read-only because it is connected from {connectedKnowledge.data.name}.</p>
-            </>
-          ) : (
-            <div className="info-note">
-              <p>Connect a Knowledge node when you want learned knowledge to use a dedicated store.</p>
-            </div>
-          )}
-          <label className="checkbox-field">
-            <input
-              type="checkbox"
-              checked={Boolean(currentExtras.useLearningModel)}
-              onChange={(event) => updateLearningMachineConfig({ useLearningModel: event.target.checked })}
-            />
-            {renderInspectorPropertyLabel("Use Learning Model", "Enables a dedicated provider/model pair for learning operations instead of relying on Agno defaults.")}
-          </label>
-          {Boolean(currentExtras.useLearningModel) ? (
-            <>
-              <label>
-                {renderInspectorPropertyLabel("Provider Preset", "Applies the provider catalog defaults for this learning model.")}
-                <select
-                  value={fieldValueAsString(getProviderConfig(currentNode.data).provider_profile)}
-                  onChange={(event) =>
-                    setGraph(updateNodeData(currentGraph, currentNode.id, applyProviderPreset(currentNode.data, event.target.value)))
-                  }
-                >
-                  <option value="">Not set</option>
-                  {AGNO_MODEL_PROVIDER_OPTIONS.map((provider) => (
-                    <option key={provider} value={provider}>
-                      {provider}
-                    </option>
-                  ))}
-                </select>
-              </label>
-              <label>
-                {renderInspectorPropertyLabel("Provider", "Provider id used to build the learning model instance.")}
-                <input
-                  value={fieldValueAsString(currentNode.data.provider)}
-                  onChange={(event) => setGraph(updateNodeData(currentGraph, currentNode.id, { provider: event.target.value }))}
-                />
-              </label>
-              <label>
-                {renderInspectorPropertyLabel("Model", "Model id used for the learning operations.")}
-                <input
-                  value={fieldValueAsString(currentNode.data.model)}
-                  onChange={(event) => setGraph(updateNodeData(currentGraph, currentNode.id, { model: event.target.value }))}
-                />
-              </label>
-            </>
-          ) : null}
-          <label>
-            {renderInspectorPropertyLabel("Namespace", "Logical namespace used by the Learning Machine to isolate tenants or environments.")}
-            <input
-              value={fieldValueAsString(currentExtras.learningNamespace)}
-              onChange={(event) => updateLearningMachineConfig({ learningNamespace: event.target.value })}
-            />
-          </label>
-          <label className="checkbox-field">
-            <input
-              type="checkbox"
-              checked={Boolean(currentExtras.learningUserProfile)}
-              onChange={(event) => updateLearningMachineConfig({ learningUserProfile: event.target.checked })}
-            />
-            {renderInspectorPropertyLabel("User Profile Store", "Tracks stable profile facts and long-lived user preferences.")}
-          </label>
-          <label className="checkbox-field">
-            <input
-              type="checkbox"
-              checked={Boolean(currentExtras.learningUserMemory)}
-              onChange={(event) => updateLearningMachineConfig({ learningUserMemory: event.target.checked })}
-            />
-            {renderInspectorPropertyLabel("User Memory Store", "Stores user-specific memories that can be recalled across sessions.")}
-          </label>
-          <label className="checkbox-field">
-            <input
-              type="checkbox"
-              checked={Boolean(currentExtras.learningSessionContext)}
-              onChange={(event) => updateLearningMachineConfig({ learningSessionContext: event.target.checked })}
-            />
-            {renderInspectorPropertyLabel("Session Context Store", "Persists session-level context learned during execution.")}
-          </label>
-          <label className="checkbox-field">
-            <input
-              type="checkbox"
-              checked={Boolean(currentExtras.learningEntityMemory)}
-              onChange={(event) => updateLearningMachineConfig({ learningEntityMemory: event.target.checked })}
-            />
-            {renderInspectorPropertyLabel("Entity Memory Store", "Keeps memory about third-party entities, accounts, or external objects.")}
-          </label>
-          <label className="checkbox-field">
-            <input
-              type="checkbox"
-              checked={Boolean(currentExtras.learningLearnedKnowledge)}
-              onChange={(event) => updateLearningMachineConfig({ learningLearnedKnowledge: event.target.checked })}
-            />
-            {renderInspectorPropertyLabel("Learned Knowledge Store", "Stores knowledge synthesized from prior runs and observations.")}
-          </label>
-          <label className="checkbox-field">
-            <input
-              type="checkbox"
-              checked={Boolean(currentExtras.learningDecisionLog)}
-              onChange={(event) => updateLearningMachineConfig({ learningDecisionLog: event.target.checked })}
-            />
-            {renderInspectorPropertyLabel("Decision Log Store", "Tracks important decisions, rationale, and run-level outcomes.")}
-          </label>
-          <label className="checkbox-field">
-            <input
-              type="checkbox"
-              checked={Boolean(currentExtras.learningDebugMode)}
-              onChange={(event) => updateLearningMachineConfig({ learningDebugMode: event.target.checked })}
-            />
-            {renderInspectorPropertyLabel("Enable Debug Mode", "Turns on debug behavior for the Learning Machine runtime.")}
-          </label>
-          <label>
-            {renderInspectorPropertyLabel("Generated Learning Machine Expression", "Preview of the Agno LearningMachine expression generated from the fields above.")}
-            <textarea className="code-input" value={generatedExpression} readOnly />
-          </label>
-        </>
-      );
+      return <LearningMachineInspector selectedNode={selectedNode} graph={graph} nodeMap={nodeMap} setGraph={setGraph} />;
     }
 
     if (selectedNode.type === "skills") {
-      const currentNode = selectedNode;
-      const currentGraph = graph;
-      if (!currentGraph) {
-        return null;
-      }
-
-      const currentExtras = {
-        ...getDefaultSkillsExtras(),
-        ...(currentNode.data.extras ?? {}),
-      };
-      const currentSkillsPath = fieldValueAsString(currentExtras.skillsPath).trim();
-      const selectedSkillPathOption = skillPathOptions.find((option) => option.path === currentSkillsPath) ?? null;
-      const hasCurrentSkillsPathOption = skillPathOptions.some((option) => option.path === currentSkillsPath);
-      const resolvedSkillPathOptions = hasCurrentSkillsPathOption || !currentSkillsPath
-        ? skillPathOptions
-        : [
-            {
-              path: currentSkillsPath,
-              label: `Current path (${currentSkillsPath})`,
-              source: "saved",
-              validates: currentExtras.skillsValidate !== false,
-              validation_error: null,
-            },
-            ...skillPathOptions,
-          ];
-      const generatedExpression = buildSkillsExpressionFromExtras(currentExtras);
-      const hasLegacyExpression =
-        Boolean(fieldValueAsString(currentNode.data.extras?.skillsExpression).trim()) &&
-        fieldValueAsString(currentNode.data.extras?.skillsExpression).trim() !== generatedExpression &&
-        currentNode.data.extras?.skillsPath === undefined;
-      const updateSkillsConfig = (patch: Record<string, unknown>) => {
-        const nextExtras: Record<string, unknown> = {
-          ...currentExtras,
-          ...patch,
-        };
-        nextExtras.skillsExpression = buildSkillsExpressionFromExtras(nextExtras);
-        setGraph(updateNodeData(currentGraph, currentNode.id, { extras: nextExtras }));
-      };
-
-      return (
-        <>
-          <div className="info-note">
-            <p>This node loads local Agno skills for connected Agents. The installed SDK exposes `skills` on `Agent`, not on `Team`, so this first slice is Agent-only.</p>
-          </div>
-          <label>
-            {renderInspectorPropertyLabel("Name", "Display name used in the canvas and in connected component selectors.", true)}
-            <input
-              value={currentNode.data.name}
-              onChange={(event) => setGraph(updateNodeData(currentGraph, currentNode.id, { name: event.target.value }))}
-            />
-          </label>
-          <label>
-            {renderInspectorPropertyLabel("Description", "Optional description stored only in the canvas for this Skills resource.")}
-            <textarea
-              value={fieldValueAsString(currentNode.data.description)}
-              onChange={(event) => setGraph(updateNodeData(currentGraph, currentNode.id, { description: event.target.value }))}
-            />
-          </label>
-          {hasLegacyExpression ? (
-            <div className="info-note">
-              <p>Legacy expression detected</p>
-              <p>Editing the structured fields below will replace the previous custom Skills expression.</p>
-            </div>
-          ) : null}
-          <label>
-            {renderInspectorPropertyLabel("Skills Path", "Select a detected local skill folder. The picker lists repo skills and installed user skills discovered by the API.")}
-            <select
-              value={currentSkillsPath}
-              disabled={!resolvedSkillPathOptions.length}
-              onChange={(event) => {
-                const nextPath = event.target.value;
-                const nextOption = resolvedSkillPathOptions.find((option) => option.path === nextPath);
-                updateSkillsConfig({
-                  skillsPath: nextPath,
-                  skillsValidate: nextOption ? nextOption.validates : currentExtras.skillsValidate,
-                });
-              }}
-            >
-              {!currentSkillsPath ? <option value="">Select a detected skills path</option> : null}
-              {resolvedSkillPathOptions.map((option) => (
-                <option key={`${option.source}:${option.path}`} value={option.path}>
-                  {option.label}
-                </option>
-              ))}
-            </select>
-          </label>
-          <div className="button-row">
-            <button
-              type="button"
-              className="secondary-button"
-              onClick={() => setSkillPathsRefreshKey((current) => current + 1)}
-              disabled={isLoadingSkillPaths}
-            >
-              {isLoadingSkillPaths ? "Refreshing paths..." : "Refresh paths"}
-            </button>
-          </div>
-          <p className="muted small-note">
-            {resolvedSkillPathOptions.length
-              ? "Detected from `examples/skills` and `~/.agents/skills`. Starter example available at `examples/skills/support-response-style`."
-              : "No local skill folders were detected yet. Add one under `examples/skills` or `~/.agents/skills` and refresh the picker."}
-          </p>
-          {selectedSkillPathOption && !selectedSkillPathOption.validates ? (
-            <div className="info-note">
-              <p>This skill does not fully match Agno's Agent Skills spec.</p>
-              <p>{selectedSkillPathOption.validation_error || "Validation was automatically disabled so the skill can still load."}</p>
-            </div>
-          ) : null}
-          <label className="checkbox-field">
-            <input
-              type="checkbox"
-              checked={currentExtras.skillsValidate !== false}
-              onChange={(event) => updateSkillsConfig({ skillsValidate: event.target.checked })}
-            />
-            {renderInspectorPropertyLabel("Validate Skills", "Validates the local skill directory against Agno's Agent Skills spec before loading it.")}
-          </label>
-          <label>
-            {renderInspectorPropertyLabel("Generated Skills Expression", "Preview of the Agno Skills expression generated from the fields above.")}
-            <textarea className="code-input" value={generatedExpression} readOnly />
-          </label>
-        </>
-      );
+      return <SkillsInspector selectedNode={selectedNode} graph={graph} isLoadingSkillPaths={isLoadingSkillPaths} setGraph={setGraph} setSkillPathsRefreshKey={setSkillPathsRefreshKey} skillPathOptions={skillPathOptions} />;
     }
 
     if (selectedNode.type === "interface") {
-      const currentNode = selectedNode;
-      const currentGraph = graph;
-      if (!currentGraph) {
-        return null;
-      }
-      const currentExtras = {
-        ...getDefaultInterfaceExtras(),
-        ...(currentNode.data.extras ?? {}),
-      };
-      const connectedExecutor =
-        currentGraph.edges
-          .filter((edge) => edge.target === currentNode.id)
-          .map((edge) => nodeMap[edge.source])
-          .find((node): node is GraphNode => Boolean(node) && (node.type === "agent" || node.type === "team")) ?? null;
-      const resolvedTargetType: "agent" | "team" = connectedExecutor?.type === "team" ? "team" : "agent";
-      const selectedPreset =
-        (fieldValueAsString(currentExtras.interfacePreset).trim() as InterfacePresetKey) ||
-        "whatsapp";
-      const normalizedPreset: InterfacePresetKey = INTERFACE_PRESET_OPTIONS.some((option) => option.key === selectedPreset)
-        ? selectedPreset
-        : "whatsapp";
-      const generatedExpression = buildInterfaceExpression(normalizedPreset, resolvedTargetType, currentExtras);
-
-      const updateInterfaceConfig = (patch: Record<string, unknown>) => {
-        const nextExtras = {
-          ...currentExtras,
-          ...patch,
-        };
-        const nextPresetRaw = fieldValueAsString(nextExtras.interfacePreset).trim() as InterfacePresetKey;
-        const nextPreset: InterfacePresetKey = INTERFACE_PRESET_OPTIONS.some((option) => option.key === nextPresetRaw)
-          ? nextPresetRaw
-          : "whatsapp";
-        const nextTarget = connectedExecutor?.type === "team" ? "team" : "agent";
-        nextExtras.interfaceTargetType = nextTarget;
-        nextExtras.interfaceExpression = buildInterfaceExpression(nextPreset, nextTarget, nextExtras);
-        setGraph(updateNodeData(currentGraph, currentNode.id, { extras: nextExtras }));
-      };
-
-      return (
-        <>
-          <label>
-            {renderInspectorPropertyLabel("Name", "Display name used in the canvas and generated interface symbol.", true)}
-            <input
-              value={currentNode.data.name}
-              onChange={(event) => setGraph(updateNodeData(currentGraph, currentNode.id, { name: event.target.value }))}
-            />
-          </label>
-          <label>
-            {renderInspectorPropertyLabel("Description", "Optional interface description used in canvas metadata.")}
-            <textarea
-              value={fieldValueAsString(currentNode.data.description)}
-              onChange={(event) => setGraph(updateNodeData(currentGraph, currentNode.id, { description: event.target.value }))}
-            />
-          </label>
-          {connectedExecutor ? (
-            <>
-              <label>
-                {renderInspectorPropertyLabel("Connected Executor", "Agent or Team currently connected to this Interface node.")}
-                <select value={connectedExecutor.data.name} disabled>
-                  <option value={connectedExecutor.data.name}>{connectedExecutor.data.name}</option>
-                </select>
-              </label>
-              <p className="muted small-note">Read-only because it is connected from {connectedExecutor.data.name}.</p>
-            </>
-          ) : (
-            <div className="info-note">
-              <p>Connect this Interface node to an Agent or Team to generate a runnable interface expression.</p>
-            </div>
-          )}
-          <label>
-            {renderInspectorPropertyLabel("Interface Preset", "Select which Agno AgentOS interface class should be generated.")}
-            <select
-              value={normalizedPreset}
-              onChange={(event) => updateInterfaceConfig({ interfacePreset: event.target.value })}
-            >
-              {INTERFACE_PRESET_OPTIONS.map((option) => (
-                <option key={option.key} value={option.key}>
-                  {option.label}
-                </option>
-              ))}
-            </select>
-          </label>
-          <label>
-            {renderInspectorPropertyLabel("Target Type", "Resolved automatically from the connected node (Agent or Team).")}
-            <select value={resolvedTargetType} disabled>
-              <option value="agent">agent</option>
-              <option value="team">team</option>
-            </select>
-          </label>
-          {normalizedPreset === "whatsapp" || normalizedPreset === "all" ? (
-            <>
-              <label>
-                {renderInspectorPropertyLabel("WhatsApp Phone Number ID Env", "Environment variable name used to resolve phone_number_id at runtime.")}
-                <input
-                  value={fieldValueAsString(currentExtras.whatsappPhoneNumberIdEnv)}
-                  onChange={(event) => updateInterfaceConfig({ whatsappPhoneNumberIdEnv: event.target.value })}
-                />
-              </label>
-              <label>
-                {renderInspectorPropertyLabel("WhatsApp Access Token Env", "Environment variable name used to resolve access_token at runtime.")}
-                <input
-                  value={fieldValueAsString(currentExtras.whatsappAccessTokenEnv)}
-                  onChange={(event) => updateInterfaceConfig({ whatsappAccessTokenEnv: event.target.value })}
-                />
-              </label>
-              <label>
-                {renderInspectorPropertyLabel("WhatsApp Verify Token Env", "Environment variable name used to resolve verify_token at runtime.")}
-                <input
-                  value={fieldValueAsString(currentExtras.whatsappVerifyTokenEnv)}
-                  onChange={(event) => updateInterfaceConfig({ whatsappVerifyTokenEnv: event.target.value })}
-                />
-              </label>
-            </>
-          ) : null}
-          {normalizedPreset === "telegram" || normalizedPreset === "all" ? (
-            <label>
-              {renderInspectorPropertyLabel("Telegram Token Env", "Environment variable name used to resolve token at runtime.")}
-              <input
-                value={fieldValueAsString(currentExtras.telegramTokenEnv)}
-                onChange={(event) => updateInterfaceConfig({ telegramTokenEnv: event.target.value })}
-              />
-            </label>
-          ) : null}
-          {normalizedPreset === "slack" || normalizedPreset === "all" ? (
-            <>
-              <label>
-                {renderInspectorPropertyLabel("Slack Bot Token Env", "Environment variable name used to resolve Slack bot token at runtime.")}
-                <input
-                  value={fieldValueAsString(currentExtras.slackTokenEnv)}
-                  onChange={(event) => updateInterfaceConfig({ slackTokenEnv: event.target.value })}
-                />
-              </label>
-              <label>
-                {renderInspectorPropertyLabel("Slack Signing Secret Env", "Environment variable name used to resolve Slack signing_secret at runtime.")}
-                <input
-                  value={fieldValueAsString(currentExtras.slackSigningSecretEnv)}
-                  onChange={(event) => updateInterfaceConfig({ slackSigningSecretEnv: event.target.value })}
-                />
-              </label>
-            </>
-          ) : null}
-          <label>
-            {renderInspectorPropertyLabel("Generated Interface Expression", "Preview of the Agno interface expression generated from the selected preset and connected target.")}
-            <textarea className="code-input" value={generatedExpression} readOnly />
-          </label>
-          <div className="info-note">
-            <p>
-              Imports used: <code>agno.os.interfaces.whatsapp</code>, <code>agno.os.interfaces.telegram</code>, <code>agno.os.interfaces.slack</code>,
-              <code> agno.os.interfaces.a2a</code>, <code>agno.os.interfaces.agui</code>
-            </p>
-          </div>
-        </>
-      );
+      return <InterfaceInspector selectedNode={selectedNode} graph={graph} nodeMap={nodeMap} setGraph={setGraph} />;
     }
 
     if (selectedNode.type === "workflow") {
-      const currentNode = selectedNode;
+      return <WorkflowInspector selectedNode={selectedNode} graph={graph} nodeMap={nodeMap} setGraph={setGraph} />;
+    }
+
+    if (WORKFLOW_CONTROL_TYPES.includes(selectedNode.type)) {
       const currentGraph = graph;
       if (!currentGraph) {
         return null;
       }
-      const currentWorkflowConfig: Record<string, unknown> = {
-        debug_mode: true,
-        stream_events: true,
-        stream_executor_events: true,
-        store_executor_outputs: true,
-        telemetry: true,
-        num_history_runs: 3,
-        cache_session: false,
-        add_workflow_history_to_steps: false,
-        ...(getWorkflowConfig(currentNode.data) ?? {}),
-      };
-      const connectedDatabase =
-        currentGraph.edges
-          .filter((edge) => edge.target === currentNode.id)
-          .map((edge) => nodeMap[edge.source])
-          .find((node): node is GraphNode => Boolean(node) && node.type === "database") ?? null;
-      const connectedSteps = currentGraph.edges
-        .filter((edge) => edge.target === currentNode.id)
-        .map((edge) => nodeMap[edge.source])
-        .filter((node): node is GraphNode => Boolean(node) && node.type === "workflow_step")
-        .sort((left, right) => {
-          const leftOrder = Number(fieldValueAsString(left.data.extras?.stepOrder) || "9999");
-          const rightOrder = Number(fieldValueAsString(right.data.extras?.stepOrder) || "9999");
-          if (leftOrder !== rightOrder) {
-            return leftOrder - rightOrder;
-          }
-          if (left.position.x !== right.position.x) {
-            return left.position.x - right.position.x;
-          }
-          if (left.position.y !== right.position.y) {
-            return left.position.y - right.position.y;
-          }
-          return left.data.name.localeCompare(right.data.name);
-        });
-
+      const nodeId = selectedNode.id;
       return (
-        <>
-          <label>
-            {renderInspectorPropertyLabel("Name", "Workflow display name used in the canvas and generated code.", true)}
-            <input
-              value={currentNode.data.name}
-              onChange={(event) => setGraph(updateNodeData(currentGraph, currentNode.id, { name: event.target.value }))}
-            />
-          </label>
-          <label>
-            {renderInspectorPropertyLabel("Description", "Optional workflow description passed to Agno and shown in the canvas.")}
-            <textarea
-              value={fieldValueAsString(currentNode.data.description)}
-              onChange={(event) => setGraph(updateNodeData(currentGraph, currentNode.id, { description: event.target.value }))}
-            />
-          </label>
-          {connectedSteps.length ? (
-            <div className="info-note">
-              <p>
-                <strong>Ordered steps</strong>
-              </p>
-              <p>{connectedSteps.map((step) => `${fieldValueAsString(step.data.extras?.stepOrder) || "?"}. ${step.data.name}`).join(" | ")}</p>
-            </div>
-          ) : (
-            <div className="info-note">
-              <p>Connect one or more Workflow Step nodes to this Workflow to build the execution order.</p>
-            </div>
-          )}
-          {connectedDatabase ? (
-            <>
-              <label>
-                {renderInspectorPropertyLabel("Connected Database", "Database currently connected to this Workflow for persisted session state.")}
-                <select value={connectedDatabase.data.name} disabled>
-                  <option value={connectedDatabase.data.name}>{connectedDatabase.data.name}</option>
-                </select>
-              </label>
-              <p className="muted small-note">Read-only because it is connected from {connectedDatabase.data.name}.</p>
-            </>
-          ) : (
-            <div className="info-note">
-              <p>Connect a Database node if you want persisted workflow session state and history.</p>
-            </div>
-          )}
-          <label>
-            {renderInspectorPropertyLabel("User ID", "Optional user id forwarded to the workflow runtime.")}
-            <input
-              value={fieldValueAsString(currentWorkflowConfig.user_id)}
-              onChange={(event) => setGraph(updateNodeData(currentGraph, currentNode.id, updateWorkflowConfig(currentNode.data, "user_id", event.target.value)))}
-            />
-          </label>
-          <label>
-            {renderInspectorPropertyLabel("Session ID", "Optional workflow session id.")}
-            <input
-              value={fieldValueAsString(currentWorkflowConfig.session_id)}
-              onChange={(event) => setGraph(updateNodeData(currentGraph, currentNode.id, updateWorkflowConfig(currentNode.data, "session_id", event.target.value)))}
-            />
-          </label>
-          <label>
-            {renderInspectorPropertyLabel("Session State", "Optional initial workflow session state JSON.")}
-            <textarea
-              className="code-input"
-              value={fieldValueAsString(currentWorkflowConfig.session_state)}
-              onChange={(event) => setGraph(updateNodeData(currentGraph, currentNode.id, updateWorkflowConfig(currentNode.data, "session_state", event.target.value)))}
-            />
-          </label>
-          <label className="checkbox-field">
-            <input
-              type="checkbox"
-              checked={Boolean(currentWorkflowConfig.add_session_state_to_context)}
-              onChange={(event) => setGraph(updateNodeData(currentGraph, currentNode.id, updateWorkflowConfig(currentNode.data, "add_session_state_to_context", event.target.checked)))}
-            />
-            {renderInspectorPropertyLabel("Add Session State To Context", "Makes workflow session state available to the steps during execution.")}
-          </label>
-          <label className="checkbox-field">
-            <input
-              type="checkbox"
-              checked={Boolean(currentWorkflowConfig.overwrite_db_session_state)}
-              onChange={(event) => setGraph(updateNodeData(currentGraph, currentNode.id, updateWorkflowConfig(currentNode.data, "overwrite_db_session_state", event.target.checked)))}
-            />
-            {renderInspectorPropertyLabel("Overwrite DB Session State", "Overwrites persisted session state with the configured session state when the workflow starts.")}
-          </label>
-          <label>
-            {renderInspectorPropertyLabel("Dependencies", "Optional dependency JSON shared with workflow steps.")}
-            <textarea
-              className="code-input"
-              value={fieldValueAsString(currentWorkflowConfig.dependencies)}
-              onChange={(event) => setGraph(updateNodeData(currentGraph, currentNode.id, updateWorkflowConfig(currentNode.data, "dependencies", event.target.value)))}
-            />
-          </label>
-          <label className="checkbox-field">
-            <input
-              type="checkbox"
-              checked={Boolean(currentWorkflowConfig.add_dependencies_to_context)}
-              onChange={(event) => setGraph(updateNodeData(currentGraph, currentNode.id, updateWorkflowConfig(currentNode.data, "add_dependencies_to_context", event.target.checked)))}
-            />
-            {renderInspectorPropertyLabel("Add Dependencies To Context", "Injects workflow dependencies into step execution context.")}
-          </label>
-          <label className="checkbox-field">
-            <input
-              type="checkbox"
-              checked={Boolean(currentWorkflowConfig.cache_session)}
-              onChange={(event) => setGraph(updateNodeData(currentGraph, currentNode.id, updateWorkflowConfig(currentNode.data, "cache_session", event.target.checked)))}
-            />
-            {renderInspectorPropertyLabel("Cache Session", "Caches workflow session data between runs when supported by Agno.")}
-          </label>
-          <label className="checkbox-field">
-            <input
-              type="checkbox"
-              checked={Boolean(currentWorkflowConfig.add_workflow_history_to_steps)}
-              onChange={(event) => setGraph(updateNodeData(currentGraph, currentNode.id, updateWorkflowConfig(currentNode.data, "add_workflow_history_to_steps", event.target.checked)))}
-            />
-            {renderInspectorPropertyLabel("Add Workflow History To Steps", "Makes previous workflow history available to step executors.")}
-          </label>
-          <label>
-            {renderInspectorPropertyLabel("Workflow History Runs", "How many previous workflow runs should be available when history is enabled.")}
-            <input
-              type="number"
-              min="1"
-              value={fieldValueAsString(currentWorkflowConfig.num_history_runs)}
-              onChange={(event) => setGraph(updateNodeData(currentGraph, currentNode.id, updateWorkflowConfig(currentNode.data, "num_history_runs", Number(event.target.value))))}
-            />
-          </label>
-          <label className="checkbox-field">
-            <input
-              type="checkbox"
-              checked={Boolean(currentWorkflowConfig.stream)}
-              onChange={(event) => setGraph(updateNodeData(currentGraph, currentNode.id, updateWorkflowConfig(currentNode.data, "stream", event.target.checked)))}
-            />
-            {renderInspectorPropertyLabel("Stream", "Enables streaming mode for the workflow run output.")}
-          </label>
-          <label className="checkbox-field">
-            <input
-              type="checkbox"
-              checked={Boolean(currentWorkflowConfig.stream_events)}
-              onChange={(event) => setGraph(updateNodeData(currentGraph, currentNode.id, updateWorkflowConfig(currentNode.data, "stream_events", event.target.checked)))}
-            />
-            {renderInspectorPropertyLabel("Stream Events", "Streams workflow events during execution.")}
-          </label>
-          <label className="checkbox-field">
-            <input
-              type="checkbox"
-              checked={currentWorkflowConfig.stream_executor_events !== false}
-              onChange={(event) => setGraph(updateNodeData(currentGraph, currentNode.id, updateWorkflowConfig(currentNode.data, "stream_executor_events", event.target.checked)))}
-            />
-            {renderInspectorPropertyLabel("Stream Executor Events", "Includes agent and team executor events in the workflow event stream.")}
-          </label>
-          <label className="checkbox-field">
-            <input
-              type="checkbox"
-              checked={Boolean(currentWorkflowConfig.store_events)}
-              onChange={(event) => setGraph(updateNodeData(currentGraph, currentNode.id, updateWorkflowConfig(currentNode.data, "store_events", event.target.checked)))}
-            />
-            {renderInspectorPropertyLabel("Store Events", "Stores emitted workflow events in the run output.")}
-          </label>
-          <label className="checkbox-field">
-            <input
-              type="checkbox"
-              checked={currentWorkflowConfig.store_executor_outputs !== false}
-              onChange={(event) => setGraph(updateNodeData(currentGraph, currentNode.id, updateWorkflowConfig(currentNode.data, "store_executor_outputs", event.target.checked)))}
-            />
-            {renderInspectorPropertyLabel("Store Executor Outputs", "Stores the raw outputs produced by each step executor.")}
-          </label>
-          <label className="checkbox-field">
-            <input
-              type="checkbox"
-              checked={Boolean(currentWorkflowConfig.debug_mode)}
-              onChange={(event) => setGraph(updateNodeData(currentGraph, currentNode.id, updateWorkflowConfig(currentNode.data, "debug_mode", event.target.checked)))}
-            />
-            {renderInspectorPropertyLabel("Debug Mode", "Enables Agno workflow debug mode.")}
-          </label>
-          <label>
-            {renderInspectorPropertyLabel("Debug Level", "Workflow debug verbosity level.")}
-            <select
-              value={fieldValueAsString(currentWorkflowConfig.debug_level)}
-              onChange={(event) => setGraph(updateNodeData(currentGraph, currentNode.id, updateWorkflowConfig(currentNode.data, "debug_level", Number(event.target.value))))}
-            >
-              <option value="">Default</option>
-              <option value="1">1</option>
-              <option value="2">2</option>
-            </select>
-          </label>
-          <label className="checkbox-field">
-            <input
-              type="checkbox"
-              checked={currentWorkflowConfig.telemetry !== false}
-              onChange={(event) => setGraph(updateNodeData(currentGraph, currentNode.id, updateWorkflowConfig(currentNode.data, "telemetry", event.target.checked)))}
-            />
-            {renderInspectorPropertyLabel("Telemetry", "Keeps Agno workflow telemetry enabled.")}
-          </label>
-        </>
+        <WorkflowControlInspector
+          node={selectedNode}
+          graph={currentGraph}
+          onChange={(patch) => setGraph((current) => updateNodeData(current, nodeId, patch))}
+        />
       );
     }
 
     if (selectedNode.type === "workflow_step") {
-      const currentNode = selectedNode;
-      const currentGraph = graph;
-      if (!currentGraph) {
-        return null;
-      }
-      const connectedExecutors = currentGraph.edges
-        .filter((edge) => edge.target === currentNode.id)
-        .map((edge) => nodeMap[edge.source])
-        .filter((node): node is GraphNode => Boolean(node) && (node.type === "agent" || node.type === "team" || node.type === "tool"));
-
-      const currentExtras = {
-        stepOrder: 1,
-        maxRetries: 3,
-        skipOnFailure: false,
-        strictInputValidation: false,
-        requiresConfirmation: false,
-        confirmationMessage: "",
-        onReject: "skip",
-        requiresUserInput: false,
-        userInputMessage: "",
-        userInputSchema: "",
-        onError: "skip",
-        ...(currentNode.data.extras ?? {}),
-      };
-
-      return (
-        <>
-          <label>
-            {renderInspectorPropertyLabel("Name", "Workflow step name used in the canvas and generated Step object.", true)}
-            <input
-              value={currentNode.data.name}
-              onChange={(event) => setGraph(updateNodeData(currentGraph, currentNode.id, { name: event.target.value }))}
-            />
-          </label>
-          <label>
-            {renderInspectorPropertyLabel("Description", "Optional step description passed to Agno.")}
-            <textarea
-              value={fieldValueAsString(currentNode.data.description)}
-              onChange={(event) => setGraph(updateNodeData(currentGraph, currentNode.id, { description: event.target.value }))}
-            />
-          </label>
-          {connectedExecutors.length ? (
-            <div className="info-note">
-              <p>
-                <strong>Connected executor{connectedExecutors.length > 1 ? "s" : ""}</strong>
-              </p>
-              <p>{connectedExecutors.map((executor) => `${NODE_CATALOG[executor.type].label}: ${executor.data.name}`).join(" | ")}</p>
-              {connectedExecutors.length > 1 ? <p>Connect exactly one executor per Workflow Step. The compiler uses the first supported connection and warns about the rest.</p> : null}
-              <p>Built-in Tool nodes use the workflow executor function configured on the Tool node.</p>
-            </div>
-          ) : (
-            <div className="info-note">
-              <p>Connect exactly one Agent, Team, Function Tool, or Built-in Tool node to this Workflow Step.</p>
-            </div>
-          )}
-          <label>
-            {renderInspectorPropertyLabel("Step Order", "Controls the sequential order inside the connected Workflow. Lower numbers run first.")}
-            <input
-              type="number"
-              min="1"
-              value={fieldValueAsString(currentExtras.stepOrder)}
-              onChange={(event) =>
-                setGraph(
-                  updateNodeData(currentGraph, currentNode.id, {
-                    extras: {
-                      ...currentExtras,
-                      stepOrder: Number(event.target.value),
-                    },
-                  }),
-                )
-              }
-            />
-          </label>
-          <label>
-            {renderInspectorPropertyLabel("Max Retries", "How many times Agno should retry the step before considering it failed.")}
-            <input
-              type="number"
-              min="0"
-              value={fieldValueAsString(currentExtras.maxRetries)}
-              onChange={(event) =>
-                setGraph(
-                  updateNodeData(currentGraph, currentNode.id, {
-                    extras: {
-                      ...currentExtras,
-                      maxRetries: Number(event.target.value),
-                    },
-                  }),
-                )
-              }
-            />
-          </label>
-          <label className="checkbox-field">
-            <input
-              type="checkbox"
-              checked={Boolean(currentExtras.skipOnFailure)}
-              onChange={(event) =>
-                setGraph(
-                  updateNodeData(currentGraph, currentNode.id, {
-                    extras: {
-                      ...currentExtras,
-                      skipOnFailure: event.target.checked,
-                    },
-                  }),
-                )
-              }
-            />
-            {renderInspectorPropertyLabel("Skip On Failure", "If enabled, the workflow continues to the next step after this step fails.")}
-          </label>
-          <label className="checkbox-field">
-            <input
-              type="checkbox"
-              checked={Boolean(currentExtras.strictInputValidation)}
-              onChange={(event) =>
-                setGraph(
-                  updateNodeData(currentGraph, currentNode.id, {
-                    extras: {
-                      ...currentExtras,
-                      strictInputValidation: event.target.checked,
-                    },
-                  }),
-                )
-              }
-            />
-            {renderInspectorPropertyLabel("Strict Input Validation", "Uses Agno strict input validation for this step.")}
-          </label>
-          <label className="checkbox-field">
-            <input
-              type="checkbox"
-              checked={Boolean(currentExtras.requiresConfirmation)}
-              onChange={(event) =>
-                setGraph(
-                  updateNodeData(currentGraph, currentNode.id, {
-                    extras: {
-                      ...currentExtras,
-                      requiresConfirmation: event.target.checked,
-                    },
-                  }),
-                )
-              }
-            />
-            {renderInspectorPropertyLabel("Requires Confirmation", "Pauses the step and requests human confirmation before execution.")}
-          </label>
-          {Boolean(currentExtras.requiresConfirmation) ? (
-            <>
-              <label>
-                {renderInspectorPropertyLabel("Confirmation Message", "Message shown when confirmation is required.")}
-                <textarea
-                  value={fieldValueAsString(currentExtras.confirmationMessage)}
-                  onChange={(event) =>
-                    setGraph(
-                      updateNodeData(currentGraph, currentNode.id, {
-                        extras: {
-                          ...currentExtras,
-                          confirmationMessage: event.target.value,
-                        },
-                      }),
-                    )
-                  }
-                />
-              </label>
-              <label>
-                {renderInspectorPropertyLabel("On Reject", "Behavior when a human rejects the confirmation request.")}
-                <select
-                  value={fieldValueAsString(currentExtras.onReject || "skip")}
-                  onChange={(event) =>
-                    setGraph(
-                      updateNodeData(currentGraph, currentNode.id, {
-                        extras: {
-                          ...currentExtras,
-                          onReject: event.target.value,
-                        },
-                      }),
-                    )
-                  }
-                >
-                  <option value="skip">skip</option>
-                  <option value="cancel">cancel</option>
-                  <option value="else">else</option>
-                </select>
-              </label>
-            </>
-          ) : null}
-          <label className="checkbox-field">
-            <input
-              type="checkbox"
-              checked={Boolean(currentExtras.requiresUserInput)}
-              onChange={(event) =>
-                setGraph(
-                  updateNodeData(currentGraph, currentNode.id, {
-                    extras: {
-                      ...currentExtras,
-                      requiresUserInput: event.target.checked,
-                    },
-                  }),
-                )
-              }
-            />
-            {renderInspectorPropertyLabel("Requires User Input", "Requests user input before running this step.")}
-          </label>
-          {Boolean(currentExtras.requiresUserInput) ? (
-            <>
-              <label>
-                {renderInspectorPropertyLabel("User Input Message", "Prompt shown to collect required user input for this step.")}
-                <textarea
-                  value={fieldValueAsString(currentExtras.userInputMessage)}
-                  onChange={(event) =>
-                    setGraph(
-                      updateNodeData(currentGraph, currentNode.id, {
-                        extras: {
-                          ...currentExtras,
-                          userInputMessage: event.target.value,
-                        },
-                      }),
-                    )
-                  }
-                />
-              </label>
-              <label>
-                {renderInspectorPropertyLabel("User Input Schema (JSON)", "JSON list describing required user input fields.")}
-                <textarea
-                  className="code-input"
-                  placeholder={'[\n  {"name": "approval_note", "type": "string", "required": false}\n]'}
-                  value={fieldValueAsString(currentExtras.userInputSchema)}
-                  onChange={(event) =>
-                    setGraph(
-                      updateNodeData(currentGraph, currentNode.id, {
-                        extras: {
-                          ...currentExtras,
-                          userInputSchema: event.target.value,
-                        },
-                      }),
-                    )
-                  }
-                />
-              </label>
-            </>
-          ) : null}
-          <label>
-            {renderInspectorPropertyLabel("On Error", "Behavior when this step raises an error.")}
-            <select
-              value={fieldValueAsString(currentExtras.onError || "skip")}
-              onChange={(event) =>
-                setGraph(
-                  updateNodeData(currentGraph, currentNode.id, {
-                    extras: {
-                      ...currentExtras,
-                      onError: event.target.value,
-                    },
-                  }),
-                )
-              }
-            >
-              <option value="fail">fail</option>
-              <option value="skip">skip</option>
-              <option value="pause">pause</option>
-            </select>
-          </label>
-        </>
-      );
+      return <WorkflowStepInspector selectedNode={selectedNode} graph={graph} nodeMap={nodeMap} setGraph={setGraph} />;
     }
 
     if (selectedNode.type === "input") {
-      const currentNode = selectedNode;
-      const currentGraph = graph;
-      if (!currentGraph) {
-        return null;
-      }
-      const currentInputSource = getInputSource(currentNode.data);
-      const inputMode = getInputMode(currentNode.data);
-      const emailProtocol = getEmailProtocol(currentNode.data);
-      const emailSecurity = getEmailSecurity(currentNode.data);
-      const currentExtras = currentNode.data.extras ?? {};
-      const currentMetadata = buildInputMetadataFromExtras(currentExtras);
-      const hasHitlAutoApproveOverride = Object.prototype.hasOwnProperty.call(currentExtras, "hitlAutoApprove");
-      const hitlAutoApproveValue = normalizeHitlAutoApproveSelection(
-        hasHitlAutoApproveOverride ? currentExtras.hitlAutoApprove : currentMetadata.hitl_auto_approve,
-      );
-      const hasHitlUserInputOverride = Object.prototype.hasOwnProperty.call(currentExtras, "hitlUserInputJson");
-      const fallbackHitlUserInput =
-        !hasHitlUserInputOverride &&
-        currentMetadata.hitl_user_input &&
-        typeof currentMetadata.hitl_user_input === "object" &&
-        !Array.isArray(currentMetadata.hitl_user_input)
-          ? stringifyJsonObject(currentMetadata.hitl_user_input as Record<string, unknown>)
-          : "";
-      const hitlUserInputJson = hasHitlUserInputOverride
-        ? fieldValueAsString(currentExtras.hitlUserInputJson)
-        : fallbackHitlUserInput;
-      const attachedFileName = getAttachedFileName(currentNode.data);
-      const attachedFileMimeType = fieldValueAsString(currentNode.data.extras?.attachedFileMimeType);
-      const emailUnreadOnly = Boolean(currentExtras.emailUnreadOnly ?? true);
-      const emailListenerEnabled = Boolean(currentExtras.emailListenerEnabled ?? true);
-      const currentFlowRouteName = slugifyFlowName(flowName) || "save_this_flow_first";
-      const webhookEndpoint = `${API_BASE}/api/integrations/webhook/${encodeURIComponent(currentFlowRouteName)}/${encodeURIComponent(currentNode.id)}`;
-      const whatsappEventsEndpoint = `${API_BASE}/api/integrations/whatsapp/${encodeURIComponent(currentFlowRouteName)}/${encodeURIComponent(currentNode.id)}/events`;
-      const formEndpoint = `${API_BASE}/api/integrations/form/${encodeURIComponent(currentFlowRouteName)}/${encodeURIComponent(currentNode.id)}`;
-      const updateInputExtras = (patch: Record<string, unknown>) =>
-        setGraph(
-          updateNodeData(currentGraph, currentNode.id, {
-            extras: {
-              ...currentExtras,
-              ...patch,
-            },
-          }),
-        );
-
-      async function handleInputFileChange(event: ChangeEvent<HTMLInputElement>) {
-        const file = event.target.files?.[0];
-        if (!file) {
-          return;
-        }
-
-        const fileBuffer = await file.arrayBuffer();
-        const fileBase64 = arrayBufferToBase64(fileBuffer);
-        setGraph(
-          updateNodeData(currentGraph, currentNode.id, {
-            extras: {
-              ...(currentNode.data.extras ?? {}),
-              attachedFileName: file.name,
-              attachedFileAlias: fieldValueAsString(currentNode.data.extras?.attachedFileAlias) || file.name,
-              attachedFileMimeType: file.type || "text/plain",
-              attachedFileEncoding: "base64",
-              attachedFileBase64: fileBase64,
-              attachedFileContent: "",
-            },
-          }),
-        );
-      }
-
-      function updateEmailProtocol(nextProtocol: "imap" | "pop") {
-        const currentPort = fieldValueAsString(currentExtras.emailPort).trim();
-        const currentDefaultPort = getDefaultEmailPort(emailProtocol, emailSecurity);
-        const nextDefaultPort = getDefaultEmailPort(nextProtocol, emailSecurity);
-        updateInputExtras({
-          emailProtocol: nextProtocol,
-          emailPort: !currentPort || currentPort === currentDefaultPort ? nextDefaultPort : currentPort,
-          emailUnreadOnly: nextProtocol === "pop" ? false : emailUnreadOnly,
-        });
-      }
-
-      function updateEmailSecurity(nextSecurity: "ssl" | "starttls" | "none") {
-        const currentPort = fieldValueAsString(currentExtras.emailPort).trim();
-        const currentDefaultPort = getDefaultEmailPort(emailProtocol, emailSecurity);
-        const nextDefaultPort = getDefaultEmailPort(emailProtocol, nextSecurity);
-        updateInputExtras({
-          emailSecurity: nextSecurity,
-          emailPort: !currentPort || currentPort === currentDefaultPort ? nextDefaultPort : currentPort,
-        });
-      }
-
-      return (
-        <>
-          <label>
-            Name
-            <span className="required-mark">*</span>
-            <input
-              value={selectedNode.data.name}
-              onChange={(event) =>
-                setGraph(updateNodeData(currentGraph, currentNode.id, { name: event.target.value }))
-              }
-            />
-          </label>
-
-          <label>
-            {renderInspectorPropertyLabel("Input Source", "Choose whether this flow starts from manual payloads, email inbox polling, webhooks, WhatsApp messages, or form submissions.", true)}
-            <select
-              value={currentInputSource}
-              onChange={(event) => {
-                const nextSource = event.target.value as "manual" | "email" | "webhook" | "whatsapp" | "form";
-                if (nextSource === "email") {
-                  updateInputExtras({
-                    inputSource: "email",
-                    inputMode: "text",
-                    attachedFileName: "",
-                    attachedFileAlias: "",
-                    attachedFileMimeType: "",
-                    attachedFileEncoding: "base64",
-                    attachedFileBase64: "",
-                    attachedFileContent: "",
-                    emailPort: fieldValueAsString(currentExtras.emailPort).trim() || getDefaultEmailPort(emailProtocol, emailSecurity),
-                  });
-                  return;
-                }
-
-                if (nextSource === "webhook") {
-                  updateInputExtras({
-                    inputSource: "webhook",
-                    inputMode: "text",
-                    attachedFileName: "",
-                    attachedFileAlias: "",
-                    attachedFileMimeType: "",
-                    attachedFileEncoding: "base64",
-                    attachedFileBase64: "",
-                    attachedFileContent: "",
-                    inputText: getInputText(currentNode.data) || "Webhook event received.",
-                    webhookSecretHeader: fieldValueAsString(currentExtras.webhookSecretHeader) || "X-AgnoLab-Secret",
-                    webhookTextField: fieldValueAsString(currentExtras.webhookTextField) || "message",
-                  });
-                  return;
-                }
-
-                if (nextSource === "whatsapp") {
-                  updateInputExtras({
-                    inputSource: "whatsapp",
-                    inputMode: "text",
-                    attachedFileName: "",
-                    attachedFileAlias: "",
-                    attachedFileMimeType: "",
-                    attachedFileEncoding: "base64",
-                    attachedFileBase64: "",
-                    attachedFileContent: "",
-                    inputText: getInputText(currentNode.data) || "WhatsApp message received.",
-                    whatsappSessionId: fieldValueAsString(currentExtras.whatsappSessionId) || `agnolab_whatsapp_${currentNode.id}`,
-                    whatsappWebhookSecret: fieldValueAsString(currentExtras.whatsappWebhookSecret) || createClientSecret("wa"),
-                    whatsappIgnoreGroups: currentExtras.whatsappIgnoreGroups ?? true,
-                    whatsappReplyEnabled: currentExtras.whatsappReplyEnabled ?? true,
-                    whatsappReplyTemplate: fieldValueAsString(currentExtras.whatsappReplyTemplate) || "$result_text",
-                  });
-                  return;
-                }
-
-                if (nextSource === "form") {
-                  updateInputExtras({
-                    inputSource: "form",
-                    inputMode: inputMode === "file" ? "file" : "mixed",
-                    inputText: getInputText(currentNode.data) || "New form submission received.",
-                    formSecretHeader: fieldValueAsString(currentExtras.formSecretHeader) || "X-AgnoLab-Secret",
-                    formSecretField: fieldValueAsString(currentExtras.formSecretField) || "_secret",
-                    formTextField: fieldValueAsString(currentExtras.formTextField) || "message",
-                    formMetadataField: fieldValueAsString(currentExtras.formMetadataField) || "metadata_json",
-                  });
-                  return;
-                }
-
-                updateInputExtras({
-                  inputSource: "manual",
-                });
-              }}
-            >
-              <option value="manual">Manual payload</option>
-              <option value="email">Email inbox</option>
-              <option value="webhook">Webhook</option>
-              <option value="whatsapp">WhatsApp</option>
-              <option value="form">Form submission</option>
-            </select>
-          </label>
-
-          {currentInputSource === "manual" ? (
-            <>
-              <label>
-                {renderInspectorPropertyLabel("Payload Mode", "Controls whether this input sends text, a file, or both.", true)}
-                <select
-                  value={inputMode}
-                  onChange={(event) =>
-                    updateInputExtras({
-                      inputMode: event.target.value,
-                    })
-                  }
-                >
-                  <option value="text">Text only</option>
-                  <option value="file">File only</option>
-                  <option value="mixed">Text + file</option>
-                </select>
-              </label>
-
-              {inputMode !== "file" ? (
-                <label>
-                  {renderInspectorPropertyLabel("Text Payload", "Default text passed to the flow when this input runs manually.")}
-                  <textarea
-                    value={getInputText(selectedNode.data)}
-                    onChange={(event) =>
-                      setGraph(
-                        updateNodeData(currentGraph, currentNode.id, {
-                          prompt: event.target.value,
-                          extras: {
-                            ...(currentNode.data.extras ?? {}),
-                            inputText: event.target.value,
-                          },
-                        }),
-                      )
-                    }
-                  />
-                </label>
-              ) : null}
-
-              {inputMode !== "text" ? (
-                <>
-                  <label>
-                    {renderInspectorPropertyLabel("Upload File", "Attach CSV, JSON, TXT, TSV, XLS, or XLSX content to the input payload.")}
-                    <input
-                      type="file"
-                      accept={FLOW_INPUT_FILE_ACCEPT}
-                      onChange={handleInputFileChange}
-                    />
-                  </label>
-                  <p className="muted">{FLOW_INPUT_FILE_SUPPORT_NOTE}</p>
-
-                  <label>
-                    {renderInspectorPropertyLabel("File Alias", "Optional display name exposed alongside the uploaded file path.")}
-                    <input
-                      value={fieldValueAsString(currentExtras.attachedFileAlias)}
-                      onChange={(event) =>
-                        updateInputExtras({
-                          attachedFileAlias: event.target.value,
-                        })
-                      }
-                    />
-                  </label>
-
-                  {attachedFileName ? (
-                    <div className="info-note">
-                      <p>
-                        <strong>{attachedFileName}</strong>
-                      </p>
-                      <p>{attachedFileMimeType || "text/plain"}</p>
-                      <div className="button-row">
-                        <button
-                          type="button"
-                          className="secondary-button"
-                          onClick={() =>
-                            updateInputExtras({
-                              attachedFileName: "",
-                              attachedFileAlias: "",
-                              attachedFileMimeType: "",
-                              attachedFileEncoding: "base64",
-                              attachedFileBase64: "",
-                              attachedFileContent: "",
-                            })
-                          }
-                        >
-                          Clear File
-                        </button>
-                      </div>
-                    </div>
-                  ) : (
-                    <div className="info-note">
-                      <p>Use upload to attach CSV, JSON, TXT, TSV, XLS, or XLSX files to the payload.</p>
-                    </div>
-                  )}
-                </>
-              ) : null}
-            </>
-          ) : currentInputSource === "email" ? (
-            <>
-              <label>
-                {renderInspectorPropertyLabel("Protocol", "Select whether this mailbox should be read with IMAP or POP3.", true)}
-                <select
-                  value={emailProtocol}
-                  onChange={(event) => updateEmailProtocol(event.target.value as "imap" | "pop")}
-                >
-                  <option value="imap">IMAP</option>
-                  <option value="pop">POP3</option>
-                </select>
-              </label>
-
-              <label>
-                {renderInspectorPropertyLabel("Security", "Connection security used when connecting to the mailbox server.", true)}
-                <select
-                  value={emailSecurity}
-                  onChange={(event) => updateEmailSecurity(event.target.value as "ssl" | "starttls" | "none")}
-                >
-                  <option value="ssl">SSL/TLS</option>
-                  <option value="starttls">STARTTLS</option>
-                  <option value="none">None</option>
-                </select>
-              </label>
-
-              <label>
-                {renderInspectorPropertyLabel("Host", "IMAP or POP server hostname, for example imap.gmail.com.", true)}
-                <input
-                  value={fieldValueAsString(currentExtras.emailHost)}
-                  onChange={(event) => updateInputExtras({ emailHost: event.target.value })}
-                />
-              </label>
-
-              <label>
-                {renderInspectorPropertyLabel("Port", "Mailbox server port. Defaults change with protocol and security.")}
-                <input
-                  value={fieldValueAsString(currentExtras.emailPort)}
-                  onChange={(event) => updateInputExtras({ emailPort: event.target.value })}
-                />
-              </label>
-
-              <label>
-                {renderInspectorPropertyLabel("Mailbox", "Folder to inspect when using IMAP. POP3 ignores this field and always reads the inbox.")}
-                <input
-                  value={fieldValueAsString(currentExtras.emailMailbox)}
-                  onChange={(event) => updateInputExtras({ emailMailbox: event.target.value })}
-                />
-              </label>
-
-              <label>
-                {renderInspectorPropertyLabel("Username", "Mailbox login or email address used to authenticate.", true)}
-                <input
-                  value={fieldValueAsString(currentExtras.emailUsername)}
-                  onChange={(event) => updateInputExtras({ emailUsername: event.target.value })}
-                />
-              </label>
-
-              <label>
-                {renderInspectorPropertyLabel("Password", "Mailbox password or app password. Stored in the flow config, so prefer app passwords.", true)}
-                <input
-                  type="password"
-                  value={fieldValueAsString(currentExtras.emailPassword)}
-                  onChange={(event) => updateInputExtras({ emailPassword: event.target.value })}
-                />
-              </label>
-
-              <label>
-                {renderInspectorPropertyLabel("Max Messages to Scan", "Newest messages checked per run before giving up. Higher values help if your filters are very specific.")}
-                <input
-                  value={fieldValueAsString(currentExtras.emailMaxMessages)}
-                  onChange={(event) => updateInputExtras({ emailMaxMessages: event.target.value })}
-                />
-              </label>
-
-              <label className="checkbox-field">
-                <input
-                  type="checkbox"
-                  checked={emailListenerEnabled}
-                  onChange={(event) => updateInputExtras({ emailListenerEnabled: event.target.checked })}
-                />
-                {renderInspectorPropertyLabel(
-                  "Background Listener",
-                  "Starts a backend monitor after the flow is saved. IMAP stays under continuous watch through a background loop; POP also runs through the same monitor using polling.",
-                )}
-              </label>
-
-              <label>
-                {renderInspectorPropertyLabel("Listener Interval (seconds)", "How often the backend listener checks the mailbox for new matches. Lower values react faster but create more mailbox traffic.")}
-                <input
-                  value={fieldValueAsString(currentExtras.emailPollIntervalSeconds)}
-                  onChange={(event) => updateInputExtras({ emailPollIntervalSeconds: event.target.value })}
-                />
-              </label>
-
-              <label className="checkbox-field">
-                <input
-                  type="checkbox"
-                  checked={emailProtocol === "pop" ? false : emailUnreadOnly}
-                  disabled={emailProtocol === "pop"}
-                  onChange={(event) => updateInputExtras({ emailUnreadOnly: event.target.checked })}
-                />
-                {renderInspectorPropertyLabel(
-                  "Unread Only",
-                  emailProtocol === "pop"
-                    ? "POP3 does not expose unread state, so this option is only available for IMAP."
-                    : "When enabled, only unread IMAP messages are considered.",
-                )}
-              </label>
-
-              <label>
-                {renderInspectorPropertyLabel("Subject Filter", "Optional case-insensitive substring match against the email subject.")}
-                <input
-                  value={fieldValueAsString(currentExtras.emailSubjectFilter)}
-                  onChange={(event) => updateInputExtras({ emailSubjectFilter: event.target.value })}
-                />
-              </label>
-
-              <label>
-                {renderInspectorPropertyLabel("Sender Filter", "Optional case-insensitive substring match against the sender address or name.")}
-                <input
-                  value={fieldValueAsString(currentExtras.emailFromFilter)}
-                  onChange={(event) => updateInputExtras({ emailFromFilter: event.target.value })}
-                />
-              </label>
-
-              <label>
-                {renderInspectorPropertyLabel("Recipient Filter", "Optional case-insensitive substring match against the To recipients.")}
-                <input
-                  value={fieldValueAsString(currentExtras.emailToFilter)}
-                  onChange={(event) => updateInputExtras({ emailToFilter: event.target.value })}
-                />
-              </label>
-
-              <label>
-                {renderInspectorPropertyLabel("Body Keywords", "Optional comma or line-break separated keywords. All keywords must appear in the message body.")}
-                <textarea
-                  value={fieldValueAsString(currentExtras.emailBodyKeywords)}
-                  onChange={(event) => updateInputExtras({ emailBodyKeywords: event.target.value })}
-                />
-              </label>
-
-              <label>
-                {renderInspectorPropertyLabel("Fallback Text", "Optional text used when no email matches the filters or the mailbox cannot be reached.")}
-                <textarea
-                  value={getInputText(selectedNode.data)}
-                  onChange={(event) =>
-                    setGraph(
-                      updateNodeData(currentGraph, currentNode.id, {
-                        prompt: event.target.value,
-                        extras: {
-                          ...(currentNode.data.extras ?? {}),
-                          inputText: event.target.value,
-                        },
-                      }),
-                    )
-                  }
-                />
-              </label>
-
-              <div className="info-note">
-                <p>After you save the flow, the backend listener can monitor this inbox automatically. Manual run still works and uses the newest matching email as `flow_input_payload.text`.</p>
-              </div>
-            </>
-          ) : currentInputSource === "webhook" ? (
-            <>
-              <label>
-                {renderInspectorPropertyLabel("Webhook Endpoint", "Save the flow, then send HTTP POST requests to this endpoint to trigger it.")}
-                <input value={webhookEndpoint} readOnly />
-              </label>
-
-              <div className="button-row">
-                <button
-                  type="button"
-                  className="secondary-button"
-                  onClick={() => handleOpenWebhookCurlModal(currentNode, webhookEndpoint)}
-                >
-                  Show cURL Example
-                </button>
-              </div>
-
-              <label>
-                {renderInspectorPropertyLabel("Shared Secret", "Optional secret compared against the configured header before the flow is allowed to run.")}
-                <input
-                  type="password"
-                  value={fieldValueAsString(currentExtras.webhookSecret)}
-                  onChange={(event) => updateInputExtras({ webhookSecret: event.target.value })}
-                />
-              </label>
-
-              <label>
-                {renderInspectorPropertyLabel("Secret Header", "Header name used to carry the shared secret from the caller, for example X-AgnoLab-Secret.")}
-                <input
-                  value={fieldValueAsString(currentExtras.webhookSecretHeader)}
-                  onChange={(event) => updateInputExtras({ webhookSecretHeader: event.target.value })}
-                />
-              </label>
-
-              <label>
-                {renderInspectorPropertyLabel("Text Field", "JSON field preferred as the main flow text when the webhook body is an object.")}
-                <input
-                  value={fieldValueAsString(currentExtras.webhookTextField)}
-                  onChange={(event) => updateInputExtras({ webhookTextField: event.target.value })}
-                />
-              </label>
-
-              <label>
-                {renderInspectorPropertyLabel("Fallback Text", "Preview text used for manual runs or when the webhook body does not expose the configured field.")}
-                <textarea
-                  value={getInputText(selectedNode.data)}
-                  onChange={(event) =>
-                    setGraph(
-                      updateNodeData(currentGraph, currentNode.id, {
-                        prompt: event.target.value,
-                        extras: {
-                          ...(currentNode.data.extras ?? {}),
-                          inputText: event.target.value,
-                        },
-                      }),
-                    )
-                  }
-                />
-              </label>
-
-              <div className="info-note">
-                <p>External callers can send JSON or plain text. The backend forwards headers, query params, parsed JSON, and body metadata into the flow.</p>
-                {projectAuthEnabled ? <p>This flow also requires `Authorization: Bearer ...` on webhook requests.</p> : null}
-              </div>
-            </>
-          ) : currentInputSource === "whatsapp" ? (
-            <>
-              <label>
-                {renderInspectorPropertyLabel("WhatsApp Session ID", "Stable session name used inside the WhatsApp gateway. Reuse the same id to preserve the linked device login.", true)}
-                <input
-                  value={fieldValueAsString(currentExtras.whatsappSessionId)}
-                  onChange={(event) => updateInputExtras({ whatsappSessionId: event.target.value })}
-                />
-              </label>
-
-              <label>
-                {renderInspectorPropertyLabel("Events Endpoint", "Internal callback used by the WhatsApp gateway to trigger this flow when a new message arrives.")}
-                <input value={whatsappEventsEndpoint} readOnly />
-              </label>
-
-              <div className="button-row">
-                <button
-                  type="button"
-                  className="secondary-button"
-                  onClick={() => handleOpenWhatsappSessionModal(currentNode)}
-                >
-                  Connect / Scan QR
-                </button>
-              </div>
-
-              <label className="checkbox-field">
-                <input
-                  type="checkbox"
-                  checked={Boolean(currentExtras.whatsappIgnoreGroups ?? true)}
-                  onChange={(event) => updateInputExtras({ whatsappIgnoreGroups: event.target.checked })}
-                />
-                {renderInspectorPropertyLabel("Ignore Group Messages", "When enabled, only direct 1:1 WhatsApp conversations trigger the flow.")}
-              </label>
-
-              <label>
-                {renderInspectorPropertyLabel("Sender Filter", "Optional case-insensitive substring filter applied to the sender id or push name.")}
-                <input
-                  value={fieldValueAsString(currentExtras.whatsappSenderFilter)}
-                  onChange={(event) => updateInputExtras({ whatsappSenderFilter: event.target.value })}
-                />
-              </label>
-
-              <label>
-                {renderInspectorPropertyLabel("Body Keywords", "Optional comma or line-break separated keywords. All keywords must appear in the incoming WhatsApp message.")}
-                <textarea
-                  value={fieldValueAsString(currentExtras.whatsappBodyKeywords)}
-                  onChange={(event) => updateInputExtras({ whatsappBodyKeywords: event.target.value })}
-                />
-              </label>
-
-              <label className="checkbox-field">
-                <input
-                  type="checkbox"
-                  checked={Boolean(currentExtras.whatsappReplyEnabled ?? true)}
-                  onChange={(event) => updateInputExtras({ whatsappReplyEnabled: event.target.checked })}
-                />
-                {renderInspectorPropertyLabel("Auto Reply With Flow Result", "Sends the final clean flow result back to the same WhatsApp chat using the connected gateway session.")}
-              </label>
-
-              <label>
-                {renderInspectorPropertyLabel("Reply Template", "Template for the outgoing WhatsApp reply. Use `$result_text`, `$input_text`, `$whatsapp_from`, `$whatsapp_sender_name`, and metadata keys.")}
-                <textarea
-                  value={fieldValueAsString(currentExtras.whatsappReplyTemplate)}
-                  onChange={(event) => updateInputExtras({ whatsappReplyTemplate: event.target.value })}
-                />
-              </label>
-
-              <label>
-                {renderInspectorPropertyLabel("Fallback Text", "Preview text used when you manually run this flow without a live WhatsApp event.")}
-                <textarea
-                  value={getInputText(selectedNode.data)}
-                  onChange={(event) =>
-                    setGraph(
-                      updateNodeData(currentGraph, currentNode.id, {
-                        prompt: event.target.value,
-                        extras: {
-                          ...(currentNode.data.extras ?? {}),
-                          inputText: event.target.value,
-                        },
-                      }),
-                    )
-                  }
-                />
-              </label>
-
-              <div className="info-note">
-                <p>Save the flow, open Connect / Scan QR, and pair the device. After that, each matching WhatsApp message runs the flow and can reply automatically with the final result.</p>
-                <p>The WhatsApp listener always executes the saved flow version on the backend. If you changed agent wiring, instructions, or Runtime Variables, save the flow before testing a new message.</p>
-                <p>The QR/session modal uses `WHATSAPP_GATEWAY_BASE_URL`, `WHATSAPP_GATEWAY_SECRET_KEY`, and `WHATSAPP_WEBHOOK_BASE_URL` from the saved flow Runtime Variables. Save the flow again after editing them.</p>
-              </div>
-            </>
-          ) : currentInputSource === "form" ? (
-            <>
-              <label>
-                {renderInspectorPropertyLabel("Form Endpoint", "Save the flow, then submit multipart or URL-encoded forms to this endpoint.")}
-                <input value={formEndpoint} readOnly />
-              </label>
-
-              <label>
-                {renderInspectorPropertyLabel("Payload Mode", "Controls the preview payload used when you test this input manually from chat or run preview.", true)}
-                <select
-                  value={inputMode}
-                  onChange={(event) =>
-                    updateInputExtras({
-                      inputMode: event.target.value,
-                    })
-                  }
-                >
-                  <option value="text">Text only</option>
-                  <option value="file">File only</option>
-                  <option value="mixed">Text + file</option>
-                </select>
-              </label>
-
-              {inputMode !== "file" ? (
-                <label>
-                  {renderInspectorPropertyLabel("Preview Text", "Preview text used for manual runs or when the form text field is empty.")}
-                  <textarea
-                    value={getInputText(selectedNode.data)}
-                    onChange={(event) =>
-                      setGraph(
-                        updateNodeData(currentGraph, currentNode.id, {
-                          prompt: event.target.value,
-                          extras: {
-                            ...(currentNode.data.extras ?? {}),
-                            inputText: event.target.value,
-                          },
-                        }),
-                      )
-                    }
-                  />
-                </label>
-              ) : null}
-
-              {inputMode !== "text" ? (
-                <>
-                  <label>
-                    {renderInspectorPropertyLabel("Upload File", "Preview attachment used when testing form submissions manually.")}
-                    <input type="file" accept={FLOW_INPUT_FILE_ACCEPT} onChange={handleInputFileChange} />
-                  </label>
-                  <p className="muted">{FLOW_INPUT_FILE_SUPPORT_NOTE}</p>
-
-                  <label>
-                    {renderInspectorPropertyLabel("File Alias", "Optional display name exposed alongside the uploaded file path.")}
-                    <input
-                      value={fieldValueAsString(currentExtras.attachedFileAlias)}
-                      onChange={(event) =>
-                        updateInputExtras({
-                          attachedFileAlias: event.target.value,
-                        })
-                      }
-                    />
-                  </label>
-
-                  {attachedFileName ? (
-                    <div className="info-note">
-                      <p>
-                        <strong>{attachedFileName}</strong>
-                      </p>
-                      <p>{attachedFileMimeType || "text/plain"}</p>
-                      <div className="button-row">
-                        <button
-                          type="button"
-                          className="secondary-button"
-                          onClick={() =>
-                            updateInputExtras({
-                              attachedFileName: "",
-                              attachedFileAlias: "",
-                              attachedFileMimeType: "",
-                              attachedFileEncoding: "base64",
-                              attachedFileBase64: "",
-                              attachedFileContent: "",
-                            })
-                          }
-                        >
-                          Clear File
-                        </button>
-                      </div>
-                    </div>
-                  ) : (
-                    <div className="info-note">
-                      <p>Use upload to preview a file-backed form submission.</p>
-                    </div>
-                  )}
-                </>
-              ) : null}
-
-              <label>
-                {renderInspectorPropertyLabel("Shared Secret", "Optional secret accepted either from the configured header or from the configured hidden form field.")}
-                <input
-                  type="password"
-                  value={fieldValueAsString(currentExtras.formSecret)}
-                  onChange={(event) => updateInputExtras({ formSecret: event.target.value })}
-                />
-              </label>
-
-              <label>
-                {renderInspectorPropertyLabel("Secret Header", "Optional header name that can carry the secret for form submissions.")}
-                <input
-                  value={fieldValueAsString(currentExtras.formSecretHeader)}
-                  onChange={(event) => updateInputExtras({ formSecretHeader: event.target.value })}
-                />
-              </label>
-
-              <label>
-                {renderInspectorPropertyLabel("Secret Form Field", "Hidden form field name that can also carry the secret.")}
-                <input
-                  value={fieldValueAsString(currentExtras.formSecretField)}
-                  onChange={(event) => updateInputExtras({ formSecretField: event.target.value })}
-                />
-              </label>
-
-              <label>
-                {renderInspectorPropertyLabel("Text Field", "Field name preferred as the main flow text when the form is submitted.")}
-                <input
-                  value={fieldValueAsString(currentExtras.formTextField)}
-                  onChange={(event) => updateInputExtras({ formTextField: event.target.value })}
-                />
-              </label>
-
-              <label>
-                {renderInspectorPropertyLabel("Metadata JSON Field", "Optional form field whose content is parsed as JSON and merged into flow_input_metadata.")}
-                <input
-                  value={fieldValueAsString(currentExtras.formMetadataField)}
-                  onChange={(event) => updateInputExtras({ formMetadataField: event.target.value })}
-                />
-              </label>
-
-              <label>
-                {renderInspectorPropertyLabel("Primary File Field", "Optional field name used to prioritize one uploaded file when a form sends many files.")}
-                <input
-                  value={fieldValueAsString(currentExtras.formPrimaryFileField)}
-                  onChange={(event) => updateInputExtras({ formPrimaryFileField: event.target.value })}
-                />
-              </label>
-
-              <div className="info-note">
-                <p>The backend accepts multipart form-data and x-www-form-urlencoded payloads. All fields and files are exposed to the flow runtime metadata.</p>
-              </div>
-            </>
-          ) : null}
-
-          <label>
-            {renderInspectorPropertyLabel("Payload Metadata JSON", "Static metadata merged into `flow_input_metadata` on every run.")}
-            <textarea
-              className="code-input"
-              value={fieldValueAsString(currentExtras.payloadJson)}
-              onChange={(event) =>
-                updateInputExtras({
-                  payloadJson: event.target.value,
-                })
-              }
-            />
-          </label>
-
-          <label>
-            {renderInspectorPropertyLabel("HITL Auto Approve", "Controls whether HITL workflow steps auto-continue or open the confirmation modal at run time.")}
-            <select
-              value={hitlAutoApproveValue}
-              onChange={(event) =>
-                updateInputExtras({
-                  hitlAutoApprove: event.target.value,
-                })
-              }
-            >
-              <option value="">Not set (manual confirmation modal on run)</option>
-              <option value="true">true (auto-continue HITL)</option>
-              <option value="false">false (force confirmation modal on run)</option>
-            </select>
-          </label>
-
-          <label>
-            {renderInspectorPropertyLabel("HITL User Input (JSON)", "Optional structured payload forwarded when a HITL gate expects user input fields.")}
-            <textarea
-              className="code-input"
-              placeholder={"{\n  \"ticket_id\": \"HITL-DEMO-001\",\n  \"review_note\": \"approved\"\n}\n"}
-              value={hitlUserInputJson}
-              onChange={(event) =>
-                updateInputExtras({
-                  hitlUserInputJson: event.target.value,
-                })
-              }
-            />
-          </label>
-
-          <div className="info-note">
-            <p>The codegen exposes `flow_input_payload`, `flow_input_files`, `flow_input_file_path`, and `flow_input` to tools, agents, and teams.</p>
-          </div>
-        </>
-      );
+      return <InputInspector selectedNode={selectedNode} flowName={flowName} graph={graph} handleOpenWebhookCurlModal={handleOpenWebhookCurlModal} handleOpenWhatsappSessionModal={handleOpenWhatsappSessionModal} projectAuthEnabled={projectAuthEnabled} setGraph={setGraph} />;
     }
 
     if (
@@ -8486,597 +3973,11 @@ export default function App() {
     }
 
     if (selectedNode.type === "tool") {
-      const toolMode = getToolMode(selectedNode.data);
-      const selectedBuiltInTool = getBuiltInTool(selectedNode.data.extras?.builtinToolKey as string | undefined);
-      const selectedBuiltInWorkflowFunctionName = fieldValueAsString(selectedNode.data.extras?.builtinWorkflowFunction).trim();
-      const selectedBuiltInWorkflowFunction =
-        builtInToolFunctionOptions.find((option) => option.name === selectedBuiltInWorkflowFunctionName) ?? null;
-
-      return (
-        <>
-          <label>
-            Name
-            <span className="required-mark">*</span>
-            <input
-              value={selectedNode.data.name}
-              onChange={(event) =>
-                setGraph(updateNodeData(graph, selectedNode.id, { name: event.target.value }))
-              }
-            />
-          </label>
-
-          <label>
-            Tool Mode
-            <span className="required-mark">*</span>
-            <select
-              value={toolMode}
-              onChange={(event) => {
-                const nextMode = event.target.value as "builtin" | "function";
-                setGraph(
-                  updateNodeData(
-                    graph,
-                    selectedNode.id,
-                    updateToolConfig(selectedNode.data, { toolMode: nextMode }),
-                  ),
-                );
-              }}
-            >
-              <option value="builtin">Built-in Tool</option>
-              <option value="function">Function Tool</option>
-            </select>
-          </label>
-
-          {toolMode === "builtin" ? (
-            <>
-              <label>
-                Built-in Tool
-                <span className="required-mark">*</span>
-                <select
-                  value={fieldValueAsString(selectedNode.data.extras?.builtinToolKey)}
-                  onChange={(event) => {
-                    const tool = getBuiltInTool(event.target.value);
-                    if (!tool) {
-                      return;
-                    }
-                    setGraph(
-                      updateNodeData(graph, selectedNode.id, {
-                        description: tool.description,
-                        ...updateToolConfig(selectedNode.data, {
-                          builtinToolKey: tool.key,
-                          builtinImportPath: tool.importPath,
-                          builtinClassName: tool.className,
-                          builtinConfig: tool.configTemplate ?? "",
-                          builtinWorkflowFunction: "",
-                          builtinWorkflowExecutorArgs: "",
-                        }),
-                      }),
-                    );
-                  }}
-                >
-                  {BUILT_IN_TOOL_CATEGORIES.map((category) => (
-                    <optgroup key={category} label={category}>
-                      {BUILT_IN_TOOLS.filter((tool) => tool.category === category).map((tool) => (
-                        <option key={tool.key} value={tool.key}>
-                          {tool.label}
-                        </option>
-                      ))}
-                    </optgroup>
-                  ))}
-                </select>
-              </label>
-
-              {selectedBuiltInTool ? (
-                <div className="info-note">
-                  <p>{selectedBuiltInTool.description}</p>
-                  {selectedBuiltInTool.prerequisite ? <p>Prerequisite: {selectedBuiltInTool.prerequisite}</p> : null}
-                </div>
-              ) : null}
-
-              <label>
-                Tool Config JSON
-                <textarea
-                  className="code-input"
-                  value={fieldValueAsString(selectedNode.data.extras?.builtinConfig)}
-                  onChange={(event) =>
-                    setGraph(
-                      updateNodeData(
-                        graph,
-                        selectedNode.id,
-                        updateToolConfig(selectedNode.data, { builtinConfig: event.target.value }),
-                      ),
-                    )
-                  }
-                />
-              </label>
-
-              <label>
-                Workflow Executor Function
-                <select
-                  value={selectedBuiltInWorkflowFunctionName}
-                  onChange={(event) =>
-                    setGraph(
-                      updateNodeData(
-                        graph,
-                        selectedNode.id,
-                        updateToolConfig(selectedNode.data, { builtinWorkflowFunction: event.target.value }),
-                      ),
-                    )
-                  }
-                  disabled={isLoadingBuiltInToolFunctions || builtInToolFunctionOptions.length === 0}
-                >
-                  {builtInToolFunctionOptions.length === 0 ? <option value="">No callable functions found</option> : null}
-                  {builtInToolFunctionOptions.map((option) => (
-                    <option key={option.name} value={option.name}>
-                      {option.label}
-                    </option>
-                  ))}
-                </select>
-              </label>
-
-              {isLoadingBuiltInToolFunctions ? (
-                <div className="info-note">
-                  <p>Inspecting built-in tool functions...</p>
-                </div>
-              ) : null}
-
-              {builtInToolFunctionsError ? (
-                <div className="info-note">
-                  <p>{builtInToolFunctionsError}</p>
-                </div>
-              ) : null}
-
-              {selectedBuiltInWorkflowFunction ? (
-                <div className="info-note">
-                  <p>
-                    <strong>Workflow executor</strong>
-                  </p>
-                  <p>{selectedBuiltInWorkflowFunction.label}</p>
-                  {selectedBuiltInWorkflowFunction.description ? <p>{selectedBuiltInWorkflowFunction.description}</p> : null}
-                  {selectedBuiltInWorkflowFunction.required_params.length ? (
-                    <p>Required params: {selectedBuiltInWorkflowFunction.required_params.join(", ")}</p>
-                  ) : (
-                    <p>No required params.</p>
-                  )}
-                  {selectedBuiltInWorkflowFunction.optional_params.length ? (
-                    <p>Optional params: {selectedBuiltInWorkflowFunction.optional_params.join(", ")}</p>
-                  ) : null}
-                  <p>When this Tool is connected to a Workflow Step, the step input is bound to the first unsatisfied function parameter.</p>
-                </div>
-              ) : null}
-
-              <label>
-                Workflow Executor Args JSON
-                <textarea
-                  className="code-input"
-                  value={fieldValueAsString(selectedNode.data.extras?.builtinWorkflowExecutorArgs)}
-                  onChange={(event) =>
-                    setGraph(
-                      updateNodeData(
-                        graph,
-                        selectedNode.id,
-                        updateToolConfig(selectedNode.data, { builtinWorkflowExecutorArgs: event.target.value }),
-                      ),
-                    )
-                  }
-                  placeholder={`{\n  "max_results": 3\n}`}
-                />
-              </label>
-            </>
-          ) : (
-            <>
-              <label>
-                Function Name
-                <span className="required-mark">*</span>
-                <input
-                  value={fieldValueAsString(selectedNode.data.extras?.functionName)}
-                  onChange={(event) =>
-                    setGraph(
-                      updateNodeData(
-                        graph,
-                        selectedNode.id,
-                        updateToolConfig(selectedNode.data, { functionName: event.target.value }),
-                      ),
-                    )
-                  }
-                />
-              </label>
-
-              <div className="info-note">
-                <p>Function tools use the Agno `@tool` decorator in codegen.</p>
-              </div>
-
-              <div className="button-row">
-                <button
-                  type="button"
-                  className="secondary-button code-button"
-                  onClick={() => setEditingFunctionNodeId(selectedNode.id)}
-                >
-                  Open Code Editor
-                </button>
-                <button
-                  type="button"
-                  className="secondary-button save-button"
-                  onClick={saveCurrentFunctionTool}
-                >
-                  Save Tool
-                </button>
-              </div>
-            </>
-          )}
-        </>
-      );
+      return <ToolInspector selectedNode={selectedNode} builtInToolFunctionOptions={builtInToolFunctionOptions} builtInToolFunctionsError={builtInToolFunctionsError} graph={graph} isLoadingBuiltInToolFunctions={isLoadingBuiltInToolFunctions} saveCurrentFunctionTool={saveCurrentFunctionTool} setEditingFunctionNodeId={setEditingFunctionNodeId} setGraph={setGraph} />;
     }
 
     if (selectedNode.type === "output_api") {
-      const currentNode = selectedNode;
-      const currentExtras = currentNode.data.extras ?? {};
-      const outputMode = getOutputMode(currentNode.data);
-      const chatProvider = getChatProvider(currentNode.data);
-      const updateOutputExtras = (patch: Record<string, unknown>) =>
-        setGraph(
-          updateNodeData(graph, currentNode.id, {
-            extras: {
-              ...currentExtras,
-              ...patch,
-            },
-          }),
-        );
-
-      return (
-        <>
-          <label>
-            Name
-            <span className="required-mark">*</span>
-            <input
-              value={currentNode.data.name}
-              onChange={(event) =>
-                setGraph(updateNodeData(graph, currentNode.id, { name: event.target.value }))
-              }
-            />
-          </label>
-
-          <label>
-            {renderInspectorPropertyLabel("Output Mode", "Choose where this integration output should deliver the final flow result.", true)}
-            <select
-              value={outputMode}
-              onChange={(event) => updateOutputExtras({ outputMode: event.target.value })}
-            >
-              <option value="api">API POST</option>
-              <option value="email">Email send</option>
-              <option value="chat">Chat message</option>
-              <option value="spreadsheet">Spreadsheet append</option>
-            </select>
-          </label>
-
-          {outputMode === "api" ? (
-            <>
-              <label>
-                API URL
-                <span className="required-mark">*</span>
-                <input
-                  placeholder="https://api.example.com/webhooks/flow-result"
-                  value={fieldValueAsString(currentExtras.apiUrl)}
-                  onChange={(event) => updateOutputExtras({ apiUrl: event.target.value })}
-                />
-              </label>
-
-              <label>
-                Bearer Token
-                <input
-                  placeholder="token without 'Bearer' prefix"
-                  value={fieldValueAsString(currentExtras.apiBearerToken)}
-                  onChange={(event) => updateOutputExtras({ apiBearerToken: event.target.value })}
-                />
-              </label>
-
-              <label>
-                Timeout (seconds)
-                <input
-                  type="number"
-                  min={1}
-                  step={1}
-                  value={fieldValueAsString(currentExtras.apiTimeoutSeconds || 15)}
-                  onChange={(event) => {
-                    const rawValue = Number(event.target.value);
-                    const nextValue = Number.isFinite(rawValue) && rawValue > 0 ? rawValue : 15;
-                    updateOutputExtras({ apiTimeoutSeconds: nextValue });
-                  }}
-                />
-              </label>
-
-              <label>
-                Additional Headers JSON
-                <textarea
-                  className="code-input"
-                  value={fieldValueAsString(currentExtras.apiHeadersJson)}
-                  onChange={(event) => updateOutputExtras({ apiHeadersJson: event.target.value })}
-                />
-              </label>
-
-              <label>
-                Additional Payload JSON
-                <textarea
-                  className="code-input"
-                  value={fieldValueAsString(currentExtras.apiPayloadJson)}
-                  onChange={(event) => updateOutputExtras({ apiPayloadJson: event.target.value })}
-                />
-              </label>
-
-              <div className="info-note">
-                <p>This node sends a POST request with a standard JSON envelope containing <code>flow</code>, <code>timestamp</code>, <code>input</code>, and <code>result</code>.</p>
-                <p>Template placeholders work in the additional payload JSON. Use metadata keys like <code>$tenant</code> and system values like <code>$result_text</code>, <code>$input_text</code>, <code>$timestamp</code>, and <code>$flow_name</code>.</p>
-                <p>Example: <code>{'{"tenant": $tenant, "summary": "$result_text"}'}</code></p>
-              </div>
-            </>
-          ) : outputMode === "email" ? (
-            <>
-              <label>
-                SMTP Host
-                <span className="required-mark">*</span>
-                <input
-                  placeholder="smtp.example.com"
-                  value={fieldValueAsString(currentExtras.emailHost)}
-                  onChange={(event) => updateOutputExtras({ emailHost: event.target.value })}
-                />
-              </label>
-
-              <label>
-                Security
-                <select
-                  value={fieldValueAsString(currentExtras.emailSecurity || "starttls")}
-                  onChange={(event) => updateOutputExtras({ emailSecurity: event.target.value })}
-                >
-                  <option value="ssl">SSL/TLS</option>
-                  <option value="starttls">STARTTLS</option>
-                  <option value="none">None</option>
-                </select>
-              </label>
-
-              <label>
-                SMTP Port
-                <input
-                  type="number"
-                  min={1}
-                  step={1}
-                  value={fieldValueAsString(currentExtras.emailPort || 587)}
-                  onChange={(event) => updateOutputExtras({ emailPort: event.target.value })}
-                />
-              </label>
-
-              <label>
-                Username
-                <input
-                  value={fieldValueAsString(currentExtras.emailUsername)}
-                  onChange={(event) => updateOutputExtras({ emailUsername: event.target.value })}
-                />
-              </label>
-
-              <label>
-                Password
-                <input
-                  type="password"
-                  value={fieldValueAsString(currentExtras.emailPassword)}
-                  onChange={(event) => updateOutputExtras({ emailPassword: event.target.value })}
-                />
-              </label>
-
-              <label>
-                From
-                <span className="required-mark">*</span>
-                <input
-                  placeholder="robot@example.com"
-                  value={fieldValueAsString(currentExtras.emailFrom)}
-                  onChange={(event) => updateOutputExtras({ emailFrom: event.target.value })}
-                />
-              </label>
-
-              <label>
-                To
-                <span className="required-mark">*</span>
-                <input
-                  placeholder="ops@example.com, support@example.com"
-                  value={fieldValueAsString(currentExtras.emailTo)}
-                  onChange={(event) => updateOutputExtras({ emailTo: event.target.value })}
-                />
-              </label>
-
-              <label>
-                Cc
-                <input
-                  value={fieldValueAsString(currentExtras.emailCc)}
-                  onChange={(event) => updateOutputExtras({ emailCc: event.target.value })}
-                />
-              </label>
-
-              <label>
-                Bcc
-                <input
-                  value={fieldValueAsString(currentExtras.emailBcc)}
-                  onChange={(event) => updateOutputExtras({ emailBcc: event.target.value })}
-                />
-              </label>
-
-              <label>
-                Subject Template
-                <textarea
-                  value={fieldValueAsString(currentExtras.emailSubject)}
-                  onChange={(event) => updateOutputExtras({ emailSubject: event.target.value })}
-                />
-              </label>
-
-              <label>
-                Body Template
-                <textarea
-                  value={fieldValueAsString(currentExtras.emailBodyTemplate)}
-                  onChange={(event) => updateOutputExtras({ emailBodyTemplate: event.target.value })}
-                />
-              </label>
-
-              <label>
-                Timeout (seconds)
-                <input
-                  type="number"
-                  min={1}
-                  step={1}
-                  value={fieldValueAsString(currentExtras.emailTimeoutSeconds || 15)}
-                  onChange={(event) => updateOutputExtras({ emailTimeoutSeconds: event.target.value })}
-                />
-              </label>
-
-              <label className="checkbox-field">
-                <input
-                  type="checkbox"
-                  checked={Boolean(currentExtras.emailAttachInputFiles)}
-                  onChange={(event) => updateOutputExtras({ emailAttachInputFiles: event.target.checked })}
-                />
-                {renderInspectorPropertyLabel("Attach Input Files", "Forwards any incoming flow_input_files as email attachments when present.")}
-              </label>
-
-              <div className="info-note">
-                <p>Subject and body support placeholders like <code>$tenant</code>, <code>$result_text</code>, <code>$input_text</code>, <code>$timestamp</code>, and <code>$flow_name</code>.</p>
-              </div>
-            </>
-          ) : outputMode === "chat" ? (
-            <>
-              <label>
-                Chat Provider
-                <select
-                  value={chatProvider}
-                  onChange={(event) => updateOutputExtras({ chatProvider: event.target.value })}
-                >
-                  <option value="slack">Slack webhook</option>
-                  <option value="discord">Discord webhook</option>
-                  <option value="telegram">Telegram bot</option>
-                  <option value="whatsapp">WhatsApp gateway</option>
-                  <option value="generic">Generic webhook</option>
-                </select>
-              </label>
-
-              {chatProvider === "telegram" ? (
-                <>
-                  <label>
-                    Bot Token
-                    <span className="required-mark">*</span>
-                    <input
-                      type="password"
-                      value={fieldValueAsString(currentExtras.chatBotToken)}
-                      onChange={(event) => updateOutputExtras({ chatBotToken: event.target.value })}
-                    />
-                  </label>
-
-                  <label>
-                    Chat ID
-                    <span className="required-mark">*</span>
-                    <input
-                      value={fieldValueAsString(currentExtras.chatChannelId)}
-                      onChange={(event) => updateOutputExtras({ chatChannelId: event.target.value })}
-                    />
-                  </label>
-                </>
-              ) : chatProvider === "whatsapp" ? (
-                <>
-                  <label>
-                    WhatsApp Session ID
-                    <span className="required-mark">*</span>
-                    <input
-                      value={fieldValueAsString(currentExtras.chatWhatsappSessionId)}
-                      onChange={(event) => updateOutputExtras({ chatWhatsappSessionId: event.target.value })}
-                    />
-                  </label>
-
-                  <label>
-                    Target Phone / Chat
-                    <span className="required-mark">*</span>
-                    <input
-                      placeholder="$whatsapp_from or 5511999999999"
-                      value={fieldValueAsString(currentExtras.chatChannelId)}
-                      onChange={(event) => updateOutputExtras({ chatChannelId: event.target.value })}
-                    />
-                  </label>
-                </>
-              ) : (
-                <>
-                  <label>
-                    Webhook URL
-                    <span className="required-mark">*</span>
-                    <input
-                      placeholder="https://hooks.slack.com/..."
-                      value={fieldValueAsString(currentExtras.chatWebhookUrl)}
-                      onChange={(event) => updateOutputExtras({ chatWebhookUrl: event.target.value })}
-                    />
-                  </label>
-
-                  <label>
-                    Additional Headers JSON
-                    <textarea
-                      className="code-input"
-                      value={fieldValueAsString(currentExtras.chatHeadersJson)}
-                      onChange={(event) => updateOutputExtras({ chatHeadersJson: event.target.value })}
-                    />
-                  </label>
-                </>
-              )}
-
-              <label>
-                Message Template
-                <textarea
-                  value={fieldValueAsString(currentExtras.chatMessageTemplate)}
-                  onChange={(event) => updateOutputExtras({ chatMessageTemplate: event.target.value })}
-                />
-              </label>
-
-              <label>
-                Timeout (seconds)
-                <input
-                  type="number"
-                  min={1}
-                  step={1}
-                  value={fieldValueAsString(currentExtras.chatTimeoutSeconds || 15)}
-                  onChange={(event) => updateOutputExtras({ chatTimeoutSeconds: event.target.value })}
-                />
-              </label>
-
-              <div className="info-note">
-                <p>Use this mode for Slack, Discord, Telegram, WhatsApp, or any webhook that accepts a short JSON message. Placeholders like <code>$tenant</code>, <code>$result_text</code>, and <code>$whatsapp_from</code> are supported.</p>
-              </div>
-            </>
-          ) : (
-            <>
-              <label>
-                CSV File Path
-                <span className="required-mark">*</span>
-                <input
-                  placeholder="tmp/flow_results.csv"
-                  value={fieldValueAsString(currentExtras.sheetFilePath)}
-                  onChange={(event) => updateOutputExtras({ sheetFilePath: event.target.value })}
-                />
-              </label>
-
-              <label className="checkbox-field">
-                <input
-                  type="checkbox"
-                  checked={Boolean(currentExtras.sheetIncludeHeader ?? true)}
-                  onChange={(event) => updateOutputExtras({ sheetIncludeHeader: event.target.checked })}
-                />
-                {renderInspectorPropertyLabel("Write Header Row", "Adds a CSV header when the file is created or empty.")}
-              </label>
-
-              <label>
-                Row JSON
-                <textarea
-                  className="code-input"
-                  value={fieldValueAsString(currentExtras.sheetRowJson)}
-                  onChange={(event) => updateOutputExtras({ sheetRowJson: event.target.value })}
-                />
-              </label>
-
-              <div className="info-note">
-                <p>Append a structured row to a local CSV file after every run. JSON values are serialized automatically, and placeholders like <code>$tenant</code>, <code>$result_text</code>, and <code>$timestamp</code> are supported.</p>
-              </div>
-            </>
-          )}
-        </>
-      );
+      return <OutputApiInspector selectedNode={selectedNode} graph={graph} setGraph={setGraph} />;
     }
 
     if (isQueueNodeType(selectedNode.type)) {
@@ -9463,6 +4364,10 @@ export default function App() {
               >
                 Models
               </button>
+              <div className="home-sidebar-footer">
+                <p className="eyebrow">Appearance</p>
+                <ThemePicker value={themeId} onChange={setThemeId} placement="top-start" />
+              </div>
             </aside>
 
             <section className="home-content panel">
@@ -9867,9 +4772,65 @@ export default function App() {
     });
   }
 
+  const hasCanvasSelection = selectedNodeIds.length > 0 || Boolean(selectedNodeId);
+  const paletteCommands: PaletteCommand[] = [
+    { id: "run", group: "Flow", label: "Run flow", keywords: "execute play", run: () => void handleRun(), disabled: isRunning || isRunningSavedFlow },
+    { id: "save", group: "Flow", label: "Save flow", keywords: "persist", run: () => void handleSaveFlow() },
+    { id: "code", group: "Flow", label: "Show generated Python", keywords: "code preview source", run: () => setIsCodePreviewOpen(true) },
+    { id: "undo", group: "Edit", label: "Undo", shortcut: "Ctrl Z", run: handleUndo, disabled: historyPast.length === 0 },
+    { id: "redo", group: "Edit", label: "Redo", shortcut: "Ctrl Y", run: handleRedo, disabled: historyFuture.length === 0 },
+    { id: "select-all", group: "Edit", label: "Select all nodes", shortcut: "Ctrl A", run: handleSelectAllNodes },
+    { id: "copy", group: "Edit", label: "Copy selection", shortcut: "Ctrl C", run: () => void handleCopySelection(), disabled: !hasCanvasSelection },
+    { id: "paste", group: "Edit", label: "Paste", shortcut: "Ctrl V", run: () => void handlePasteClipboard(), disabled: !graphClipboardRef.current },
+    { id: "duplicate", group: "Edit", label: "Duplicate selection", shortcut: "Ctrl D", run: handleDuplicateSelection, disabled: !hasCanvasSelection },
+    { id: "fit", group: "View", label: "Fit flow to view", shortcut: "Shift 1", run: handleFitView },
+    { id: "layout", group: "View", label: "Auto-layout nodes", keywords: "arrange organize tidy", shortcut: "Shift L", run: handleAutoLayout },
+    { id: "zoom-in", group: "View", label: "Zoom in", run: handleZoomIn },
+    { id: "zoom-out", group: "View", label: "Zoom out", run: handleZoomOut },
+    { id: "zoom-reset", group: "View", label: "Reset zoom to 100%", run: handleZoomReset },
+    ...THEMES.map((theme) => ({
+      id: `theme:${theme.id}`,
+      group: "Theme",
+      label: `Theme: ${theme.label}`,
+      keywords: theme.description,
+      run: () => setThemeId(theme.id),
+    })),
+    { id: "import", group: "File", label: "Import flow (.json)", run: handleTriggerImportFlow },
+    { id: "export-json", group: "File", label: "Export flow (.json)", run: handleExportFlow },
+    { id: "export-py", group: "File", label: "Export Python (.py)", run: handleExportPython },
+    { id: "export-serve", group: "File", label: "Export AgentOS server app", keywords: "fastapi serve", run: () => void handleExportServeApp() },
+    { id: "home", group: "Navigate", label: "Go to Flow Hub", keywords: "home templates", run: handleGoHome },
+    ...Object.values(NODE_CATALOG)
+      .filter((definition) => definition.type !== "tool")
+      .map((definition) => ({
+        id: `node:${definition.type}`,
+        group: "Add node",
+        label: `Add ${definition.label}`,
+        keywords: `${definition.category} ${definition.description}`,
+        icon: (
+          <span style={{ color: definition.color }}>
+            <NodeIcon type={definition.type} />
+          </span>
+        ),
+        run: () => addNode(definition.type),
+      })),
+    ...BUILT_IN_TOOLS.map((tool) => ({
+      id: `tool:${tool.key}`,
+      group: "Add tool",
+      label: `Add ${tool.label}`,
+      keywords: `${tool.category} ${tool.description}`,
+      icon: (
+        <span style={{ color: toolIconColor(tool) }}>
+          <ToolIcon toolKey={tool.key} category={tool.category} />
+        </span>
+      ),
+      run: () => addBuiltInToolNode(tool),
+    })),
+  ];
+
   return (
     <div className="layout">
-      <aside className="left-dock">
+      <aside className="left-dock" onDragStart={handleLibraryDragStart}>
         <section className="dock-library panel">
           <div className="panel-header">
             <div>
@@ -9901,6 +4862,7 @@ export default function App() {
                     <button
                       key={item.key}
                       type="button"
+                      draggable
                       className="library-item"
                       onClick={() => {
                         item.onSelect();
@@ -9952,6 +4914,7 @@ export default function App() {
                       <button
                         key={definition.type}
                         type="button"
+                        draggable
                         className="library-item"
                         onClick={() => addNode(definition.type)}
                         title={definition.description}
@@ -9988,6 +4951,7 @@ export default function App() {
                   <button
                     key={item.key}
                     type="button"
+                    draggable
                     className={`library-item ${item.status === "planned" ? "library-item-disabled" : ""}`}
                     onClick={item.status === "available" ? () => handleIntegrationInputLibrarySelect(item.key) : undefined}
                     disabled={item.status === "planned"}
@@ -10024,6 +4988,7 @@ export default function App() {
                   <button
                     key={item.key}
                     type="button"
+                    draggable
                     className={`library-item ${item.status === "planned" ? "library-item-disabled" : ""}`}
                     onClick={item.status === "available" ? () => handleIntegrationOutputLibrarySelect(item.key) : undefined}
                     disabled={item.status === "planned"}
@@ -10060,6 +5025,7 @@ export default function App() {
                   <button
                     key={tool.id}
                     type="button"
+                    draggable
                     className="library-item"
                     onClick={() => addStarterToolNode(tool)}
                     title={`${tool.description ?? tool.name}\n\nPrerequisite: ${tool.prerequisite ?? "Check tool setup before running."}`}
@@ -10094,6 +5060,7 @@ export default function App() {
                   <button
                     key={item.key}
                     type="button"
+                    draggable
                     className="library-item library-item-disabled"
                     disabled
                     title={`${item.description}${item.helper ? `\n\n${item.helper}` : ""}`}
@@ -10107,6 +5074,7 @@ export default function App() {
                 ))}
                 <button
                   type="button"
+                  draggable
                   className="library-item"
                   onClick={() => addLearningMachineNode()}
                   title="Add a Learning Machine node to the canvas and connect it to an Agent or Team."
@@ -10138,6 +5106,7 @@ export default function App() {
               <div className="library-grid">
                 <button
                   type="button"
+                  draggable
                   className="library-item"
                   onClick={() => addNode("tool")}
                   title={NODE_CATALOG.tool.description}
@@ -10171,6 +5140,7 @@ export default function App() {
                   <button
                     key={item.key}
                     type="button"
+                    draggable
                     className="library-item"
                     onClick={() => addSkillsNode()}
                     title={`${item.description}${item.helper ? `\n\n${item.helper}` : ""}`}
@@ -10206,6 +5176,7 @@ export default function App() {
                   <button
                     key={item.key}
                     type="button"
+                    draggable
                     className="library-item"
                     onClick={() => addInterfaceNode(item.key)}
                     title={`${item.description}${item.helper ? `\n\n${item.helper}` : ""}`}
@@ -10241,6 +5212,7 @@ export default function App() {
                   <div key={tool.id} className="library-item library-item-card" title={tool.description ?? tool.name}>
                     <button
                       type="button"
+                      draggable
                       className="library-item-main"
                       onClick={() => addMyToolNode(tool)}
                     >
@@ -10293,6 +5265,7 @@ export default function App() {
                   <button
                     key={item.key}
                     type="button"
+                    draggable
                     className="library-item"
                     onClick={() => addVectorDbNode(item.key as VectorDbPresetKey)}
                     title={`${item.description}${item.helper ? `\n\n${item.helper}` : ""}`}
@@ -10328,6 +5301,7 @@ export default function App() {
                   <button
                     key={item.key}
                     type="button"
+                    draggable
                     className="library-item library-item-disabled"
                     disabled
                     title={`${item.description}${item.helper ? `\n\n${item.helper}` : ""}`}
@@ -10341,6 +5315,7 @@ export default function App() {
                 ))}
                 <button
                   type="button"
+                  draggable
                   className="library-item"
                   onClick={() => addKnowledgeNode("knowledge")}
                   title="Add a Knowledge node to the canvas and connect it to an Agent."
@@ -10352,6 +5327,7 @@ export default function App() {
                 </button>
                 <button
                   type="button"
+                  draggable
                   className="library-item"
                   onClick={() => addKnowledgeNode("knowledge_contents")}
                   title="Add a Knowledge node with Contents DB support to the canvas."
@@ -10385,6 +5361,7 @@ export default function App() {
                   <button
                     key={item.key}
                     type="button"
+                    draggable
                     className="library-item"
                     onClick={() => addManagerNode(item.key)}
                     title={`${item.description}\n\n${item.helper}`}
@@ -10419,6 +5396,7 @@ export default function App() {
                   <button
                     key={item.key}
                     type="button"
+                    draggable
                     className="library-item"
                     onClick={() => addDatabaseNode(item.key as DatabasePresetKey)}
                     title={`${item.description}${item.helper ? `\n\n${item.helper}` : ""}`}
@@ -10476,6 +5454,7 @@ export default function App() {
                             <button
                               key={tool.key}
                               type="button"
+                              draggable
                               className="library-item"
                               onClick={() => addBuiltInToolNode(tool)}
                               title={formatToolLibraryTitle(tool)}
@@ -10516,101 +5495,121 @@ export default function App() {
       </aside>
 
       <main
-        className={`canvas ${dragState ? "is-dragging" : ""} ${canvasPanState ? "is-panning" : ""}`}
+        className="canvas"
         ref={canvasRef}
-        onMouseDown={handleCanvasMouseDown}
-        onMouseMove={handleCanvasPointerMove}
-        onWheel={handleCanvasWheel}
-        onClick={(event) => {
-          if (ignoreCanvasClickRef.current) {
-            ignoreCanvasClickRef.current = false;
-            return;
-          }
-
-          if (isCanvasBackgroundTarget(event.target, event.currentTarget)) {
-            setSelectedNodeId(null);
-            setSelectedEdgeId(null);
-            setPendingConnectionSourceId(null);
-            setConnectionPointer(null);
-          }
-        }}
       >
-        <div className="canvas-brand">
-          <p className="eyebrow">AgnoLab</p>
-          <h1>{graph.project.name}</h1>
-          <p className="muted">Visual canvas for Agno</p>
-          <div className="canvas-brand-actions">
-            <button type="button" className="secondary-button" onClick={handleGoHome}>
-              Home
+        <header className="canvas-toolbar" role="toolbar" aria-label="Flow toolbar">
+          <div className="canvas-toolbar-group canvas-toolbar-identity">
+            <button type="button" className="icon-button" onClick={handleGoHome} title="Back to the Flow Hub" aria-label="Home">
+              <svg viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M4 11.5 12 5l8 6.5V20a1 1 0 0 1-1 1h-4.5v-6h-5v6H5a1 1 0 0 1-1-1z" />
+              </svg>
+            </button>
+            <div className="canvas-toolbar-title">
+              <span className="eyebrow">AgnoLab · {graph.project.target}</span>
+              <strong title={graph.project.name}>{graph.project.name}</strong>
+            </div>
+          </div>
+
+          <div className="canvas-toolbar-group canvas-toolbar-flow">
+            <label className="visually-hidden" htmlFor="flow-name-input">
+              Flow name
+            </label>
+            <input
+              id="flow-name-input"
+              className="flow-name-input"
+              value={flowName}
+              onChange={(event) => setFlowName(event.target.value)}
+              list="saved-flow-names"
+              placeholder="flow_name"
+            />
+            <button type="button" className="secondary-button save-button" onClick={handleSaveFlow} disabled={isSavingFlow}>
+              {isSavingFlow ? "Saving…" : "Save"}
+            </button>
+            <button type="button" className="secondary-button" onClick={() => handleOpenIntegrationModal()}>
+              Integration
             </button>
             <details className="canvas-settings-menu">
-              <summary className="secondary-button">Settings</summary>
+              <summary className="secondary-button" aria-label="More flow actions">
+                More
+              </summary>
               <div className="canvas-settings-menu-items">
                 <button type="button" className="secondary-button" onClick={handleTriggerImportFlow}>
                   Import Flow
                 </button>
                 <button type="button" className="secondary-button" onClick={handleExportFlow}>
-                  Export Flow
+                  Export Flow (.json)
                 </button>
                 <button type="button" className="secondary-button" onClick={handleExportPython}>
-                  Export .py
+                  Export Python (.py)
                 </button>
                 <button type="button" className="secondary-button" onClick={handleExportServeApp} title="Export an AgentOS server app (FastAPI) that serves this flow's agents/teams/workflows as an API.">
                   Export Server App
                 </button>
-                <button type="button" className="secondary-button" onClick={handleUndo} disabled={historyPast.length === 0} title="Undo (Ctrl/Cmd+Z)">
-                  Undo
-                </button>
-                <button type="button" className="secondary-button" onClick={handleRedo} disabled={historyFuture.length === 0} title="Redo (Ctrl/Cmd+Y)">
-                  Redo
-                </button>
               </div>
             </details>
+            <datalist id="saved-flow-names">
+              {savedFlows.map((flow) => (
+                <option key={flow.name} value={flow.name} />
+              ))}
+            </datalist>
           </div>
-        </div>
-        <div className="run-cta">
-          <button type="button" className="primary-button run-button" onClick={handleRun} disabled={isRunning || isRunningSavedFlow}>
-            {isRunning ? "Running..." : "Run"}
-          </button>
-        </div>
 
-        <div className="flow-actions" role="toolbar" aria-label="Flow actions">
-          <input
-            className="flow-name-input"
-            value={flowName}
-            onChange={(event) => setFlowName(event.target.value)}
-            list="saved-flow-names"
-            placeholder="flow_name"
-          />
-          <button type="button" className="secondary-button save-button" onClick={handleSaveFlow} disabled={isSavingFlow}>
-            {isSavingFlow ? "Saving..." : "Save Flow"}
-          </button>
-          <button type="button" className="secondary-button" onClick={() => handleOpenIntegrationModal()}>
-            Integration
-          </button>
-          <datalist id="saved-flow-names">
-            {savedFlows.map((flow) => (
-              <option key={flow.name} value={flow.name} />
-            ))}
-          </datalist>
-        </div>
-
-        <div className="canvas-controls" role="toolbar" aria-label="Canvas view controls">
-          <button type="button" className="secondary-button" onClick={handleToggleTheme} title="Toggle dark/light theme">
-            Theme: {themeMode === "dark" ? "Dark" : "Light"}
-          </button>
-          <div className="zoom-control" role="group" aria-label="Zoom controls">
-            <button type="button" className="secondary-button" onClick={handleZoomOut} disabled={canvasZoom <= MIN_CANVAS_ZOOM}>
-              Zoom -
+          <div className="canvas-toolbar-group canvas-toolbar-view">
+            <div className="segmented" role="group" aria-label="History">
+              <button type="button" className="icon-button" onClick={handleUndo} disabled={historyPast.length === 0} title="Undo (Ctrl/Cmd+Z)" aria-label="Undo">
+                <svg viewBox="0 0 24 24" aria-hidden="true">
+                  <path d="M9 7 4 12l5 5M4.5 12H14a6 6 0 0 1 0 12h-1" transform="translate(0 -3)" />
+                </svg>
+              </button>
+              <button type="button" className="icon-button" onClick={handleRedo} disabled={historyFuture.length === 0} title="Redo (Ctrl/Cmd+Y)" aria-label="Redo">
+                <svg viewBox="0 0 24 24" aria-hidden="true">
+                  <path d="m15 7 5 5-5 5M19.5 12H10a6 6 0 0 0 0 12h1" transform="translate(0 -3)" />
+                </svg>
+              </button>
+            </div>
+            <div className="segmented zoom-control" role="group" aria-label="Zoom">
+              <button type="button" className="icon-button" onClick={handleZoomOut} disabled={canvasZoom <= MIN_FLOW_ZOOM + 0.001} title="Zoom out (Ctrl/Cmd -)" aria-label="Zoom out">
+                <svg viewBox="0 0 24 24" aria-hidden="true">
+                  <path d="M6 12h12" />
+                </svg>
+              </button>
+              <button type="button" className="icon-button canvas-zoom-readout" onClick={handleZoomReset} title="Reset zoom to 100%">
+                {Math.round(canvasZoom * 100)}%
+              </button>
+              <button type="button" className="icon-button" onClick={handleZoomIn} disabled={canvasZoom >= MAX_FLOW_ZOOM - 0.001} title="Zoom in (Ctrl/Cmd +)" aria-label="Zoom in">
+                <svg viewBox="0 0 24 24" aria-hidden="true">
+                  <path d="M6 12h12M12 6v12" />
+                </svg>
+              </button>
+            </div>
+            <div className="segmented" role="group" aria-label="Layout">
+              <button type="button" className="icon-button" onClick={handleFitView} title="Fit flow to view (Shift+1)" aria-label="Fit to view">
+                <svg viewBox="0 0 24 24" aria-hidden="true">
+                  <path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5" />
+                </svg>
+              </button>
+              <button type="button" className="icon-button" onClick={handleAutoLayout} title="Auto-layout: arrange nodes left to right by data flow (Shift+L)" aria-label="Auto-layout">
+                <svg viewBox="0 0 24 24" aria-hidden="true">
+                  <path d="M4 5h5v5H4zM15 5h5v5h-5zM15 14h5v5h-5zM9 7.5h6M17.5 10v4" />
+                </svg>
+              </button>
+            </div>
+            <button type="button" className="icon-button command-palette-trigger" onClick={() => setIsCommandPaletteOpen(true)} title="Command palette (Ctrl/Cmd+K)" aria-label="Open command palette">
+              <svg viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M10.5 4a6.5 6.5 0 1 0 0 13 6.5 6.5 0 0 0 0-13zM20 20l-4.6-4.6" />
+              </svg>
+              <kbd>⌘K</kbd>
             </button>
-            <button type="button" className="secondary-button canvas-zoom-readout" onClick={handleZoomReset} title="Reset zoom to 100%">
-              {Math.round(canvasZoom * 100)}%
-            </button>
-            <button type="button" className="secondary-button" onClick={handleZoomIn} disabled={canvasZoom >= MAX_CANVAS_ZOOM}>
-              Zoom +
+            <ThemePicker value={themeId} onChange={setThemeId} placement="bottom-end" />
+            <button type="button" className="primary-button run-button" onClick={handleRun} disabled={isRunning || isRunningSavedFlow}>
+              <svg viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M8 5.5v13l10-6.5z" />
+              </svg>
+              {isRunning ? "Running…" : "Run"}
             </button>
           </div>
-        </div>
+        </header>
 
         <div className="canvas-footer-left">
           <span className="muted small-note">
@@ -10632,215 +5631,43 @@ export default function App() {
           onChange={handleImportFlowFileChange}
         />
 
-        {minimapModel ? (
-          <div className="canvas-minimap" aria-label="Flow minimap">
-            <svg viewBox={`0 0 ${MINIMAP_WIDTH} ${MINIMAP_HEIGHT}`} role="img" onClick={handleMinimapClick}>
-              <rect className="canvas-minimap-background" x={0} y={0} width={MINIMAP_WIDTH} height={MINIMAP_HEIGHT} rx={4} ry={4} />
-              {minimapModel.nodes.map((node) => (
-                <rect
-                  key={node.id}
-                  x={node.x}
-                  y={node.y}
-                  width={node.width}
-                  height={node.height}
-                  className={`canvas-minimap-node ${node.selected ? "selected" : ""}`}
-                  rx={2}
-                  ry={2}
-                />
-              ))}
-              <rect
-                x={minimapModel.viewport.x}
-                y={minimapModel.viewport.y}
-                width={minimapModel.viewport.width}
-                height={minimapModel.viewport.height}
-                className="canvas-minimap-viewport"
-                rx={3}
-                ry={3}
-              />
-            </svg>
+        {currentFlowRuntimeStatus?.active_runs ? (
+          <div className="canvas-runtime-status" role="status">
+            <strong>Running:</strong> {currentFlowRuntimeStatus.active_runs} active request(s) · total {currentFlowRuntimeStatus.total_runs} · success{" "}
+            {currentFlowRuntimeStatus.success_runs} · failed {currentFlowRuntimeStatus.failed_runs}
           </div>
         ) : null}
 
-        <div className="canvas-hint">
-          <p>
-            {pendingSourceNode
-              ? `Connecting ${pendingSourceNode.data.name}. Click the destination left port to complete.`
-              : connectionMessage ?? "To connect components: click the source right port and then the destination left port."}
-          </p>
-          {currentFlowRuntimeStatus?.active_runs ? (
-            <p>
-              <strong>Running:</strong> {currentFlowRuntimeStatus.active_runs} active request(s) · total {currentFlowRuntimeStatus.total_runs} ·
-              success {currentFlowRuntimeStatus.success_runs} · failed {currentFlowRuntimeStatus.failed_runs}
-            </p>
-          ) : null}
-        </div>
-
-        <div
-          className="canvas-viewport"
-          style={{ transform: `translate(${canvasOffset.x}px, ${canvasOffset.y}px) scale(${canvasZoom})` }}
-        >
-        <div className="canvas-grid" />
-        <svg className="edges">
-          {graph.edges.map((edge) => {
-            const source = nodeMap[edge.source];
-            const target = nodeMap[edge.target];
-            if (!source || !target) {
-              return null;
-            }
-
-            const sourceCenterX = source.position.x + NODE_WIDTH / 2;
-            const sourceCenterY = source.position.y + NODE_MIN_HEIGHT / 2;
-            const targetCenterX = target.position.x + NODE_WIDTH / 2;
-            const targetCenterY = target.position.y + NODE_MIN_HEIGHT / 2;
-            const horizontalGap = targetCenterX - sourceCenterX;
-
-            let x1 = source.position.x + NODE_WIDTH;
-            let y1 = sourceCenterY;
-            let x2 = target.position.x;
-            let y2 = targetCenterY;
-
-            if (Math.abs(horizontalGap) < 180) {
-              x1 = sourceCenterX;
-              y1 = source.position.y + 80;
-              x2 = targetCenterX;
-              y2 = target.position.y;
-            } else if (horizontalGap < 0) {
-              x1 = source.position.x;
-              x2 = target.position.x + NODE_WIDTH;
-            }
-
-            const cx1 = x1 + (x2 - x1) * 0.45;
-            const cx2 = x1 + (x2 - x1) * 0.55;
-
-            return (
-              <g key={edge.id}>
-                <path
-                  d={`M ${x1} ${y1} C ${cx1} ${y1}, ${cx2} ${y2}, ${x2} ${y2}`}
-                  className={`edge-path ${selectedEdgeId === edge.id ? "selected" : ""}`}
-                />
-                <path
-                  d={`M ${x1} ${y1} C ${cx1} ${y1}, ${cx2} ${y2}, ${x2} ${y2}`}
-                  className="edge-hit-area"
-                  onClick={(event) => {
-                    event.stopPropagation();
-                    selectEdge(edge);
-                  }}
-                />
-              </g>
-            );
-          })}
-          {pendingSourceNode && connectionPointer ? (
-            <path
-              d={`M ${pendingSourceNode.position.x + NODE_WIDTH} ${pendingSourceNode.position.y + NODE_MIN_HEIGHT / 2} C ${
-                pendingSourceNode.position.x + NODE_WIDTH + (connectionPointer.x - (pendingSourceNode.position.x + NODE_WIDTH)) * 0.45
-              } ${pendingSourceNode.position.y + NODE_MIN_HEIGHT / 2}, ${
-                pendingSourceNode.position.x + NODE_WIDTH + (connectionPointer.x - (pendingSourceNode.position.x + NODE_WIDTH)) * 0.55
-              } ${connectionPointer.y}, ${connectionPointer.x} ${connectionPointer.y}`}
-              className="edge-path edge-path-pending"
-            />
-          ) : null}
-        </svg>
-
-        {graph.nodes.map((node) => {
-          const visual = getNodeVisualIcon(node);
-          const runBadge = nodeRunBadges[node.id];
-
-          return (
-            <div
-              key={node.id}
-              className={`canvas-node ${runBadge ? "has-run-status" : ""} ${selectedNodeId === node.id ? "selected" : ""} ${pendingConnectionSourceId === node.id ? "is-connecting" : ""} ${dragState?.nodeId === node.id ? "is-dragging" : ""}`}
-              style={{
-                left: `${node.position.x}px`,
-                top: `${node.position.y}px`,
-                borderColor: selectedNodeId === node.id ? visual.color : undefined,
-              }}
-              onClick={() => setSelectedNodeId(node.id)}
-              onClickCapture={() => setSelectedEdgeId(null)}
-              onDoubleClick={() => {
-                if (node.type === "input") {
-                  setSelectedNodeId(null);
-                  setSelectedEdgeId(null);
-                  setIsChatOpen((current) => !current);
-                  return;
-                }
-
-                if (node.type !== "output") {
-                  return;
-                }
-                setSelectedNodeId(node.id);
-                setActiveRightTab("code");
-                setOutputResponseOnly((current) => !current);
-              }}
-              onMouseDown={(event) => handleNodeMouseDown(node.id, event)}
-            >
-              {NODE_CATALOG[node.type].receivesFrom.length > 0 ? (
-                <button
-                  type="button"
-                  className="port port-left"
-                  title={`Receives from: ${listNodeTypes(NODE_CATALOG[node.type].receivesFrom)}`}
-                  onClick={(event) => {
-                    event.stopPropagation();
-                    finishConnection(node.id);
-                  }}
-                />
-              ) : null}
-
-              {NODE_CATALOG[node.type].sendsTo.length > 0 ? (
-                <button
-                  type="button"
-                  className="port port-right"
-                  title={`Sends to: ${listNodeTypes(NODE_CATALOG[node.type].sendsTo)}`}
-                  onClick={(event) => {
-                    event.stopPropagation();
-                    startConnection(node.id);
-                  }}
-                />
-              ) : null}
-
-              {runBadge ? (
-                <span
-                  className={`node-run-badge ${
-                    runBadge.variant === "running"
-                      ? "is-running"
-                      : runBadge.variant === "tool-completed"
-                        ? "is-tool-completed"
-                        : "is-completed"
-                  }`}
-                  title={runBadge.title}
-                >
-                  {runBadge.text}
-                </span>
-              ) : null}
-
-              <div className="node-help">
-                <button type="button" className="help-button" onClick={(event) => event.stopPropagation()}>
-                  ?
-                </button>
-                <div className="help-tooltip">
-                  <strong>{NODE_CATALOG[node.type].label}</strong>
-                  <p>{NODE_CATALOG[node.type].description}</p>
-                  <p>Receives from: {listNodeTypes(NODE_CATALOG[node.type].receivesFrom)}</p>
-                  <p>Sends to: {listNodeTypes(NODE_CATALOG[node.type].sendsTo)}</p>
-                </div>
-              </div>
-
-              <span className="node-icon" style={{ color: visual.color }}>
-                {visual.icon}
-              </span>
-              <span className="node-type">{getCanvasNodeLabel(node.data, node.type)}</span>
-              <strong>{node.data.name}</strong>
-              <span className="node-meta">
-                {node.type === "output" && outputResponseOnly
-                  ? "Response only view"
-                  : node.type === "output"
-                    ? "Double-click for clean response"
-                    : getCanvasNodeMeta(node)}
-              </span>
+        <div className="toast-stack" role="status" aria-live="polite">
+          {toasts.map((toast) => (
+            <div key={toast.id} className={`toast is-${toast.tone}`}>
+              <span>{toast.message}</span>
+              <button type="button" className="toast-close" aria-label="Dismiss" onClick={() => dismissToast(toast.id)}>
+                ×
+              </button>
             </div>
-          );
-        })}
+          ))}
         </div>
+
+        <FlowCanvas
+          ref={flowCanvasRef}
+          nodes={canvasNodeViews}
+          edges={graph.edges}
+          selectedNodeIds={selectedNodeIds}
+          selectedEdgeIds={selectedEdgeId ? [selectedEdgeId] : []}
+          colorScheme={getThemeDefinition(themeId).scheme}
+          canConnect={canConnectNodeIds}
+          onConnect={connectNodes}
+          onNodesMoved={handleNodesMoved}
+          onSelectionChange={handleCanvasSelectionChange}
+          onDelete={handleCanvasDelete}
+          onNodeDoubleClick={handleNodeDoubleClick}
+          onDropLibraryItem={handleLibraryItemDrop}
+          onZoomChange={setCanvasZoom}
+        />
       </main>
+
+      <CommandPalette open={isCommandPaletteOpen} commands={paletteCommands} onClose={() => setIsCommandPaletteOpen(false)} />
 
       <aside className="right-dock">
         <section className="dock-inspector panel">

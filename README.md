@@ -1,79 +1,190 @@
 # AgnoLab
 
-AgnoLab is a visual builder for Agno workflows with a low-code canvas, code preview, and executable Python generation.
+AgnoLab is a visual builder for [Agno](https://github.com/agno-agi/agno) agents, teams, and
+workflows. Draw a flow on a low-code canvas, preview the Python it compiles to, run it in an
+isolated sandbox, and export it as a runnable script or an AgentOS server app.
 
-![AgnoLab running flow](docs/agno-agent-flow.png)
+Built on **Agno 3.2.1**.
+
+![AgnoLab editor](docs/screenshots/editor.png)
 
 ## Demo Video
 
 - Watch on YouTube: https://www.youtube.com/watch?v=fQjQHiIHMsM
 
-## What It Does
+## Highlights
 
-- Build flows with `input`, `agent`, `team`, `tool`, `condition`, `output`, and `output_api` nodes.
-- Configure providers, models, credentials, base URLs, and execution timeout directly from the canvas.
-- Use local providers like Ollama, including local model discovery in the UI.
-- Work with built-in Agno tools, saved function tools, and starter Excel tools.
-- Preview the generated Python before running it.
-- Execute flows in an isolated backend runner with debug logs and runtime checks.
-- Save, load, and rerun flows by name.
-- Export the generated project as code, requirements, and a starter README.
-- Inspect runtime output in a cleaner "response only" view when needed.
+- **Visual canvas.** Built on React Flow: drag nodes in from the library, drag from a port to
+  connect, multi-select, copy/paste, auto-layout, minimap, and live run badges on every node.
+- **Command palette.** `Ctrl/Cmd+K` to run any action or add any node or tool by name.
+- **Agents, Teams, and Workflows.** Compile to real Agno objects, including sequential
+  workflows with human-in-the-loop review steps.
+- **Code you can read.** Preview the generated Python before running, in an editor that
+  follows the app theme.
+- **Safe execution.** Isolated subprocess runner with timeouts, resource limits, optional
+  environment isolation, and no secrets written into generated code.
+- **110+ built-in tools** and 55 model providers, custom `@tool` functions, local skills,
+  guardrails, knowledge/RAG, memory, and vector databases.
+- **Integrations.** Email, webhook/form, WhatsApp, cron schedules, and six message queues
+  (RabbitMQ, Kafka, Redis, NATS, SQS, Pub/Sub) as inputs and outputs.
+- **Workflow control flow.** Router, Parallel, Loop, and if/else Branch nodes compile to Agno's
+  own workflow primitives.
+- **Export.** A run-once `main.py` or an AgentOS FastAPI server, with a pinned
+  `requirements.txt`.
+- **Five themes.** Agno Dark, Agno Light, Dracula, One Dark, and Neon.
 
-## Available Resources
+## What's New
 
-- Visual flow builder (canvas-based editor)
-- Provider presets and manual provider/model configuration
-- Built-in tools, starter function tools, and Excel helper tool
-- Python code preview and local backend execution
-- Save/load flows and run saved flows by name
-- Export generated projects with `main.py`, `requirements.txt`, and starter `README.md`
-- Docker and Docker Dev environments
-- Optional WhatsApp gateway in development compose
+### Agno 3.2.1
 
-## How to Run the Project
+AgnoLab now targets Agno 3.x, the latest major version:
 
-You can run AgnoLab either locally (API + Web) or with Docker.
+- Workflow-step human-in-the-loop settings compile to Agno 3's `HumanReview` API. New step
+  options: **Requires Output Review**, **Review Timeout**, **On Timeout**
+  (`cancel` / `skip` / `approve`), and a `retry` reject action.
+- Flows saved on Agno 2 keep working. Renamed fields are migrated automatically, and removed
+  ones produce a warning that says what to use instead.
+- Exported projects pin the exact Agno version (`agno[os]` for server exports), so an export
+  cannot silently install an incompatible release.
+- Compiler support for more backends: MySQL, SingleStore, SurrealDB, GCS JSON, JSON and
+  in-memory databases; Elasticsearch and OpenSearch vector DBs; MMR and recency rerankers.
+- Fixed eleven built-in tools that failed with "class not found", including the Google
+  tools (BigQuery, Calendar, Sheets, Drive, Maps, Gmail), Crawl4AI, Jina Reader, and SearXNG.
+  CI now checks every catalog entry against the installed Agno.
 
-- Local run: follow [Local Setup](#local-setup)
-- Production-like containers: follow [Docker](#docker)
-- Development containers with hot reload: follow [Development Mode (Docker Dev)](#development-mode-docker-dev)
+![Workflow step with human review](docs/screenshots/human-review.png)
+
+### Workflow control flow
+
+Four new **Logic** nodes sit in a workflow's step list like a Workflow Step, and can be nested:
+
+| Node | Agno class | What it does |
+| --- | --- | --- |
+| **Router** | `Router` | Runs one of its connected steps, chosen by a rule that returns a step name. |
+| **Parallel** | `Parallel` | Runs every connected step at the same time. |
+| **Loop** | `Loop` | Repeats its steps until an end condition holds or the iteration limit is hit. |
+| **Branch (if / else)** | `Condition` | Runs the steps on its *if* port when the rule is true, otherwise the steps on its *else* port. |
+
+Rules are short Python expressions, for example `'Billing Step' if 'invoice' in text.lower() else 'Support Step'`
+for a Router or `'APPROVED' in last` for a Loop. They are checked when the flow compiles, and a rule
+that fails at runtime is reported instead of stopping the workflow. The **Workflow Control Flow**
+template shows all four working together.
+
+![Workflow control flow](docs/screenshots/control-flow.png)
+
+### Scheduled flows
+
+Set an Input node's source to **Schedule (cron)**, pick a cron expression (or a preset such as
+"Weekdays at 09:00") and a time zone, and save. The API then runs the saved flow on that schedule,
+and the inspector shows the next run, the last run, and any error.
+
+![Schedule input](docs/screenshots/schedule.png)
+
+### More models, tools, and agent options
+
+- **Models:** any OpenAI-compatible endpoint, Open Responses, Azure OpenAI Responses, xAI
+  Responses, MiniMax, and Cloudflare AI Gateway.
+- **Agent and Team options from Agno 3:** fallback models (tried when the main model errors, is rate
+  limited, or runs out of context), context compaction, checkpoints, offloading large tool results,
+  and a filesystem toolkit.
+- **28 new built-in tools,** including Brave, You.com, Parallel, Valyu, Trafilatura, Docling, Resend,
+  Twilio, WhatsApp, Salesforce, Shopify, Zendesk, and Zep.
+
+### Themes and a new toolbar
+
+Pick a theme from the toolbar or the home screen. The whole UI follows it: panels, nodes,
+connections, minimap, and the code editor. Each node type gets its own accent color.
+
+![The five AgnoLab themes](docs/screenshots/themes.png)
+
+<p align="center">
+  <img src="docs/screenshots/theme-picker.png" alt="Theme picker" width="640">
+</p>
+
+The canvas now has a single toolbar: flow name, Save, Integration, an export menu,
+undo/redo, zoom, fit, auto-layout, command palette, theme, and an always-visible **Run** button.
+
+### A faster canvas
+
+The canvas moved to [React Flow](https://reactflow.dev):
+
+- **Drag to connect.** Drag from a node's right port to another node's left port. Valid
+  targets light up and invalid ones fade, so you only make connections Agno accepts.
+  Clicking one port and then the other still works.
+- **Drag from the library.** Drop any component where you want it; added nodes otherwise
+  appear in the middle of the visible area.
+- **Work with many nodes at once.** Shift+drag to box-select, Ctrl/Cmd+click to add to the
+  selection, then move, copy, paste, duplicate, or delete them together.
+- **Auto-layout** arranges the flow left to right by data flow, and **Fit** frames it.
+
+![Connecting two nodes](docs/screenshots/connect.png)
+
+![Command palette](docs/screenshots/command-palette.png)
+
+### Keyboard shortcuts
+
+| Shortcut | Action |
+| --- | --- |
+| `Ctrl/Cmd+K` | Command palette |
+| `Ctrl/Cmd+Z` / `Ctrl/Cmd+Y` | Undo / redo |
+| `Ctrl/Cmd+C` / `Ctrl/Cmd+V` | Copy / paste nodes (with the connections between them) |
+| `Ctrl/Cmd+D` | Duplicate selection |
+| `Ctrl/Cmd+A` | Select all nodes |
+| `Delete` / `Backspace` | Delete the selected nodes or connection |
+| `Shift+1` | Fit flow to view |
+| `Shift+L` | Auto-layout |
+| `Esc` | Clear the selection |
 
 ## Main Features
 
 ### Visual Canvas
 
-- Drag and connect nodes on a graph-based canvas.
-- Validate the direction of connections through the node model.
-- See execution badges and run state directly on the canvas.
-- Double-click output nodes to focus on the agent response without debug noise.
+- Add nodes from a searchable library grouped by category (Core, Logic, Queues,
+  Integrations, Interfaces, Tools, Skills, Learning), by click or drag and drop.
+- Connect nodes by dragging between ports; the node model validates every connection.
+- See execution badges and run state on the canvas; connections from running nodes animate.
+- Double-click an Input node to open the chat runner, or an Output node to show only the
+  agent's response.
+- Zoom with the scroll wheel, pan by dragging the background, and navigate with the minimap.
+- Keyboard focus is visible on every control.
+
+### Templates
+
+Start from a blank canvas or a ready-made template: base agent, team support desk,
+workflow handoff, workflow control flow (router, parallel, loop, if/else), memory, RAG,
+learning, skills, workflow with tools, human-in-the-loop review, and WhatsApp interface.
+
+![Templates](docs/screenshots/home-templates.png)
 
 ### Provider Management
 
 - Choose a provider preset or set a provider manually.
 - Use separate fields for provider, model, API key, base URL, extra env values, and timeout.
 - Leave credentials blank to fall back to the system environment.
-- Support local providers and remote providers through the same properties panel.
+- Discover local Ollama models from the UI.
 
 ### Tooling
 
 - Add built-in tools from the Agno tool catalog.
-- Add function tools from saved user code or starter templates.
+- Write function tools in the built-in editor, or start from saved code and starter templates.
 - Read Excel files with the starter workbook tool.
+- Attach guardrails (prompt injection, PII detection, OpenAI moderation) through
+  `pre_hooks` / `post_hooks`.
 - Export runtime dependency hints automatically from the selected tools.
 
 ### Execution
 
 - Preview code before execution.
-- Run flows locally in the backend sandbox.
-- Run saved flows by name.
+- Run flows locally in the backend sandbox, or run saved flows by name.
 - Capture stdout, stderr, exit code, and warnings.
 - Use debug mode to inspect tool calls and agent logs.
+
+![Code preview](docs/screenshots/code-preview.png)
 
 ### Export
 
 - Generate a runnable Python project from the graph.
-- Produce a requirements file for the selected flow nodes.
+- Produce a pinned requirements file for the selected flow nodes.
 - Keep generated output portable and readable.
 
 ## Repository Layout
@@ -87,19 +198,28 @@ You can run AgnoLab either locally (API + Web) or with Docker.
 - `apps/api/app/exporter.py`: export bundle generation.
 - `apps/api/app/flow_store.py`: saved-flow persistence.
 - `apps/web`: React canvas, properties panel, run console, code preview, and library panels.
-- `apps/web/src/App.tsx`: main canvas experience and panel logic.
+- `apps/web/src/App.tsx`: main editor experience and panel logic.
+- `apps/web/src/FlowCanvas.tsx`: the React Flow canvas (nodes, ports, edges, minimap, drop).
+- `apps/web/src/CommandPalette.tsx`: the `Ctrl/Cmd+K` command palette.
+- `apps/web/src/inspector/`: one property inspector per node type.
+- `apps/web/src/nodeData.tsx`, `apps/web/src/editorConstants.ts`: node factories, expression builders, and library catalogs.
+- `apps/api/app/workflow_control.py`: Router / Parallel / Loop / Branch code generation.
+- `apps/api/app/schedule_runner.py`: cron schedules for saved flows.
 - `apps/web/src/providerCatalog.ts`: frontend provider catalog and presets.
 - `apps/web/src/agentConfig.ts`: agent properties definition.
 - `apps/web/src/nodeCatalog.ts`: node templates and defaults.
 - `apps/web/src/toolCatalog.ts`: built-in tool catalog.
 - `apps/web/src/starterTools.ts`: starter function tools.
 - `apps/web/src/api.ts`: frontend API client.
+- `apps/web/src/themes.ts`: theme definitions; the single source of every color token.
+- `apps/web/src/ThemePicker.tsx`: theme selector.
 - `docs`: architecture notes and project screenshots.
 
 ## Requirements
 
 - Python 3.11+
-- Node.js 18+
+- Node.js 18+ (run the frontend unit tests with `npm test` in `apps/web`)
+- Agno 3.2.1 (installed by `requirements.txt` as `agno[os]`)
 - An OpenAI API key if you want to use the default OpenAI provider out of the box
 
 ## Local Setup
@@ -235,7 +355,8 @@ For local providers, the agent properties include a configurable execution timeo
 When you export a flow, AgnoLab generates:
 
 - `main.py` with the compiled Agno workflow
-- `requirements.txt` with the runtime dependencies for the selected nodes
+- `requirements.txt` with the runtime dependencies for the selected nodes, pinned to the
+  Agno version the code was generated for (`agno[os]` for server exports)
 - `README.md` for the exported project
 
 There are two export targets:

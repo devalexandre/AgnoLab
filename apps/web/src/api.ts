@@ -1,4 +1,4 @@
-import { BuiltInToolFunctionOption, CanvasGraph, CanvasTemplateSummary, FlowRecord, FlowRuntimeStatus, FlowSummary, QueueSubscriberStatus, RunResult, SaveFlowResponse, SkillPathOption, WhatsappSessionStatus } from "./types";
+import { BuiltInToolFunctionOption, CanvasGraph, CanvasTemplateSummary, FlowRecord, FlowRuntimeStatus, FlowSummary, QueueSubscriberStatus, RunResult, ScheduleStatus, SaveFlowResponse, SkillPathOption, WhatsappSessionStatus } from "./types";
 
 function trimTrailingSlash(value: string): string {
   return value.replace(/\/+$/, "");
@@ -141,6 +141,16 @@ export async function listFlowRuntimeStatuses(flowName?: string): Promise<FlowRu
   }
   const payload = (await response.json()) as { statuses?: FlowRuntimeStatus[] };
   return Array.isArray(payload.statuses) ? payload.statuses : [];
+}
+
+export async function listScheduleStatuses(flowName?: string): Promise<ScheduleStatus[]> {
+  const query = flowName?.trim() ? `?flow_name=${encodeURIComponent(flowName.trim())}` : "";
+  const response = await fetch(`${API_BASE}/api/integrations/schedules${query}`);
+  if (!response.ok) {
+    throw new Error("Failed to list flow schedules");
+  }
+  const payload = (await response.json()) as { schedules?: ScheduleStatus[] };
+  return Array.isArray(payload.schedules) ? payload.schedules : [];
 }
 
 export async function fetchFlowByName(name: string): Promise<FlowRecord> {
