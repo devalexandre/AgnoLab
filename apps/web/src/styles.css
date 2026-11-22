@@ -2412,3 +2412,46 @@ kbd {
 .rule-input {
   min-height: 72px;
 }
+
+/* Schedule input */
+.preset-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 8px;
+}
+
+.chip-button {
+  padding: 4px 10px;
+  border: 1px solid var(--agno-border);
+  border-radius: var(--agno-radius-pill);
+  background: rgba(var(--agno-overlay-rgb), 0.03);
+  color: var(--agno-text-secondary);
+  font-size: var(--agno-font-xs);
+  cursor: pointer;
+}
+
+.chip-button:hover,
+.chip-button.is-active {
+  border-color: rgba(var(--agno-primary-rgb), 0.5);
+  background: rgba(var(--agno-primary-rgb), 0.12);
+  color: var(--agno-text-primary);
+}
+
+.code-input-inline {
+  font-family: "IBM Plex Mono", "SFMono-Regular", monospace;
+}
+
+.schedule-status.is-scheduled,
+.schedule-status.is-running {
+  border-color: rgba(var(--agno-success-rgb), 0.4);
+}
+
+.schedule-status.is-invalid,
+.schedule-status.is-error {
+  border-color: rgba(var(--agno-danger-rgb), 0.5);
+}
+
+.schedule-error {
+  color: var(--agno-danger-text);
+}

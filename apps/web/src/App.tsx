@@ -58,6 +58,7 @@ import type { MonacoToolEditorProps } from "./MonacoToolEditor";
 import CommandPalette, { type PaletteCommand } from "./CommandPalette";
 import ThemePicker from "./ThemePicker";
 import { renderInspectorPropertyLabel } from "./inspector/fields";
+import ScheduleInputInspector from "./inspector/ScheduleInputInspector";
 import WorkflowControlInspector from "./inspector/WorkflowControlInspector";
 import { THEMES, applyTheme, getThemeDefinition, loadInitialThemeId, type ThemeId } from "./themes";
 import {
@@ -480,6 +481,14 @@ const INTEGRATION_INPUT_LIBRARY_ITEMS: IntegrationLibraryItem[] = [
     helper: "Designed for background jobs and event-driven pipelines.",
     badge: "Planned",
     status: "planned",
+  },
+  {
+    key: "schedule-input",
+    label: "Schedule Input",
+    description: "Runs the saved flow on a cron schedule (for example weekdays at 09:00) in the time zone you pick.",
+    helper: "Daily digests, periodic reports, recurring checks. The API keeps the schedule running after save.",
+    badge: "Cron",
+    status: "available",
   },
   {
     key: "form-input",
@@ -1443,6 +1452,25 @@ function createLearningMachineNodeData(): NodeData {
   };
 }
 
+function createScheduleInputNodeData(index: number): NodeData {
+  return {
+    name: `Schedule ${index}`,
+    description: "Runs the saved flow on a cron schedule.",
+    prompt: "",
+    extras: {
+      inputSource: "schedule",
+      inputMode: "text",
+      inputText: "Run the scheduled task.",
+      payloadJson: '{\n  "source": "schedule"\n}',
+      scheduleCron: "0 9 * * 1-5",
+      scheduleTimezone: Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC",
+      scheduleEnabled: true,
+      hitlAutoApprove: "",
+      hitlUserInputJson: "",
+    },
+  };
+}
+
 function createEmailInputNodeData(index: number): NodeData {
   return {
     name: `Email Inbox ${index}`,
@@ -1629,8 +1657,8 @@ function getToolMode(data: NodeData): "builtin" | "function" {
   return (data.extras?.toolMode as "builtin" | "function" | undefined) ?? "builtin";
 }
 
-function getInputSource(data: NodeData): "manual" | "email" | "webhook" | "whatsapp" | "form" {
-  return (data.extras?.inputSource as "manual" | "email" | "webhook" | "whatsapp" | "form" | undefined) ?? "manual";
+function getInputSource(data: NodeData): "manual" | "email" | "webhook" | "whatsapp" | "form" | "schedule" {
+  return (data.extras?.inputSource as "manual" | "email" | "webhook" | "whatsapp" | "form" | "schedule" | undefined) ?? "manual";
 }
 
 function getInputMode(data: NodeData): "text" | "file" | "mixed" {
@@ -1895,6 +1923,11 @@ function getCanvasNodeMeta(node: { type: keyof typeof NODE_CATALOG; data: NodeDa
 
   if (node.type === "input") {
     const inputSource = getInputSource(node.data);
+    if (inputSource === "schedule") {
+      const cron = fieldValueAsString(node.data.extras?.scheduleCron) || "no cron";
+      const timezone = fieldValueAsString(node.data.extras?.scheduleTimezone) || "UTC";
+      return node.data.extras?.scheduleEnabled === false ? `Paused · ${cron}` : `Cron ${cron} · ${timezone}`;
+    }
     if (inputSource === "email") {
       const protocol = getEmailProtocol(node.data).toUpperCase();
       const host = fieldValueAsString(node.data.extras?.emailHost).trim();
@@ -3485,6 +3518,10 @@ export default function App() {
     }
     if (itemKey === "whatsapp-input") {
       addWhatsappInputNode();
+      return;
+    }
+    if (itemKey === "schedule-input") {
+      addConfiguredInputNode(createScheduleInputNodeData, "Schedule input added. Save the flow to start the schedule.");
       return;
     }
     if (itemKey === "form-input") {
@@ -7488,7 +7525,7 @@ export default function App() {
             <select
               value={currentInputSource}
               onChange={(event) => {
-                const nextSource = event.target.value as "manual" | "email" | "webhook" | "whatsapp" | "form";
+                const nextSource = event.target.value as "manual" | "email" | "webhook" | "whatsapp" | "form" | "schedule";
                 if (nextSource === "email") {
                   updateInputExtras({
                     inputSource: "email",
@@ -7541,6 +7578,18 @@ export default function App() {
                   return;
                 }
 
+                if (nextSource === "schedule") {
+                  updateInputExtras({
+                    inputSource: "schedule",
+                    inputMode: "text",
+                    scheduleCron: fieldValueAsString(currentExtras.scheduleCron) || "0 9 * * 1-5",
+                    scheduleTimezone:
+                      fieldValueAsString(currentExtras.scheduleTimezone) || Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC",
+                    scheduleEnabled: currentExtras.scheduleEnabled ?? true,
+                  });
+                  return;
+                }
+
                 if (nextSource === "form") {
                   updateInputExtras({
                     inputSource: "form",
@@ -7564,6 +7613,7 @@ export default function App() {
               <option value="webhook">Webhook</option>
               <option value="whatsapp">WhatsApp</option>
               <option value="form">Form submission</option>
+              <option value="schedule">Schedule (cron)</option>
             </select>
           </label>
 
@@ -7662,6 +7712,13 @@ export default function App() {
                 </>
               ) : null}
             </>
+          ) : currentInputSource === "schedule" ? (
+            <ScheduleInputInspector
+              nodeId={currentNode.id}
+              flowName={slugifyFlowName(flowName)}
+              extras={currentExtras}
+              onChange={(patch) => updateInputExtras(patch)}
+            />
           ) : currentInputSource === "email" ? (
             <>
               <label>

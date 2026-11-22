@@ -204,3 +204,18 @@ export interface StarterToolTemplate {
   functionCode: string;
   prerequisite?: string | null;
 }
+
+export interface ScheduleStatus {
+  flow_name: string;
+  node_id: string;
+  node_name: string;
+  cron: string;
+  timezone: string;
+  enabled: boolean;
+  status: "scheduled" | "running" | "paused" | "invalid" | "error" | string;
+  next_run_at?: string | null;
+  last_run_at?: string | null;
+  run_count: number;
+  last_result?: string | null;
+  last_error?: string | null;
+}

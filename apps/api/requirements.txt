@@ -1,6 +1,7 @@
 # Core framework — pinned to the version the compiler targets.
 # Bump deliberately (and re-run the compiler golden tests) to adopt a newer Agno.
 agno[os]==3.2.1
+croniter>=1.3
 aiohttp
 aiofiles
 anthropic

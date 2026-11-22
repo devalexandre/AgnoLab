@@ -182,6 +182,25 @@ class EmailListenerStatus(BaseModel):
     last_result: str | None = None
 
 
+class ScheduleStatus(BaseModel):
+    flow_name: str
+    node_id: str
+    node_name: str
+    cron: str
+    timezone: str = "UTC"
+    enabled: bool = True
+    status: str = "scheduled"
+    next_run_at: str | None = None
+    last_run_at: str | None = None
+    run_count: int = 0
+    last_result: str | None = None
+    last_error: str | None = None
+
+
+class ListScheduleStatusesResponse(BaseModel):
+    schedules: list[ScheduleStatus] = Field(default_factory=list)
+
+
 class ListEmailListenerStatusesResponse(BaseModel):
     listeners: list[EmailListenerStatus] = Field(default_factory=list)
 
