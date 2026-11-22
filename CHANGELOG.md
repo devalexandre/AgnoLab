@@ -34,6 +34,25 @@ This project adheres to [Semantic Versioning](https://semver.org/).
 - Tests that validate every compiler import and every built-in tool catalog entry against the
   installed Agno, so a wrong module path or class name fails CI instead of a user's run.
 
+### Added — UI
+
+- **Themes:** Agno Dark, Agno Light, Dracula, One Dark and Neon, picked from the canvas
+  toolbar, the home screen or the command palette. Every color is a theme token, including
+  nodes, connections, minimap and the code editor; each node type has its own accent.
+- **React Flow canvas:** drag from a port to connect (invalid targets are rejected live),
+  drag components in from the library, box-select and Ctrl/Cmd+click multi-selection,
+  copy/paste/duplicate with internal connections, layered auto-layout and fit-to-view.
+- **Command palette** (`Ctrl/Cmd+K`) for every action, theme, export, node and tool.
+- **Keyboard shortcuts:** `Ctrl/Cmd+C/V/D/A`, `Delete`, `Shift+1` (fit), `Shift+L` (layout), `Esc`.
+- One canvas toolbar replaces the floating cards (Run is always visible); status messages
+  are toasts; visible keyboard focus everywhere; reduced-motion support.
+- Frontend unit tests (Vitest), run in CI.
+
+### Changed — UI
+
+- Node drags commit once on release, so the editor no longer re-renders on every mouse move.
+- A loaded flow is framed with fit-to-view instead of having its node positions rewritten.
+
 ### Fixed
 
 - `DynamoDb` imported from the non-existent `agno.db.dynamodb` (now `agno.db.dynamo`).
